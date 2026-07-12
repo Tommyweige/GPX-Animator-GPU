@@ -1,0 +1,9 @@
+[package]
+name = "mp4-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mp4 = { path = "../vendor/mp4" }
+thiserror.workspace = true

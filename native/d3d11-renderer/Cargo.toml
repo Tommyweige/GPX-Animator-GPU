@@ -1,0 +1,18 @@
+[package]
+name = "d3d11-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+scene-core = { path = "../scene-core" }
+thiserror.workspace = true
+ureq = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-numerics.workspace = true
+
+[dev-dependencies]
+gpx-core = { path = "../gpx-core" }

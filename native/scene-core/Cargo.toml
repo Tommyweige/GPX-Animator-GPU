@@ -1,0 +1,10 @@
+[package]
+name = "scene-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpx-core = { path = "../gpx-core" }
+serde.workspace = true
+

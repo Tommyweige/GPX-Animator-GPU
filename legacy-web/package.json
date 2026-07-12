@@ -1,0 +1,19 @@
+{
+  "name": "gpx-animator-gpu",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GPU-accelerated GPX route animator with WebGL2 and hardware video encoding.",
+  "scripts": {
+    "start": "node server.mjs --open",
+    "serve": "node server.mjs",
+    "test": "node --test",
+    "build:exe": "node scripts/build-exe.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "postject": "^1.0.0-alpha.6"
+  }
+}

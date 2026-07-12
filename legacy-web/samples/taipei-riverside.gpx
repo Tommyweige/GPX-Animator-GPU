@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="GPX Animator GPU" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata>
+    <name>台北河濱晨騎</name>
+    <time>2026-04-12T22:30:00Z</time>
+  </metadata>
+  <trk>
+    <name>台北河濱晨騎</name>
+    <type>cycling</type>
+    <trkseg>
+      <trkpt lat="25.05245" lon="121.50760"><ele>7.2</ele><time>2026-04-12T22:30:00Z</time></trkpt>
+      <trkpt lat="25.05410" lon="121.50540"><ele>7.5</ele><time>2026-04-12T22:30:35Z</time></trkpt>
+      <trkpt lat="25.05605" lon="121.50295"><ele>6.8</ele><time>2026-04-12T22:31:10Z</time></trkpt>
+      <trkpt lat="25.05820" lon="121.50040"><ele>6.3</ele><time>2026-04-12T22:31:48Z</time></trkpt>
+      <trkpt lat="25.06055" lon="121.49790"><ele>6.5</ele><time>2026-04-12T22:32:27Z</time></trkpt>
+      <trkpt lat="25.06300" lon="121.49565"><ele>7.0</ele><time>2026-04-12T22:33:05Z</time></trkpt>
+      <trkpt lat="25.06555" lon="121.49370"><ele>7.4</ele><time>2026-04-12T22:33:42Z</time></trkpt>
+      <trkpt lat="25.06825" lon="121.49170"><ele>7.1</ele><time>2026-04-12T22:34:20Z</time></trkpt>
+      <trkpt lat="25.07100" lon="121.48960"><ele>6.7</ele><time>2026-04-12T22:34:58Z</time></trkpt>
+      <trkpt lat="25.07390" lon="121.48780"><ele>6.2</ele><time>2026-04-12T22:35:36Z</time></trkpt>
+      <trkpt lat="25.07675" lon="121.48615"><ele>6.0</ele><time>2026-04-12T22:36:12Z</time></trkpt>
+      <trkpt lat="25.07960" lon="121.48470"><ele>6.4</ele><time>2026-04-12T22:36:48Z</time></trkpt>
+      <trkpt lat="25.08235" lon="121.48345"><ele>6.9</ele><time>2026-04-12T22:37:24Z</time></trkpt>
+      <trkpt lat="25.08505" lon="121.48210"><ele>7.3</ele><time>2026-04-12T22:38:00Z</time></trkpt>
+      <trkpt lat="25.08770" lon="121.48095"><ele>7.8</ele><time>2026-04-12T22:38:36Z</time></trkpt>
+      <trkpt lat="25.09035" lon="121.47995"><ele>8.6</ele><time>2026-04-12T22:39:12Z</time></trkpt>
+      <trkpt lat="25.09295" lon="121.47900"><ele>9.1</ele><time>2026-04-12T22:39:48Z</time></trkpt>
+      <trkpt lat="25.09555" lon="121.47815"><ele>9.5</ele><time>2026-04-12T22:40:24Z</time></trkpt>
+      <trkpt lat="25.09820" lon="121.47755"><ele>10.2</ele><time>2026-04-12T22:41:00Z</time></trkpt>
+      <trkpt lat="25.10080" lon="121.47725"><ele>10.8</ele><time>2026-04-12T22:41:36Z</time></trkpt>
+      <trkpt lat="25.10330" lon="121.47750"><ele>10.5</ele><time>2026-04-12T22:42:12Z</time></trkpt>
+      <trkpt lat="25.10575" lon="121.47820"><ele>10.0</ele><time>2026-04-12T22:42:48Z</time></trkpt>
+      <trkpt lat="25.10805" lon="121.47935"><ele>9.4</ele><time>2026-04-12T22:43:24Z</time></trkpt>
+      <trkpt lat="25.11015" lon="121.48095"><ele>9.1</ele><time>2026-04-12T22:44:00Z</time></trkpt>
+      <trkpt lat="25.11200" lon="121.48305"><ele>8.7</ele><time>2026-04-12T22:44:36Z</time></trkpt>
+      <trkpt lat="25.11360" lon="121.48555"><ele>8.2</ele><time>2026-04-12T22:45:12Z</time></trkpt>
+      <trkpt lat="25.11485" lon="121.48835"><ele>7.8</ele><time>2026-04-12T22:45:48Z</time></trkpt>
+      <trkpt lat="25.11565" lon="121.49140"><ele>7.4</ele><time>2026-04-12T22:46:24Z</time></trkpt>
+      <trkpt lat="25.11600" lon="121.49455"><ele>7.1</ele><time>2026-04-12T22:47:00Z</time></trkpt>
+      <trkpt lat="25.11575" lon="121.49770"><ele>7.0</ele><time>2026-04-12T22:47:36Z</time></trkpt>
+      <trkpt lat="25.11510" lon="121.50070"><ele>7.2</ele><time>2026-04-12T22:48:12Z</time></trkpt>
+      <trkpt lat="25.11405" lon="121.50350"><ele>7.6</ele><time>2026-04-12T22:48:48Z</time></trkpt>
+      <trkpt lat="25.11255" lon="121.50600"><ele>8.0</ele><time>2026-04-12T22:49:24Z</time></trkpt>
+      <trkpt lat="25.11065" lon="121.50815"><ele>8.3</ele><time>2026-04-12T22:50:00Z</time></trkpt>
+      <trkpt lat="25.10845" lon="121.50980"><ele>8.5</ele><time>2026-04-12T22:50:36Z</time></trkpt>
+      <trkpt lat="25.10600" lon="121.51090"><ele>8.2</ele><time>2026-04-12T22:51:12Z</time></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

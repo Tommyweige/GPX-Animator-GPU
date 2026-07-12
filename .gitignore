@@ -1,0 +1,10 @@
+/target/
+/native/target/
+/node_modules/
+/cache/
+*.part
+*.mp4
+*.trk.gpx
+*.log
+*.tmp
+.DS_Store

@@ -1,0 +1,18 @@
+{
+  "main": "D:\\Learning\\SelfLearning\\GPX Animator\\packaging\\sea-main.cjs",
+  "output": "D:\\Learning\\SelfLearning\\GPX Animator\\build\\sea-prep.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": false,
+  "assets": {
+    "index.html": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\index.html",
+    "js/app.js": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\js\\app.js",
+    "js/exporter.js": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\js\\exporter.js",
+    "js/geo.js": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\js\\geo.js",
+    "js/gpx.js": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\js\\gpx.js",
+    "js/overlay.js": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\js\\overlay.js",
+    "js/renderer.js": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\js\\renderer.js",
+    "samples/taipei-riverside.gpx": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\samples\\taipei-riverside.gpx",
+    "styles.css": "D:\\Learning\\SelfLearning\\GPX Animator\\public\\styles.css"
+  }
+}

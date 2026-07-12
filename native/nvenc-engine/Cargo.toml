@@ -1,0 +1,19 @@
+[package]
+name = "nvenc-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+d3d11-renderer = { path = "../d3d11-renderer" }
+scene-core = { path = "../scene-core" }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+nvenc = { path = "../vendor/nvenc" }
+windows.workspace = true
+
+[dev-dependencies]
+mp4 = { path = "../vendor/mp4" }
+mp4-output = { path = "../mp4-output" }
+gpx-core = { path = "../gpx-core" }

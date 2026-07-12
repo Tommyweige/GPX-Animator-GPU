@@ -1,0 +1,22 @@
+[package]
+name = "gpx-animator-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+d3d11-renderer = { path = "../d3d11-renderer" }
+gpx-core = { path = "../gpx-core" }
+scene-core = { path = "../scene-core" }
+nvenc-engine = { path = "../nvenc-engine" }
+mp4-output = { path = "../mp4-output" }
+thiserror.workspace = true
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+
+[dev-dependencies]
+windows.workspace = true
+
+[lib]
+name = "desktop_app"
+path = "src/lib.rs"

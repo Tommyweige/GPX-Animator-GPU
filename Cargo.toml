@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+  "native/gpx-core",
+  "native/scene-core",
+  "native/d3d11-renderer",
+  "native/nvenc-engine",
+  "native/mp4-output",
+  "native/desktop-app",
+  "native/vendor/nvenc",
+  "native/vendor/mp4",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[workspace.dependencies]
+quick-xml = "0.38"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+time = { version = "0.3", features = ["parsing"] }
+windows = { version = "0.62", features = [
+  "Foundation_Numerics",
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_System_Threading",
+  "Win32_Security",
+] }
+windows-numerics = "0.3"
