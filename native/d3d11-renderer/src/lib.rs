@@ -872,11 +872,11 @@ impl D2dSceneRenderer {
         }
         if options.show_elevation && frame.elevation_line.len() > 1 {
             let chart_left = width as f32 * 0.04;
-            let chart_right = width as f32 * 0.96;
-            // Keep the profile at the very bottom and let the map show through.
-            // There is intentionally no opaque chart panel behind it.
-            let chart_top = height as f32 * 0.84;
-            let chart_bottom = height as f32 * 0.995;
+            let chart_right = width as f32 * 0.26;
+            // Compact, panel-free profile below the HUD. The map remains the
+            // primary visual and the profile is only a contextual cue.
+            let chart_top = height as f32 * 0.18;
+            let chart_bottom = height as f32 * 0.29;
             let completed_fill = unsafe {
                 self.context
                     .CreateSolidColorBrush(
@@ -885,6 +885,19 @@ impl D2dSceneRenderer {
                             g: options.route_color[1] as f32 / 255.0,
                             b: options.route_color[2] as f32 / 255.0,
                             a: 0.18,
+                        },
+                        None,
+                    )
+                    .map_err(|error| RendererError::Api(error.to_string()))?
+            };
+            let elevation_brush = unsafe {
+                self.context
+                    .CreateSolidColorBrush(
+                        &D2D1_COLOR_F {
+                            r: options.route_color[0] as f32 / 255.0,
+                            g: options.route_color[1] as f32 / 255.0,
+                            b: options.route_color[2] as f32 / 255.0,
+                            a: 0.70,
                         },
                         None,
                     )
@@ -933,7 +946,7 @@ impl D2dSceneRenderer {
                     }
                 }
                 unsafe {
-                    self.context.DrawLine(a, b, &route_brush, 3.0, None);
+                    self.context.DrawLine(a, b, &elevation_brush, 2.0, None);
                 }
             }
         }

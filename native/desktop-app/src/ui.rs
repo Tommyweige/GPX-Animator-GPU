@@ -591,11 +591,11 @@ impl NativeApp {
                 let chart = egui::Rect::from_min_max(
                     egui::pos2(
                         rect.left() + rect.width() * 0.04,
-                        rect.top() + rect.height() * 0.84,
+                        rect.top() + rect.height() * 0.18,
                     ),
                     egui::pos2(
-                        rect.left() + rect.width() * 0.96,
-                        rect.top() + rect.height() * 0.995,
+                        rect.left() + rect.width() * 0.26,
+                        rect.top() + rect.height() * 0.29,
                     ),
                 );
                 let elevation_point = |point: [f32; 2]| {
@@ -644,10 +644,11 @@ impl NativeApp {
                     profile,
                     egui::Stroke::new(
                         2.0,
-                        egui::Color32::from_rgb(
+                        egui::Color32::from_rgba_unmultiplied(
                             self.model.settings.scene.route_color[0],
                             self.model.settings.scene.route_color[1],
                             self.model.settings.scene.route_color[2],
+                            178,
                         ),
                     ),
                 ));
