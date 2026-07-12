@@ -20,6 +20,12 @@ enum TileMessage {
     Failed(d3d11_renderer::TileKey),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Language {
+    TraditionalChinese,
+    English,
+}
+
 pub struct NativeApp {
     model: AppModel,
     track: Option<Track>,
@@ -35,6 +41,8 @@ pub struct NativeApp {
     preview_tiles: HashMap<d3d11_renderer::TileKey, egui::TextureHandle>,
     pending_tiles: HashSet<d3d11_renderer::TileKey>,
     preview_map_style: MapStyle,
+    language: Language,
+    show_settings: bool,
 }
 
 fn current_long_edge(settings: &ExportSettings) -> u32 {
@@ -62,7 +70,16 @@ fn apply_long_edge(settings: &mut ExportSettings, long_edge: u32) {
     }
 }
 
-fn resolution_label(long_edge: u32) -> String {
+fn resolution_label(long_edge: u32, language: Language) -> String {
+    if language == Language::English {
+        return match long_edge {
+            3840 => "4K · 3840".to_owned(),
+            2560 => "2.5K · 2560".to_owned(),
+            1920 => "1080p · 1920".to_owned(),
+            1280 => "720p · 1280".to_owned(),
+            value => format!("Custom · {value}"),
+        };
+    }
     match long_edge {
         3840 => "4K · 3840".to_owned(),
         2560 => "2.5K · 2560".to_owned(),
@@ -97,6 +114,8 @@ impl NativeApp {
             preview_tiles: HashMap::new(),
             pending_tiles: HashSet::new(),
             preview_map_style,
+            language: Language::TraditionalChinese,
+            show_settings: false,
         }
     }
 
@@ -268,6 +287,13 @@ impl NativeApp {
                 ui.label(
                     egui::RichText::new("GPU EDITION").color(egui::Color32::from_rgb(255, 93, 59)),
                 );
+                let settings_label = match self.language {
+                    Language::TraditionalChinese => "設定",
+                    Language::English => "Settings",
+                };
+                if ui.button(settings_label).clicked() {
+                    self.show_settings = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("GPU 診斷").clicked() {
                         self.show_diagnostics = !self.show_diagnostics
@@ -334,7 +360,7 @@ impl NativeApp {
                     });
                 let mut long_edge = current_long_edge(&self.model.settings);
                 egui::ComboBox::from_label("解析度")
-                    .selected_text(resolution_label(long_edge))
+                    .selected_text(resolution_label(long_edge, self.language))
                     .show_ui(ui, |ui| {
                         for (edge, label) in [
                             (3840, "4K · 3840"),
@@ -772,6 +798,43 @@ impl NativeApp {
                 ));
             });
     }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let title = match self.language {
+            Language::TraditionalChinese => "設定",
+            Language::English => "Settings",
+        };
+        egui::Window::new(title)
+            .open(&mut self.show_settings)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(match self.language {
+                    Language::TraditionalChinese => "語言",
+                    Language::English => "Language",
+                });
+                egui::ComboBox::from_id_salt("language")
+                    .selected_text(match self.language {
+                        Language::TraditionalChinese => "繁體中文",
+                        Language::English => "English",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.language,
+                            Language::TraditionalChinese,
+                            "繁體中文",
+                        );
+                        ui.selectable_value(&mut self.language, Language::English, "English");
+                    });
+                ui.separator();
+                ui.small(match self.language {
+                    Language::TraditionalChinese => "語言會立即套用到介面。",
+                    Language::English => "Language changes apply immediately.",
+                });
+            });
+    }
 }
 
 impl eframe::App for NativeApp {
@@ -795,6 +858,7 @@ impl eframe::App for NativeApp {
         self.draw_controls(ctx);
         self.draw_preview(ctx);
         self.diagnostics_window(ctx);
+        self.settings_window(ctx);
         if matches!(self.model.state, JobState::Running(_)) {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
