@@ -587,6 +587,76 @@ impl NativeApp {
                 9.0,
                 egui::Color32::from_rgb(255, 93, 59),
             );
+            if self.model.settings.scene.show_elevation && frame.elevation_line.len() > 1 {
+                let chart = egui::Rect::from_min_max(
+                    egui::pos2(
+                        rect.left() + rect.width() * 0.04,
+                        rect.top() + rect.height() * 0.78,
+                    ),
+                    egui::pos2(
+                        rect.left() + rect.width() * 0.96,
+                        rect.top() + rect.height() * 0.94,
+                    ),
+                );
+                painter.rect_filled(
+                    chart,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(209, 214, 219, 204),
+                );
+                let elevation_point = |point: [f32; 2]| {
+                    egui::pos2(
+                        chart.left() + (point[0] * 0.5 + 0.5) * chart.width(),
+                        chart.top() + (0.5 - point[1] * 0.5) * chart.height(),
+                    )
+                };
+                let progress_x = chart.left() + chart.width() * frame.progress.clamp(0.0, 1.0);
+                let fill = egui::Color32::from_rgba_unmultiplied(
+                    self.model.settings.scene.route_color[0],
+                    self.model.settings.scene.route_color[1],
+                    self.model.settings.scene.route_color[2],
+                    122,
+                );
+                for pair in frame.elevation_line.windows(2) {
+                    let a = elevation_point(pair[0]);
+                    let b = elevation_point(pair[1]);
+                    if a.x < progress_x {
+                        let end_x = b.x.min(progress_x);
+                        let ratio = if (b.x - a.x).abs() > f32::EPSILON {
+                            ((end_x - a.x) / (b.x - a.x)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let end = egui::pos2(end_x, a.y + (b.y - a.y) * ratio);
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                a,
+                                end,
+                                egui::pos2(end.x, chart.bottom()),
+                                egui::pos2(a.x, chart.bottom()),
+                            ],
+                            fill,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                }
+                let profile: Vec<_> = frame
+                    .elevation_line
+                    .iter()
+                    .copied()
+                    .map(elevation_point)
+                    .collect();
+                painter.add(egui::Shape::line(
+                    profile,
+                    egui::Stroke::new(
+                        2.0,
+                        egui::Color32::from_rgb(
+                            self.model.settings.scene.route_color[0],
+                            self.model.settings.scene.route_color[1],
+                            self.model.settings.scene.route_color[2],
+                        ),
+                    ),
+                ));
+            }
             painter.text(
                 rect.right_bottom() - egui::vec2(12.0, 10.0),
                 egui::Align2::RIGHT_BOTTOM,
@@ -603,7 +673,14 @@ impl NativeApp {
                 painter.text(
                     rect.min + egui::vec2(24.0, 24.0),
                     egui::Align2::LEFT_TOP,
-                    format!("公里數 {:.2} km", frame.distance_m / 1000.0),
+                    format!(
+                        "公里數 {:.2} km    海拔 {}",
+                        frame.distance_m / 1000.0,
+                        frame
+                            .elevation_m
+                            .map(|value| format!("{value:.0} m"))
+                            .unwrap_or_else(|| "-- m".to_owned())
+                    ),
                     egui::FontId::proportional(18.0),
                     egui::Color32::WHITE,
                 );

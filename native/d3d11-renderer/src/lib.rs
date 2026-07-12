@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -45,6 +45,23 @@ pub fn required_view_tiles(center: [f64; 2], span: f64, zoom: u8) -> Vec<TileKey
     (y0..=y1)
         .flat_map(|y| (x0..=x1).map(move |x| TileKey { zoom, x, y }))
         .collect()
+}
+
+/// Select one complete tile level for a frame. Mixing parent and child tiles
+/// creates visible colour seams on satellite imagery because providers may use
+/// different source captures and colour grading at each zoom level.
+pub fn complete_tile_zoom(
+    available: &HashSet<TileKey>,
+    center: [f64; 2],
+    span: f64,
+    output_width: u32,
+) -> Option<u8> {
+    let preferred = tile_zoom(span, output_width);
+    (2..=preferred).rev().find(|&zoom| {
+        required_view_tiles(center, span, zoom)
+            .iter()
+            .all(|key| available.contains(key))
+    })
 }
 
 pub struct TileDiskCache {
@@ -716,9 +733,18 @@ impl D2dSceneRenderer {
         if options.map_style != scene_core::MapStyle::Transparent
             && let Some(tiles) = tiles
         {
-            let mut ordered: Vec<_> = tiles.tiles.iter().collect();
-            ordered.sort_by_key(|(key, _)| key.zoom);
-            for (key, tile) in ordered {
+            let available: HashSet<_> = tiles.tiles.keys().copied().collect();
+            let selected_zoom = complete_tile_zoom(
+                &available,
+                frame.view_center_mercator,
+                frame.view_span,
+                width,
+            );
+            for (key, tile) in tiles
+                .tiles
+                .iter()
+                .filter(|(key, _)| Some(key.zoom) == selected_zoom)
+            {
                 let n = (1u32 << key.zoom) as f64;
                 let map = |x: f64, y: f64| {
                     (
@@ -824,7 +850,14 @@ impl D2dSceneRenderer {
                 right: rect.right - 16.0,
                 bottom: rect.bottom - 12.0,
             };
-            let label = format!("公里數 {:.2} km", frame.distance_m / 1000.0);
+            let altitude = frame
+                .elevation_m
+                .map(|value| format!("{value:.0} m"))
+                .unwrap_or_else(|| "-- m".to_owned());
+            let label = format!(
+                "公里數 {:.2} km    海拔 {altitude}",
+                frame.distance_m / 1000.0
+            );
             let text: Vec<u16> = label.encode_utf16().collect();
             unsafe {
                 self.context.DrawText(
@@ -838,14 +871,91 @@ impl D2dSceneRenderer {
             }
         }
         if options.show_elevation && frame.elevation_line.len() > 1 {
+            let chart_left = width as f32 * 0.04;
+            let chart_right = width as f32 * 0.96;
+            let chart_top = height as f32 * 0.78;
+            let chart_bottom = height as f32 * 0.94;
+            let chart_background = unsafe {
+                self.context
+                    .CreateSolidColorBrush(
+                        &D2D1_COLOR_F {
+                            r: 0.82,
+                            g: 0.84,
+                            b: 0.86,
+                            a: 0.80,
+                        },
+                        None,
+                    )
+                    .map_err(|error| RendererError::Api(error.to_string()))?
+            };
+            let completed_fill = unsafe {
+                self.context
+                    .CreateSolidColorBrush(
+                        &D2D1_COLOR_F {
+                            r: options.route_color[0] as f32 / 255.0,
+                            g: options.route_color[1] as f32 / 255.0,
+                            b: options.route_color[2] as f32 / 255.0,
+                            a: 0.48,
+                        },
+                        None,
+                    )
+                    .map_err(|error| RendererError::Api(error.to_string()))?
+            };
+            unsafe {
+                self.context.FillRectangle(
+                    &D2D_RECT_F {
+                        left: chart_left,
+                        top: chart_top,
+                        right: chart_right,
+                        bottom: chart_bottom,
+                    },
+                    &chart_background,
+                );
+            }
+            let progress_x =
+                chart_left + (chart_right - chart_left) * frame.progress.clamp(0.0, 1.0);
+            let map = |point: [f32; 2]| Vector2 {
+                X: chart_left + (point[0] * 0.5 + 0.5) * (chart_right - chart_left),
+                Y: chart_top + (0.5 - point[1] * 0.5) * (chart_bottom - chart_top),
+            };
             for pair in frame.elevation_line.windows(2) {
-                let map = |point: [f32; 2]| Vector2 {
-                    X: (point[0] * 0.5 + 0.5) * width as f32 * 0.92 + width as f32 * 0.04,
-                    Y: height as f32 * (0.94 - (point[1] * 0.5 + 0.5) * 0.16),
-                };
+                let a = map(pair[0]);
+                let b = map(pair[1]);
+                if a.X < progress_x {
+                    let end_x = b.X.min(progress_x);
+                    let ratio = if (b.X - a.X).abs() > f32::EPSILON {
+                        ((end_x - a.X) / (b.X - a.X)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let end_y = a.Y + (b.Y - a.Y) * ratio;
+                    unsafe {
+                        self.context.DrawLine(
+                            Vector2 { X: a.X, Y: a.Y },
+                            Vector2 {
+                                X: a.X,
+                                Y: chart_bottom,
+                            },
+                            &completed_fill,
+                            (end_x - a.X).max(1.0) + 1.0,
+                            None,
+                        );
+                        if end_x > a.X {
+                            self.context.DrawLine(
+                                Vector2 { X: end_x, Y: end_y },
+                                Vector2 {
+                                    X: end_x,
+                                    Y: chart_bottom,
+                                },
+                                &completed_fill,
+                                (end_x - a.X).max(1.0) + 1.0,
+                                None,
+                            );
+                        }
+                    }
+                }
                 unsafe {
-                    self.context
-                        .DrawLine(map(pair[0]), map(pair[1]), &route_brush, 3.0, None);
+                    self.context.DrawLine(a, b, &route_brush, 3.0, None);
                 }
             }
         }
@@ -1056,6 +1166,37 @@ mod tests {
         let mut unique = std::collections::HashSet::new();
         assert!(tiles.iter().all(|tile| unique.insert(*tile)));
         assert!(tiles.iter().all(|tile| tile.zoom == 10));
+    }
+    #[test]
+    fn frame_uses_one_complete_zoom_instead_of_mixing_tile_levels() {
+        let center = [0.5, 0.5];
+        let span = 0.01;
+        let preferred = tile_zoom(span, 3840);
+        let parent = preferred - 1;
+        let mut available: HashSet<_> = required_view_tiles(center, span, parent)
+            .into_iter()
+            .collect();
+        let mut detailed = required_view_tiles(center, span, preferred);
+        detailed.pop(); // one missing detailed tile forces a whole-frame fallback
+        available.extend(detailed);
+        assert_eq!(
+            complete_tile_zoom(&available, center, span, 3840),
+            Some(parent)
+        );
+    }
+
+    #[test]
+    fn frame_prefers_highest_complete_zoom() {
+        let center = [0.5, 0.5];
+        let span = 0.01;
+        let preferred = tile_zoom(span, 3840);
+        let available: HashSet<_> = required_view_tiles(center, span, preferred)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            complete_tile_zoom(&available, center, span, 3840),
+            Some(preferred)
+        );
     }
     #[test]
     fn satellite_uses_esri_xyz_order_and_separate_source() {

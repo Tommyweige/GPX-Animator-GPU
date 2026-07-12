@@ -1,5 +1,6 @@
 /target/
 /native/target/
+/native/.cargo-target/
 /node_modules/
 /dist/*.exe
 !/dist/GPX-Animator-GPU-fixed.exe
