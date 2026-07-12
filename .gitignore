@@ -1,6 +1,8 @@
 /target/
 /native/target/
 /node_modules/
+/dist/*.exe
+!/dist/GPX-Animator-GPU-fixed.exe
 /cache/
 *.part
 *.mp4
