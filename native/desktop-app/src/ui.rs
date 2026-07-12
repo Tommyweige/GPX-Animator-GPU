@@ -591,17 +591,12 @@ impl NativeApp {
                 let chart = egui::Rect::from_min_max(
                     egui::pos2(
                         rect.left() + rect.width() * 0.04,
-                        rect.top() + rect.height() * 0.78,
+                        rect.top() + rect.height() * 0.84,
                     ),
                     egui::pos2(
                         rect.left() + rect.width() * 0.96,
-                        rect.top() + rect.height() * 0.94,
+                        rect.top() + rect.height() * 0.995,
                     ),
-                );
-                painter.rect_filled(
-                    chart,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(209, 214, 219, 204),
                 );
                 let elevation_point = |point: [f32; 2]| {
                     egui::pos2(
@@ -614,7 +609,7 @@ impl NativeApp {
                     self.model.settings.scene.route_color[0],
                     self.model.settings.scene.route_color[1],
                     self.model.settings.scene.route_color[2],
-                    122,
+                    46,
                 );
                 for pair in frame.elevation_line.windows(2) {
                     let a = elevation_point(pair[0]);
