@@ -590,12 +590,12 @@ impl NativeApp {
             if self.model.settings.scene.show_elevation && frame.elevation_line.len() > 1 {
                 let chart = egui::Rect::from_min_max(
                     egui::pos2(
-                        rect.left() + rect.width() * 0.04,
-                        rect.top() + rect.height() * 0.18,
+                        rect.left() + rect.width() * 0.73,
+                        rect.top() + rect.height() * 0.05,
                     ),
                     egui::pos2(
-                        rect.left() + rect.width() * 0.26,
-                        rect.top() + rect.height() * 0.29,
+                        rect.left() + rect.width() * 0.96,
+                        rect.top() + rect.height() * 0.16,
                     ),
                 );
                 let elevation_point = |point: [f32; 2]| {

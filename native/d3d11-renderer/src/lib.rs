@@ -64,6 +64,25 @@ pub fn complete_tile_zoom(
     })
 }
 
+/// Return a usable single zoom even when a network/cache failure leaves a
+/// level incomplete. The caller still draws one level only, so it cannot
+/// create the colour seams caused by mixing satellite generations.
+fn fallback_tile_zoom(
+    available: &HashSet<TileKey>,
+    center: [f64; 2],
+    span: f64,
+    output_width: u32,
+) -> Option<u8> {
+    let preferred = tile_zoom(span, output_width);
+    complete_tile_zoom(available, center, span, output_width).or_else(|| {
+        (2..=preferred).rev().find(|&zoom| {
+            required_view_tiles(center, span, zoom)
+                .iter()
+                .any(|key| available.contains(key))
+        })
+    })
+}
+
 pub struct TileDiskCache {
     root: PathBuf,
     max_bytes: u64,
@@ -591,7 +610,7 @@ impl D2dSceneRenderer {
                     DWRITE_FONT_WEIGHT_SEMI_BOLD,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
-                    30.0,
+                    26.0,
                     PCWSTR(locale.as_ptr()),
                 )
                 .map_err(|error| RendererError::Api(error.to_string()))?
@@ -734,7 +753,7 @@ impl D2dSceneRenderer {
             && let Some(tiles) = tiles
         {
             let available: HashSet<_> = tiles.tiles.keys().copied().collect();
-            let selected_zoom = complete_tile_zoom(
+            let selected_zoom = fallback_tile_zoom(
                 &available,
                 frame.view_center_mercator,
                 frame.view_span,
@@ -786,6 +805,19 @@ impl D2dSceneRenderer {
         let marker_brush = unsafe {
             self.context
                 .CreateSolidColorBrush(&color(options.marker_color), None)
+                .map_err(|error| RendererError::Api(error.to_string()))?
+        };
+        let hud_shadow_brush = unsafe {
+            self.context
+                .CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.70,
+                    },
+                    None,
+                )
                 .map_err(|error| RendererError::Api(error.to_string()))?
         };
         let muted_brush = unsafe {
@@ -860,6 +892,20 @@ impl D2dSceneRenderer {
             );
             let text: Vec<u16> = label.encode_utf16().collect();
             unsafe {
+                let shadow_rect = D2D_RECT_F {
+                    left: text_rect.left + 2.0,
+                    top: text_rect.top + 2.0,
+                    right: text_rect.right + 2.0,
+                    bottom: text_rect.bottom + 2.0,
+                };
+                self.context.DrawText(
+                    &text,
+                    &self.text_format,
+                    &shadow_rect,
+                    &hud_shadow_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
                 self.context.DrawText(
                     &text,
                     &self.text_format,
@@ -871,12 +917,12 @@ impl D2dSceneRenderer {
             }
         }
         if options.show_elevation && frame.elevation_line.len() > 1 {
-            let chart_left = width as f32 * 0.04;
-            let chart_right = width as f32 * 0.26;
-            // Compact, panel-free profile below the HUD. The map remains the
+            let chart_left = width as f32 * 0.73;
+            let chart_right = width as f32 * 0.96;
+            // Compact, panel-free profile in the upper-right. The map remains the
             // primary visual and the profile is only a contextual cue.
-            let chart_top = height as f32 * 0.18;
-            let chart_bottom = height as f32 * 0.29;
+            let chart_top = height as f32 * 0.05;
+            let chart_bottom = height as f32 * 0.16;
             let completed_fill = unsafe {
                 self.context
                     .CreateSolidColorBrush(

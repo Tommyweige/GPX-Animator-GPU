@@ -149,13 +149,23 @@ where
         if scene.options.camera_mode == CameraMode::Follow {
             let mut fit_scene = scene.clone();
             fit_scene.options.camera_mode = CameraMode::Fit;
-            let frame = build_frame(&fit_scene, 1.0);
-            let zoom = d3d11_renderer::tile_zoom(frame.view_span, request.settings.width);
-            keys.extend(d3d11_renderer::required_view_tiles(
-                frame.view_center_mercator,
-                frame.view_span,
-                zoom,
-            ));
+            let follow = build_frame(&scene, 1.0);
+            let fit = build_frame(&fit_scene, 1.0);
+            let transition_frames = 2 * request.settings.fps as u64;
+            // Preload every interpolated camera view. Without these keys the
+            // transition can clear to the dark background while the camera
+            // moves between two otherwise-preloaded views.
+            for index in 0..=transition_frames {
+                let linear = index as f64 / transition_frames.max(1) as f64;
+                let smooth = linear * linear * linear * (linear * (linear * 6.0 - 15.0) + 10.0);
+                let frame = blend_frames(&follow, &fit, smooth);
+                let zoom = d3d11_renderer::tile_zoom(frame.view_span, request.settings.width);
+                keys.extend(d3d11_renderer::required_view_tiles(
+                    frame.view_center_mercator,
+                    frame.view_span,
+                    zoom,
+                ));
+            }
         }
         // Always cache and upload two lower zoom levels as a seamless underlay.
         // A missing high-resolution request then reveals real satellite imagery
