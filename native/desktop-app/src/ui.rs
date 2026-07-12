@@ -37,6 +37,41 @@ pub struct NativeApp {
     preview_map_style: MapStyle,
 }
 
+fn current_long_edge(settings: &ExportSettings) -> u32 {
+    match settings.scene.aspect {
+        Aspect::Portrait => settings.height,
+        Aspect::Landscape | Aspect::Square => settings.width,
+    }
+}
+
+fn apply_long_edge(settings: &mut ExportSettings, long_edge: u32) {
+    let long_edge = long_edge.clamp(320, 8192);
+    match settings.scene.aspect {
+        Aspect::Landscape => {
+            settings.width = long_edge;
+            settings.height = long_edge * 9 / 16;
+        }
+        Aspect::Square => {
+            settings.width = long_edge;
+            settings.height = long_edge;
+        }
+        Aspect::Portrait => {
+            settings.width = long_edge * 9 / 16;
+            settings.height = long_edge;
+        }
+    }
+}
+
+fn resolution_label(long_edge: u32) -> String {
+    match long_edge {
+        3840 => "4K · 3840".to_owned(),
+        2560 => "2.5K · 2560".to_owned(),
+        1920 => "1080p · 1920".to_owned(),
+        1280 => "720p · 1280".to_owned(),
+        value => format!("自訂 · {value}"),
+    }
+}
+
 impl NativeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&cc.egui_ctx);
@@ -182,11 +217,8 @@ impl NativeApp {
 
     fn validated_settings(&self) -> ExportSettings {
         let mut value = self.model.settings.clone();
-        match value.scene.aspect {
-            Aspect::Landscape => (value.width, value.height) = (3840, 2160),
-            Aspect::Square => (value.width, value.height) = (2160, 2160),
-            Aspect::Portrait => (value.width, value.height) = (2160, 3840),
-        }
+        let long_edge = current_long_edge(&value).clamp(320, 8192);
+        apply_long_edge(&mut value, long_edge);
         value.fps = match value.fps {
             24 | 30 | 60 | 120 => value.fps,
             _ => 60,
@@ -300,6 +332,30 @@ impl NativeApp {
                             "9:16",
                         );
                     });
+                let mut long_edge = current_long_edge(&self.model.settings);
+                egui::ComboBox::from_label("解析度")
+                    .selected_text(resolution_label(long_edge))
+                    .show_ui(ui, |ui| {
+                        for (edge, label) in [
+                            (3840, "4K · 3840"),
+                            (2560, "2.5K · 2560"),
+                            (1920, "1080p · 1920"),
+                            (1280, "720p · 1280"),
+                        ] {
+                            if ui.selectable_label(long_edge == edge, label).clicked() {
+                                long_edge = edge;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("自訂長邊");
+                    ui.add(
+                        egui::DragValue::new(&mut long_edge)
+                            .range(320..=8192)
+                            .speed(16),
+                    );
+                });
+                apply_long_edge(&mut self.model.settings, long_edge);
                 egui::ComboBox::from_label("地圖樣式")
                     .selected_text(format!("{:?}", self.model.settings.scene.map_style))
                     .show_ui(ui, |ui| {
