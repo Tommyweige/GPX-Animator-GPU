@@ -28,6 +28,7 @@ pub struct NativeApp {
     output_path: Option<PathBuf>,
     preview_progress: f64,
     receiver: Option<Receiver<WorkerMessage>>,
+    gpu_receiver: Option<Receiver<Result<nvenc_engine::GpuCapabilities, String>>>,
     active_token: Option<CancellationToken>,
     last_error: Option<String>,
     show_diagnostics: bool,
@@ -94,10 +95,11 @@ impl NativeApp {
         model.settings.cache_limit_bytes = preferences
             .cache_limit_bytes
             .max(crate::default_cache_limit_bytes() / 8);
-        match detect_gpu_capabilities() {
-            Ok(value) => model.capabilities = Some(value),
-            Err(error) => model.state = JobState::Failed(error.to_string()),
-        }
+        let (gpu_tx, gpu_receiver) = channel();
+        std::thread::spawn(move || {
+            let result = detect_gpu_capabilities().map_err(|error| error.to_string());
+            let _ = gpu_tx.send(result);
+        });
         let (tile_tx, tile_rx) = channel();
         let preview_map_style = model.settings.scene.map_style;
         Self {
@@ -107,6 +109,7 @@ impl NativeApp {
             output_path: None,
             preview_progress: 0.0,
             receiver: None,
+            gpu_receiver: Some(gpu_receiver),
             active_token: None,
             last_error: None,
             show_diagnostics: false,
@@ -135,6 +138,9 @@ impl NativeApp {
                 self.output_path = Some(path.with_extension("mp4"));
                 self.gpx_path = Some(path);
                 self.track = Some(track);
+                if let Some(input) = self.gpx_path.as_ref().and_then(|value| value.parent()) {
+                    self.preferences.last_input_directory = Some(input.to_path_buf());
+                }
                 self.preview_tiles.clear();
                 self.pending_tiles.clear();
                 self.last_error = None
@@ -250,6 +256,18 @@ impl NativeApp {
     }
 
     fn poll_worker(&mut self) {
+        if let Some(receiver) = &self.gpu_receiver
+            && let Ok(result) = receiver.try_recv()
+        {
+            match result {
+                Ok(value) => self.model.capabilities = Some(value),
+                Err(error) => {
+                    self.last_error = Some(error.clone());
+                    self.model.state = JobState::Failed(error);
+                }
+            }
+            self.gpu_receiver = None;
+        }
         let mut messages = Vec::new();
         if let Some(receiver) = &self.receiver {
             while let Ok(message) = receiver.try_recv() {
@@ -297,11 +315,21 @@ impl NativeApp {
                     self.show_settings = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("GPU 診斷").clicked() {
+                    let diagnostics_label = match self.language {
+                        UiLanguage::TraditionalChinese => "GPU 診斷",
+                        UiLanguage::English => "GPU Diagnostics",
+                    };
+                    if ui.button(diagnostics_label).clicked() {
                         self.show_diagnostics = !self.show_diagnostics
                     }
                     if let Some(gpu) = &self.model.capabilities {
                         ui.label(format!("NVENC · {}", gpu.adapter_name));
+                    } else if self.gpu_receiver.is_some() {
+                        ui.spinner();
+                        ui.label(match self.language {
+                            UiLanguage::TraditionalChinese => "正在偵測 RTX / NVENC…",
+                            UiLanguage::English => "Detecting RTX / NVENC…",
+                        });
                     }
                 });
             });
@@ -390,7 +418,12 @@ impl NativeApp {
                     });
                     apply_long_edge(&mut self.model.settings, long_edge);
                     egui::ComboBox::from_label("地圖樣式")
-                        .selected_text(format!("{:?}", self.model.settings.scene.map_style))
+                        .selected_text(match self.model.settings.scene.map_style {
+                            MapStyle::Light => "淺色地圖",
+                            MapStyle::Dark => "深色地圖",
+                            MapStyle::Satellite => "衛星圖",
+                            MapStyle::Transparent => "透明背景",
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.model.settings.scene.map_style,
@@ -414,7 +447,11 @@ impl NativeApp {
                             );
                         });
                     egui::ComboBox::from_label("攝影機")
-                        .selected_text(format!("{:?}", self.model.settings.scene.camera_mode))
+                        .selected_text(match self.model.settings.scene.camera_mode {
+                            CameraMode::Fit => "顯示完整路線",
+                            CameraMode::Follow => "跟隨標記",
+                            CameraMode::Free => "自由拖曳／縮放",
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.model.settings.scene.camera_mode,
@@ -441,7 +478,10 @@ impl NativeApp {
                     ui.separator();
                     ui.heading("03 輸出");
                     egui::ComboBox::from_label("Codec")
-                        .selected_text(format!("{:?}", self.model.settings.codec))
+                        .selected_text(match self.model.settings.codec {
+                            Codec::Hevc => "H.265 / HEVC",
+                            Codec::H264 => "H.264 / AVC",
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.model.settings.codec,
@@ -455,7 +495,11 @@ impl NativeApp {
                             );
                         });
                     egui::ComboBox::from_label("品質")
-                        .selected_text(format!("{:?}", self.model.settings.quality))
+                        .selected_text(match self.model.settings.quality {
+                            QualityPreset::Balanced => "平衡 P4 / CQ22",
+                            QualityPreset::Quality => "高畫質 P5 / CQ19",
+                            QualityPreset::Speed => "高速 P3 / CQ25",
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.model.settings.quality,
@@ -497,6 +541,7 @@ impl NativeApp {
                             .set_file_name("gpx-animation.mp4")
                             .save_file()
                     {
+                        self.preferences.last_output_directory = path.parent().map(PathBuf::from);
                         self.output_path = Some(path)
                     }
                     if let Some(path) = &self.output_path {
@@ -757,6 +802,7 @@ impl NativeApp {
                             .set_file_name("gpx-animation.mp4")
                             .save_file()
                     {
+                        self.preferences.last_output_directory = path.parent().map(PathBuf::from);
                         self.output_path = Some(path);
                     }
                     if let Some(path) = &self.output_path {
@@ -764,22 +810,32 @@ impl NativeApp {
                     }
                     match &self.model.state {
                         JobState::Running(value) => {
+                            if value.stage == nvenc_engine::ExportStage::Preflight {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Preparing cached map tiles…");
+                                });
+                            }
                             let ratio = if value.stage_total == 0 {
                                 0.0
                             } else {
                                 value.stage_completed as f32 / value.stage_total as f32
                             };
-                            ui.add(
-                                egui::ProgressBar::new(ratio)
-                                    .show_percentage()
-                                    .text(format!(
-                                        "{} / {} · {:.1} FPS · ETA {:.1}s",
-                                        value.stage_completed,
-                                        value.stage_total,
-                                        value.fps,
-                                        value.eta_seconds
-                                    )),
-                            );
+                            let status = if value.stage == nvenc_engine::ExportStage::Preflight {
+                                format!(
+                                    "Map tiles {} / {}",
+                                    value.stage_completed, value.stage_total
+                                )
+                            } else {
+                                format!(
+                                    "{} / {} · {:.1} FPS · ETA {:.1}s",
+                                    value.stage_completed,
+                                    value.stage_total,
+                                    value.fps,
+                                    value.eta_seconds
+                                )
+                            };
+                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
                             if ui.button("Cancel").clicked() {
                                 if let Some(token) = &self.active_token {
                                     token.cancel();
@@ -837,18 +893,31 @@ impl NativeApp {
             let available = ui.available_size();
             let (response, painter) = ui.allocate_painter(available, egui::Sense::drag());
             let rect = response.rect;
+            let frame = scene_core::fit_aspect_rect(
+                available.x,
+                available.y,
+                self.model.settings.scene.aspect,
+            );
+            let frame_rect = egui::Rect::from_min_size(
+                rect.min + egui::vec2(frame[0], frame[1]),
+                egui::vec2(frame[2], frame[3]),
+            );
             let background = match self.model.settings.scene.map_style {
                 MapStyle::Light => egui::Color32::from_rgb(232, 236, 232),
                 MapStyle::Dark => egui::Color32::from_rgb(26, 35, 42),
                 MapStyle::Satellite => egui::Color32::from_rgb(24, 28, 32),
                 MapStyle::Transparent => egui::Color32::from_gray(45),
             };
-            painter.rect_filled(rect, 8.0, background);
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 16, 20));
+            painter.rect_filled(frame_rect, 8.0, background);
             let Some(track) = &self.track else {
                 painter.text(
-                    rect.center(),
+                    frame_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "載入 GPX 後顯示預覽",
+                    match self.language {
+                        UiLanguage::TraditionalChinese => "載入 GPX 後顯示預覽",
+                        UiLanguage::English => "Load a GPX track to preview",
+                    },
                     egui::FontId::proportional(22.0),
                     egui::Color32::GRAY,
                 );
@@ -856,7 +925,12 @@ impl NativeApp {
             };
             if response.dragged() {
                 let delta = ctx.input(|input| input.pointer.delta());
-                apply_pan(&mut self.model.settings.scene, track, delta, rect.size());
+                apply_pan(
+                    &mut self.model.settings.scene,
+                    track,
+                    delta,
+                    frame_rect.size(),
+                );
             }
             if response.hovered() {
                 let scroll = ctx.input(|input| input.smooth_scroll_delta.y);
@@ -872,28 +946,28 @@ impl NativeApp {
                 options: self.model.settings.scene.clone(),
             };
             let frame = build_frame(&scene, self.preview_progress);
-            let zoom = d3d11_renderer::tile_zoom(frame.view_span, rect.width() as u32);
+            let zoom = d3d11_renderer::tile_zoom(frame.view_span, frame_rect.width() as u32);
             let keys = d3d11_renderer::required_view_tiles(
                 frame.view_center_mercator,
                 frame.view_span,
                 zoom,
             );
             self.request_tiles(ctx, &keys);
-            let painter = painter.with_clip_rect(rect);
+            let painter = painter.with_clip_rect(frame_rect);
             let n = (1u32 << zoom) as f64;
             for key in &keys {
                 if let Some(texture) = self.preview_tiles.get(key) {
                     let map = |x: f64, y: f64| {
                         egui::pos2(
-                            rect.center().x
+                            frame_rect.center().x
                                 + ((x - frame.view_center_mercator[0]) * 2.0 / frame.view_span)
                                     as f32
-                                    * rect.width()
+                                    * frame_rect.width()
                                     * 0.5,
-                            rect.center().y
+                            frame_rect.center().y
                                 - (-(y - frame.view_center_mercator[1]) * 2.0 / frame.view_span)
                                     as f32
-                                    * rect.height()
+                                    * frame_rect.height()
                                     * 0.5,
                         )
                     };
@@ -909,8 +983,8 @@ impl NativeApp {
             }
             let to_screen = |point: [f32; 2]| {
                 egui::pos2(
-                    rect.center().x + point[0] * rect.width() * 0.5,
-                    rect.center().y - point[1] * rect.height() * 0.5,
+                    frame_rect.center().x + point[0] * frame_rect.width() * 0.5,
+                    frame_rect.center().y - point[1] * frame_rect.height() * 0.5,
                 )
             };
             let route: Vec<_> = frame.route_ndc.iter().copied().map(to_screen).collect();
@@ -947,12 +1021,14 @@ impl NativeApp {
                 let overlay = scene_core::overlay_layout(self.model.settings.scene.aspect);
                 let chart = egui::Rect::from_min_max(
                     egui::pos2(
-                        rect.left() + rect.width() * overlay.elevation[0],
-                        rect.top() + rect.height() * overlay.elevation[1],
+                        frame_rect.left() + frame_rect.width() * overlay.elevation[0],
+                        frame_rect.top() + frame_rect.height() * overlay.elevation[1],
                     ),
                     egui::pos2(
-                        rect.left() + rect.width() * (overlay.elevation[0] + overlay.elevation[2]),
-                        rect.top() + rect.height() * (overlay.elevation[1] + overlay.elevation[3]),
+                        frame_rect.left()
+                            + frame_rect.width() * (overlay.elevation[0] + overlay.elevation[2]),
+                        frame_rect.top()
+                            + frame_rect.height() * (overlay.elevation[1] + overlay.elevation[3]),
                     ),
                 );
                 let elevation_point = |point: [f32; 2]| {
@@ -1011,7 +1087,7 @@ impl NativeApp {
                 ));
             }
             painter.text(
-                rect.right_bottom() - egui::vec2(12.0, 10.0),
+                frame_rect.right_bottom() - egui::vec2(12.0, 10.0),
                 egui::Align2::RIGHT_BOTTOM,
                 match self.model.settings.scene.map_style {
                     MapStyle::Satellite => {
@@ -1025,7 +1101,7 @@ impl NativeApp {
             if self.model.settings.scene.show_hud && self.language == UiLanguage::TraditionalChinese
             {
                 painter.text(
-                    rect.min + egui::vec2(24.0, 24.0),
+                    frame_rect.min + egui::vec2(24.0, 24.0),
                     egui::Align2::LEFT_TOP,
                     format!(
                         "公里數 {:.2} km    海拔 {}",
@@ -1041,7 +1117,7 @@ impl NativeApp {
             }
             if self.model.settings.scene.show_hud && self.language == UiLanguage::English {
                 painter.text(
-                    rect.min + egui::vec2(24.0, 24.0),
+                    frame_rect.min + egui::vec2(24.0, 24.0),
                     egui::Align2::LEFT_TOP,
                     format!(
                         "Distance {:.2} km    Elevation {}",
@@ -1089,8 +1165,14 @@ impl NativeApp {
                     d.encoded_frames, d.dropped_frames, d.duplicated_frames
                 ));
                 ui.label(format!(
-                    "Render p95: {:.2} ms · elapsed: {:.2} s",
-                    d.render_p95_ms, d.elapsed_seconds
+                    "Render p50/p95: {:.2}/{:.2} ms · Encode p95: {:.2} ms · Mux p95: {:.2} ms",
+                    d.render_p50_ms, d.render_p95_ms, d.encode_p95_ms, d.mux_p95_ms
+                ));
+                ui.label(format!(
+                    "Ring peak: {} · VRAM peak: {:.1} GB · elapsed: {:.2} s",
+                    d.ring_occupancy_peak,
+                    d.peak_vram_bytes as f64 / (1u64 << 30) as f64,
+                    d.elapsed_seconds
                 ));
             });
     }
@@ -1120,8 +1202,14 @@ impl NativeApp {
                     d.encoded_frames, d.dropped_frames, d.duplicated_frames
                 ));
                 ui.label(format!(
-                    "Render p95: {:.2} ms · elapsed: {:.2} s",
-                    d.render_p95_ms, d.elapsed_seconds
+                    "Render p50/p95: {:.2}/{:.2} ms · Encode p95: {:.2} ms · Mux p95: {:.2} ms",
+                    d.render_p50_ms, d.render_p95_ms, d.encode_p95_ms, d.mux_p95_ms
+                ));
+                ui.label(format!(
+                    "Ring peak: {} · VRAM peak: {:.1} GB · elapsed: {:.2} s",
+                    d.ring_occupancy_peak,
+                    d.peak_vram_bytes as f64 / (1u64 << 30) as f64,
+                    d.elapsed_seconds
                 ));
             });
     }
@@ -1238,7 +1326,7 @@ impl eframe::App for NativeApp {
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
         self.persist_preferences();
-        if matches!(self.model.state, JobState::Running(_)) {
+        if matches!(self.model.state, JobState::Running(_)) || self.gpu_receiver.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
     }

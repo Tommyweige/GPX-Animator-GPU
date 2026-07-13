@@ -110,11 +110,19 @@ impl AppPreferences {
         std::fs::create_dir_all(parent)?;
         let temporary = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&temporary, bytes)?;
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
+        let mut file = std::fs::File::create(&temporary)?;
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::rename(&temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(first_error) if path.exists() => {
+                std::fs::remove_file(&path)?;
+                std::fs::rename(&temporary, &path).map_err(|_| first_error)
+            }
+            Err(error) => Err(error),
         }
-        std::fs::rename(temporary, path)
     }
 }
 impl Default for ExportSettings {
@@ -165,6 +173,11 @@ pub struct Diagnostics {
     pub dropped_frames: u64,
     pub duplicated_frames: u64,
     pub render_p95_ms: f64,
+    pub render_p50_ms: f64,
+    pub encode_p95_ms: f64,
+    pub mux_p95_ms: f64,
+    pub ring_occupancy_peak: usize,
+    pub peak_vram_bytes: u64,
     pub elapsed_seconds: f64,
 }
 
@@ -243,6 +256,11 @@ impl AppModel {
             dropped_frames: metrics.dropped_frames,
             duplicated_frames: metrics.duplicated_frames,
             render_p95_ms: metrics.render_p95_ms,
+            render_p50_ms: metrics.render_p50_ms,
+            encode_p95_ms: metrics.encode_p95_ms,
+            mux_p95_ms: metrics.mux_p95_ms,
+            ring_occupancy_peak: metrics.ring_occupancy_peak,
+            peak_vram_bytes: metrics.peak_vram_bytes,
             elapsed_seconds: metrics.elapsed_seconds,
         };
         self.cancellation = None;

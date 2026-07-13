@@ -210,7 +210,12 @@ impl TileDiskCache {
     }
     pub fn load(&self, key: TileKey) -> Result<DecodedTile, RendererError> {
         self.load_with_fetch(key, |url| {
-            let mut response = ureq::get(url)
+            let agent = ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                .build()
+                .new_agent();
+            let mut response = agent
+                .get(url)
                 .header("User-Agent", "GPXAnimatorNative/2.0")
                 .call()
                 .map_err(|error| error.to_string())?;
@@ -247,7 +252,7 @@ impl TileDiskCache {
                 Err(_) => return Ok(self.offline_placeholder(key)),
             }
         };
-        decode_tile(key, &bytes)
+        decode_tile(key, &bytes).or_else(|_| Ok(self.offline_placeholder(key)))
     }
     fn offline_placeholder(&self, key: TileKey) -> DecodedTile {
         if let Some(tile) = self.cached_parent_tile(key) {

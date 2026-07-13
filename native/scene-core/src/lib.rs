@@ -264,6 +264,33 @@ pub fn layout(aspect: Aspect, long_edge: u32) -> Layout {
     }
 }
 
+/// Compute the centered preview rectangle used by the desktop UI. The export
+/// renderer always produces the exact aspect dimensions; the preview uses
+/// this same math and letterboxes unused space instead of stretching it.
+pub fn fit_aspect_rect(available_width: f32, available_height: f32, aspect: Aspect) -> [f32; 4] {
+    let width = available_width.max(0.0);
+    let height = available_height.max(0.0);
+    let ratio = match aspect {
+        Aspect::Landscape => 16.0 / 9.0,
+        Aspect::Square => 1.0,
+        Aspect::Portrait => 9.0 / 16.0,
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let (frame_width, frame_height) = if width / height > ratio {
+        (height * ratio, height)
+    } else {
+        (width, width / ratio)
+    };
+    [
+        (width - frame_width) * 0.5,
+        (height - frame_height) * 0.5,
+        frame_width,
+        frame_height,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +357,16 @@ mod tests {
                 assert!(rect[1] + rect[3] <= 1.0);
             }
         }
+    }
+    #[test]
+    fn preview_rect_preserves_selected_aspect_and_is_centered() {
+        let landscape = fit_aspect_rect(1000.0, 800.0, Aspect::Landscape);
+        assert!((landscape[2] / landscape[3] - 16.0 / 9.0).abs() < 1e-5);
+        assert!((landscape[0] - 0.0).abs() < 1e-5);
+        assert!((landscape[1] - 118.75).abs() < 1e-3);
+        let portrait = fit_aspect_rect(1000.0, 800.0, Aspect::Portrait);
+        assert!((portrait[2] / portrait[3] - 9.0 / 16.0).abs() < 1e-5);
+        assert!((portrait[0] - 275.0).abs() < 1e-3);
     }
     #[test]
     fn frame_plan_keeps_route_and_marker_in_ndc() {
