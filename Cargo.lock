@@ -1218,6 +1218,7 @@ dependencies = [
  "gpx-core",
  "mp4-output",
  "nvenc-engine",
+ "places-core",
  "rfd",
  "scene-core",
  "serde",
@@ -2152,6 +2153,16 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "places-core"
+version = "2.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ureq",
+]
 
 [[package]]
 name = "plain"

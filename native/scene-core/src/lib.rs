@@ -89,6 +89,41 @@ fn mercator(lon: f64, lat: f64) -> [f64; 2] {
     [x, y]
 }
 
+/// Convert a pixel in the preview frame back to a WGS84 coordinate.  The
+/// point is relative to the actual aspect-correct frame (not the letterboxed
+/// central panel), with `(0, 0)` at the top-left.  This is used by the native
+/// context menu and is intentionally independent from any map provider.
+pub fn screen_point_to_geo(
+    frame: &FramePlan,
+    frame_size: [f32; 2],
+    point_px: [f32; 2],
+) -> Option<[f64; 2]> {
+    let [width, height] = frame_size;
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || !point_px.iter().all(|value| value.is_finite())
+        || !frame.view_span.is_finite()
+        || frame.view_span <= 0.0
+    {
+        return None;
+    }
+    let ndc_x = point_px[0] as f64 / width as f64 * 2.0 - 1.0;
+    let ndc_y = 1.0 - point_px[1] as f64 / height as f64 * 2.0;
+    let x = frame.view_center_mercator[0] + ndc_x * frame.view_span * 0.5;
+    let y = frame.view_center_mercator[1] - ndc_y * frame.view_span * 0.5;
+    if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+        return None;
+    }
+    let longitude = x * 360.0 - 180.0;
+    let latitude = ((std::f64::consts::PI * (1.0 - 2.0 * y)).sinh())
+        .atan()
+        .to_degrees()
+        .clamp(-85.051_128_78, 85.051_128_78);
+    Some([latitude, longitude])
+}
+
 pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
     let progress = progress.clamp(0.0, 1.0);
     let projected: Vec<_> = scene
@@ -429,5 +464,26 @@ mod tests {
                 .iter()
                 .any(|point| point[0].abs() < 0.05 && point[1].abs() < 0.05)
         );
+    }
+
+    #[test]
+    fn screen_point_to_geo_maps_frame_center_and_rejects_invalid_input() {
+        let frame = build_frame(&scene(), 0.5);
+        let center = screen_point_to_geo(&frame, [1_600.0, 900.0], [800.0, 450.0]).unwrap();
+        assert!((center[0] - 25.01).abs() < 0.02);
+        assert!((center[1] - 121.01).abs() < 0.03);
+        assert!(screen_point_to_geo(&frame, [0.0, 900.0], [0.0, 0.0]).is_none());
+        assert!(screen_point_to_geo(&frame, [1_600.0, 900.0], [f32::NAN, 0.0]).is_none());
+    }
+
+    #[test]
+    fn screen_point_to_geo_round_trips_fit_corners_within_web_mercator_bounds() {
+        let frame = build_frame(&scene(), 0.0);
+        let top_left = screen_point_to_geo(&frame, [100.0, 100.0], [0.0, 0.0]).unwrap();
+        let bottom_right = screen_point_to_geo(&frame, [100.0, 100.0], [100.0, 100.0]).unwrap();
+        assert!(top_left[0] > bottom_right[0]);
+        assert!(top_left[1] < bottom_right[1]);
+        assert!(top_left[0].abs() <= 85.051_128_78);
+        assert!(bottom_right[0].abs() <= 85.051_128_78);
     }
 }

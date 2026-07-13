@@ -6,6 +6,7 @@ members = [
   "native/d3d11-renderer",
   "native/nvenc-engine",
   "native/mp4-output",
+  "native/places-core",
   "native/desktop-app",
   "native/vendor/nvenc",
   "native/vendor/mp4",
@@ -34,5 +35,8 @@ windows = { version = "0.62", features = [
   "Win32_Graphics_Dxgi_Common",
   "Win32_System_Threading",
   "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 windows-numerics = "0.3"

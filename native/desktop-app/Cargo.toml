@@ -8,6 +8,7 @@ license.workspace = true
 d3d11-renderer = { path = "../d3d11-renderer" }
 gpx-core = { path = "../gpx-core" }
 scene-core = { path = "../scene-core" }
+places-core = { path = "../places-core" }
 nvenc-engine = { path = "../nvenc-engine" }
 mp4-output = { path = "../mp4-output" }
 thiserror.workspace = true
@@ -15,8 +16,6 @@ serde.workspace = true
 serde_json = "1"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
-
-[dev-dependencies]
 windows.workspace = true
 
 [lib]

@@ -6,7 +6,12 @@ use crate::{
 use eframe::egui;
 use gpx_core::{ParseOptions, Track};
 use nvenc_engine::CancellationToken;
-use scene_core::{Aspect, CameraMode, Codec, MapStyle, QualityPreset, Scene, build_frame};
+use places_core::{
+    NearbySearchRequest, PlaceLanguage, PlaceProvider, PlaceSummary, SearchCoordinate,
+};
+use scene_core::{
+    Aspect, CameraMode, Codec, MapStyle, QualityPreset, Scene, build_frame, screen_point_to_geo,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -19,6 +24,27 @@ enum WorkerMessage {
 enum TileMessage {
     Loaded(MapStyle, d3d11_renderer::DecodedTile),
     Failed(d3d11_renderer::TileKey),
+}
+
+enum PlacesMessage {
+    Finished {
+        request_id: u64,
+        result: Result<Vec<PlaceSummary>, String>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct ContextMenuState {
+    screen_pos: egui::Pos2,
+    coordinate: SearchCoordinate,
+}
+
+struct NearbyDialogState {
+    coordinate: SearchCoordinate,
+    request_id: u64,
+    loading: bool,
+    places: Vec<PlaceSummary>,
+    error: Option<String>,
 }
 
 pub struct NativeApp {
@@ -40,6 +66,13 @@ pub struct NativeApp {
     language: UiLanguage,
     show_settings: bool,
     preferences: AppPreferences,
+    context_menu: Option<ContextMenuState>,
+    nearby_dialog: Option<NearbyDialogState>,
+    places_tx: Sender<PlacesMessage>,
+    places_rx: Receiver<PlacesMessage>,
+    next_places_request_id: u64,
+    google_key_input: String,
+    google_key_status: Option<String>,
 }
 
 fn current_long_edge(settings: &ExportSettings) -> u32 {
@@ -127,6 +160,11 @@ impl NativeApp {
             let _ = gpu_tx.send(result);
         });
         let (tile_tx, tile_rx) = channel();
+        let (places_tx, places_rx) = channel();
+        let google_key_input = crate::secrets::read_google_places_api_key()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let preview_map_style = model.settings.scene.map_style;
         Self {
             model,
@@ -147,6 +185,13 @@ impl NativeApp {
             language: preferences.language,
             show_settings: false,
             preferences,
+            context_menu: None,
+            nearby_dialog: None,
+            places_tx,
+            places_rx,
+            next_places_request_id: 0,
+            google_key_input,
+            google_key_status: None,
         }
     }
 
@@ -237,6 +282,257 @@ impl NativeApp {
                 let _ = tx.send(message);
                 ctx.request_repaint();
             });
+        }
+    }
+
+    fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate) {
+        self.next_places_request_id = self.next_places_request_id.wrapping_add(1);
+        let request_id = self.next_places_request_id;
+        self.nearby_dialog = Some(NearbyDialogState {
+            coordinate,
+            request_id,
+            loading: true,
+            places: Vec::new(),
+            error: None,
+        });
+        let tx = self.places_tx.clone();
+        let radius_m = places_core::normalize_radius(self.preferences.nearby_radius_m);
+        let language = match self.language {
+            UiLanguage::TraditionalChinese => PlaceLanguage::TraditionalChinese,
+            UiLanguage::English => PlaceLanguage::English,
+        };
+        std::thread::spawn(move || {
+            let request = NearbySearchRequest {
+                coordinate,
+                radius_m,
+                limit: 20,
+                language,
+            };
+            let google_key = crate::secrets::read_google_places_api_key()
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty());
+            let google_result = google_key
+                .as_deref()
+                .map(|key| places_core::GooglePlacesClient::default().search(key, request.clone()));
+            let result = match google_result {
+                Some(Ok(value)) => Ok(value),
+                Some(Err(google_error)) => {
+                    match places_core::OverpassClient::default().search(request) {
+                        Ok(value) => Ok(value),
+                        Err(osm_error) => Err(format!(
+                            "Google: {google_error}; OpenStreetMap: {osm_error}"
+                        )),
+                    }
+                }
+                None => places_core::OverpassClient::default()
+                    .search(request)
+                    .map_err(|error| error.to_string()),
+            };
+            let _ = tx.send(PlacesMessage::Finished { request_id, result });
+        });
+    }
+
+    fn poll_places(&mut self) {
+        while let Ok(message) = self.places_rx.try_recv() {
+            let PlacesMessage::Finished { request_id, result } = message;
+            let Some(dialog) = self.nearby_dialog.as_mut() else {
+                continue;
+            };
+            if dialog.request_id != request_id {
+                continue;
+            }
+            dialog.loading = false;
+            match result {
+                Ok(places) => {
+                    dialog.places = places;
+                    dialog.error = None;
+                }
+                Err(error) => dialog.error = Some(error),
+            }
+        }
+    }
+
+    fn draw_context_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.context_menu else {
+            return;
+        };
+        let mut search = false;
+        let language = self.language;
+        egui::Area::new(egui::Id::new("nearby-context-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.screen_pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(match language {
+                        UiLanguage::TraditionalChinese => "選取位置",
+                        UiLanguage::English => "Selected location",
+                    });
+                    ui.small(format!(
+                        "{:.6}, {:.6}",
+                        menu.coordinate.latitude, menu.coordinate.longitude
+                    ));
+                    if ui
+                        .button(match language {
+                            UiLanguage::TraditionalChinese => "搜尋附近地點",
+                            UiLanguage::English => "Search nearby places",
+                        })
+                        .clicked()
+                    {
+                        search = true;
+                    }
+                    if ui
+                        .button(match language {
+                            UiLanguage::TraditionalChinese => "關閉",
+                            UiLanguage::English => "Close",
+                        })
+                        .clicked()
+                    {
+                        search = false;
+                        self.context_menu = None;
+                    }
+                });
+            });
+        if search {
+            self.context_menu = None;
+            self.start_nearby_lookup(menu.coordinate);
+        }
+    }
+
+    fn draw_nearby_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.nearby_dialog.as_mut() else {
+            return;
+        };
+        let language = self.language;
+        let mut close = false;
+        let mut retry = false;
+        let screen = ctx.content_rect();
+        let position = egui::pos2(
+            (screen.right() - 440.0).max(8.0),
+            (screen.top() + 84.0).max(8.0),
+        );
+        egui::Window::new(match language {
+            UiLanguage::TraditionalChinese => "附近地點",
+            UiLanguage::English => "Nearby places",
+        })
+        .id(egui::Id::new("nearby-places-window"))
+        .fixed_pos(position)
+        .default_size(egui::vec2(420.0, 520.0))
+        .resizable(true)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(match language {
+                    UiLanguage::TraditionalChinese => "座標",
+                    UiLanguage::English => "Coordinate",
+                });
+                ui.monospace(format!("{:.5}, {:.5}", dialog.coordinate.latitude, dialog.coordinate.longitude));
+            });
+            ui.horizontal(|ui| {
+                ui.label(match language {
+                    UiLanguage::TraditionalChinese => "搜尋半徑",
+                    UiLanguage::English => "Search radius",
+                });
+                egui::ComboBox::from_id_salt("nearby-radius")
+                    .selected_text(format!("{} m", self.preferences.nearby_radius_m))
+                    .show_ui(ui, |ui| {
+                        for radius in places_core::ALLOWED_RADII_M {
+                            if ui
+                                .selectable_label(self.preferences.nearby_radius_m == radius, format!("{} m", radius))
+                                .clicked()
+                            {
+                                self.preferences.nearby_radius_m = radius;
+                            }
+                        }
+                    });
+                if ui
+                    .button(match language {
+                        UiLanguage::TraditionalChinese => "重新搜尋",
+                        UiLanguage::English => "Retry",
+                    })
+                    .clicked()
+                {
+                    retry = true;
+                }
+                if ui
+                    .button(match language {
+                        UiLanguage::TraditionalChinese => "關閉",
+                        UiLanguage::English => "Close",
+                    })
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+            ui.separator();
+            if dialog.loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(match language {
+                        UiLanguage::TraditionalChinese => "正在查詢 Google / OpenStreetMap…",
+                        UiLanguage::English => "Querying Google / OpenStreetMap…",
+                    });
+                });
+            }
+            if let Some(error) = &dialog.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.small(match language {
+                    UiLanguage::TraditionalChinese => "請確認網路、防火牆與 Google API 設定；結果只在目前視窗保存。",
+                    UiLanguage::English => "Check network, firewall, and Google API settings. Results remain in memory only.",
+                });
+            }
+            if !dialog.places.is_empty() {
+                let provider = dialog.places.first().map(|place| place.provider);
+                ui.small(match provider {
+                    Some(PlaceProvider::Google) => "Powered by Google · sorted by review count",
+                    Some(PlaceProvider::OpenStreetMap) => "OpenStreetMap · sorted by distance (no review data)",
+                    None => "",
+                });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (index, place) in dialog.places.iter().enumerate() {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("{}.", index + 1));
+                                ui.strong(&place.name);
+                            });
+                            if let Some(category) = &place.category {
+                                ui.small(category);
+                            }
+                            ui.horizontal(|ui| {
+                                if let Some(rating) = place.rating {
+                                    ui.label(format!("★ {rating:.1}"));
+                                    ui.label(format!("{} reviews", place.review_count));
+                                } else {
+                                    ui.label("No review data");
+                                }
+                                ui.label(format!("{:.0} m", place.distance_m));
+                                if let Some(open_now) = place.open_now {
+                                    ui.label(if open_now { "Open" } else { "Closed" });
+                                }
+                            });
+                            if let Some(address) = &place.address {
+                                ui.small(address);
+                            }
+                            ui.hyperlink_to(
+                                match place.provider {
+                                    PlaceProvider::Google => "Open in Google Maps",
+                                    PlaceProvider::OpenStreetMap => "Open in OpenStreetMap",
+                                },
+                                &place.external_url,
+                            );
+                        });
+                    }
+                });
+            }
+            if dialog.places.iter().any(|place| place.provider == PlaceProvider::Google) {
+                ui.small("Google Maps and Places attribution is required when Google data is shown.");
+            }
+        });
+        let coordinate = dialog.coordinate;
+        if close {
+            self.nearby_dialog = None;
+        } else if retry {
+            self.start_nearby_lookup(coordinate);
         }
     }
 
@@ -908,6 +1204,7 @@ impl NativeApp {
             self.preview_tiles.clear();
             self.pending_tiles.clear();
         }
+        let mut context_click = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.language == UiLanguage::English {
                 ui.horizontal(|ui| {
@@ -928,7 +1225,7 @@ impl NativeApp {
                 });
             }
             let available = ui.available_size();
-            let (response, painter) = ui.allocate_painter(available, egui::Sense::drag());
+            let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
             let rect = response.rect;
             let frame = scene_core::fit_aspect_rect(
                 available.x,
@@ -983,6 +1280,23 @@ impl NativeApp {
                 options: self.model.settings.scene.clone(),
             };
             let frame = build_frame(&scene, self.preview_progress);
+            if response.secondary_clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && frame_rect.contains(pointer)
+                && let Some([latitude, longitude]) = screen_point_to_geo(
+                    &frame,
+                    [frame_rect.width(), frame_rect.height()],
+                    [pointer.x - frame_rect.left(), pointer.y - frame_rect.top()],
+                )
+            {
+                context_click = Some(ContextMenuState {
+                    screen_pos: pointer,
+                    coordinate: SearchCoordinate {
+                        latitude,
+                        longitude,
+                    },
+                });
+            }
             let zoom = d3d11_renderer::tile_zoom(frame.view_span, frame_rect.width() as u32);
             let keys = d3d11_renderer::required_view_tiles(
                 frame.view_center_mercator,
@@ -1181,6 +1495,9 @@ impl NativeApp {
                 );
             }
         });
+        if let Some(value) = context_click {
+            self.context_menu = Some(value);
+        }
     }
 
     fn diagnostics_window(&mut self, ctx: &egui::Context) {
@@ -1294,6 +1611,66 @@ impl NativeApp {
                         ui.selectable_value(&mut self.language, UiLanguage::English, "English");
                     });
                 ui.separator();
+                ui.label(match self.language {
+                    UiLanguage::TraditionalChinese => {
+                        "Google Places API 金鑰（儲存在 Windows Credential Manager）"
+                    }
+                    UiLanguage::English => {
+                        "Google Places API key (stored in Windows Credential Manager)"
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.google_key_input)
+                        .password(true)
+                        .hint_text("AIza…"),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(match self.language {
+                            UiLanguage::TraditionalChinese => "儲存金鑰",
+                            UiLanguage::English => "Save key",
+                        })
+                        .clicked()
+                    {
+                        self.google_key_status = match crate::secrets::write_google_places_api_key(
+                            &self.google_key_input,
+                        ) {
+                            Ok(()) => Some(match self.language {
+                                UiLanguage::TraditionalChinese => {
+                                    "已儲存；查詢時優先使用 Google，失敗會回退 OSM。".to_owned()
+                                }
+                                UiLanguage::English => {
+                                    "Saved. Google is preferred; OSM is used as fallback."
+                                        .to_owned()
+                                }
+                            }),
+                            Err(error) => Some(error),
+                        };
+                    }
+                    if ui
+                        .button(match self.language {
+                            UiLanguage::TraditionalChinese => "移除",
+                            UiLanguage::English => "Remove",
+                        })
+                        .clicked()
+                    {
+                        self.google_key_input.clear();
+                        self.google_key_status =
+                            match crate::secrets::write_google_places_api_key("") {
+                                Ok(()) => Some(match self.language {
+                                    UiLanguage::TraditionalChinese => {
+                                        "已移除 Google API 金鑰。".to_owned()
+                                    }
+                                    UiLanguage::English => "Google API key removed.".to_owned(),
+                                }),
+                                Err(error) => Some(error),
+                            };
+                    }
+                });
+                if let Some(status) = &self.google_key_status {
+                    ui.small(status);
+                }
+                ui.separator();
                 let mut cache_gb =
                     self.model.settings.cache_limit_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
                 ui.add(
@@ -1368,10 +1745,13 @@ impl eframe::App for NativeApp {
             self.load_gpx(path);
         }
         self.poll_worker();
+        self.poll_places();
         self.poll_tiles(ctx);
         self.draw_header(ctx);
         self.draw_controls(ctx);
         self.draw_preview(ctx);
+        self.draw_context_menu(ctx);
+        self.draw_nearby_dialog(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
         self.persist_preferences();

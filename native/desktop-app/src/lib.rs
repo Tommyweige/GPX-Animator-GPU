@@ -5,6 +5,7 @@ use scene_core::{Codec, QualityPreset, SceneOptions};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 pub mod export;
+pub mod secrets;
 pub use export::{
     ExportError, ExportOutcome, ExportRequest, detect_gpu_capabilities, load_gpx_file,
     run_native_export,
@@ -44,17 +45,24 @@ pub struct AppPreferences {
     pub last_input_directory: Option<PathBuf>,
     pub last_output_directory: Option<PathBuf>,
     pub cache_limit_bytes: u64,
+    #[serde(default = "default_nearby_radius_m")]
+    pub nearby_radius_m: u32,
+}
+
+pub const fn default_nearby_radius_m() -> u32 {
+    places_core::DEFAULT_RADIUS_M
 }
 
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             language: UiLanguage::default(),
             settings: ExportSettings::default(),
             last_input_directory: None,
             last_output_directory: None,
             cache_limit_bytes: default_cache_limit_bytes(),
+            nearby_radius_m: default_nearby_radius_m(),
         }
     }
 }
@@ -75,13 +83,14 @@ impl AppPreferences {
         };
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(mut value) => {
-                value.schema_version = 1;
+                value.schema_version = 2;
                 if value.cache_limit_bytes == 0 {
                     value.cache_limit_bytes = default_cache_limit_bytes();
                 }
                 if value.settings.cache_limit_bytes == 0 {
                     value.settings.cache_limit_bytes = value.cache_limit_bytes;
                 }
+                value.nearby_radius_m = places_core::normalize_radius(value.nearby_radius_m);
                 value
             }
             Err(_) => {
@@ -358,9 +367,21 @@ mod tests {
         value.language = UiLanguage::English;
         value.settings.cache_limit_bytes = 512 * 1024 * 1024;
         value.cache_limit_bytes = value.settings.cache_limit_bytes;
+        value.nearby_radius_m = 5_000;
         let bytes = serde_json::to_vec(&value).unwrap();
         let decoded: AppPreferences = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.language, UiLanguage::English);
         assert_eq!(decoded.settings.cache_limit_bytes, 512 * 1024 * 1024);
+        assert_eq!(decoded.nearby_radius_m, 5_000);
+        assert!(!String::from_utf8(bytes).unwrap().contains("api_key"));
+    }
+
+    #[test]
+    fn old_preferences_without_radius_migrate_to_default() {
+        let mut json = serde_json::to_value(AppPreferences::default()).unwrap();
+        json.as_object_mut().unwrap().remove("nearby_radius_m");
+        let value: AppPreferences = serde_json::from_value(json).unwrap();
+        assert_eq!(value.nearby_radius_m, places_core::DEFAULT_RADIUS_M);
+        assert_eq!(value.schema_version, 2);
     }
 }

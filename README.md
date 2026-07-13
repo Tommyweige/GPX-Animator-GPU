@@ -29,6 +29,11 @@ included below in [繁體中文](#繁體中文).
   profile overlays; 8 px route width by default.
 - English and Traditional Chinese UI, persisted preferences, resizable panels,
   cancellation, progress reporting, and a GPU diagnostics view.
+- Right-click any visible map coordinate to browse nearby places in a fixed
+  results window. Google Places is used first when its key is configured; the
+  free Overpass/OpenStreetMap service is used automatically as a fallback.
+  Results are ranked by review count, then rating and distance, and are never
+  written to the map tiles, GPX file, or exported video.
 
 ## Download and run
 
@@ -77,6 +82,22 @@ The preflight status reports cached and missing tiles. Network timeouts,
 permission errors, and offline runs degrade to a cached parent tile or a
 deterministic placeholder so a transient tile request cannot corrupt the GPU
 export pipeline.
+
+## Nearby places lookup
+
+Right-click inside the aspect-correct preview and choose **Search nearby
+places**. The coordinate is converted from the camera view back to WGS84 and
+the result window stays at a stable top-right position so it does not jump
+around with the pointer. The radius is persisted as a normal preference (500
+m, 1 km, 2 km, or 5 km).
+
+Google Places API keys are stored only in the Windows per-user Credential
+Manager. They are never serialized to `settings.json`, logs, Git, or MP4
+metadata. A Google response is kept in memory for the current result window
+only and includes the required Google attribution/link. If no key is configured
+or the Google request is unavailable, the app queries Overpass and labels the
+result as OpenStreetMap. See [docs/nearby-places.md](docs/nearby-places.md)
+for provider setup, quotas, privacy, and test details.
 
 ## Export behavior
 
@@ -145,6 +166,7 @@ native/d3d11-renderer    D3D11/Direct2D renderer and tile cache
 native/nvenc-engine      RTX texture ring and NVENC session
 native/mp4-output        HEVC/H.264 sample conversion and MP4 muxing
 native/desktop-app       egui UI, export state machine, diagnostics
+native/places-core        Google/Overpass lookup, ranking, parsing, HTTP mocks
 legacy-web/              Previous browser prototype (not the release path)
 packaging/               Windows packaging helpers
 dist/                    Checked-in packaged executable
