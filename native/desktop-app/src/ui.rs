@@ -810,11 +810,24 @@ impl NativeApp {
             self.pending_tiles.clear();
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("預覽位置");
-                ui.add(egui::Slider::new(&mut self.preview_progress, 0.0..=1.0).show_value(false));
-                ui.label("拖曳平移 · 滾輪縮放");
-            });
+            if self.language == Language::English {
+                ui.horizontal(|ui| {
+                    ui.label("Timeline");
+                    ui.add(
+                        egui::Slider::new(&mut self.preview_progress, 0.0..=1.0).show_value(false),
+                    );
+                    ui.label("Drag to pan · Scroll to zoom");
+                });
+            }
+            if self.language == Language::TraditionalChinese {
+                ui.horizontal(|ui| {
+                    ui.label("預覽位置");
+                    ui.add(
+                        egui::Slider::new(&mut self.preview_progress, 0.0..=1.0).show_value(false),
+                    );
+                    ui.label("拖曳平移 · 滾輪縮放");
+                });
+            }
             let available = ui.available_size();
             let (response, painter) = ui.allocate_painter(available, egui::Sense::drag());
             let rect = response.rect;
@@ -1002,12 +1015,28 @@ impl NativeApp {
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_gray(90),
             );
-            if self.model.settings.scene.show_hud {
+            if self.model.settings.scene.show_hud && self.language == Language::TraditionalChinese {
                 painter.text(
                     rect.min + egui::vec2(24.0, 24.0),
                     egui::Align2::LEFT_TOP,
                     format!(
                         "公里數 {:.2} km    海拔 {}",
+                        frame.distance_m / 1000.0,
+                        frame
+                            .elevation_m
+                            .map(|value| format!("{value:.0} m"))
+                            .unwrap_or_else(|| "-- m".to_owned())
+                    ),
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::WHITE,
+                );
+            }
+            if self.model.settings.scene.show_hud && self.language == Language::English {
+                painter.text(
+                    rect.min + egui::vec2(24.0, 24.0),
+                    egui::Align2::LEFT_TOP,
+                    format!(
+                        "Distance {:.2} km    Elevation {}",
                         frame.distance_m / 1000.0,
                         frame
                             .elevation_m
