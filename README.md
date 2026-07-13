@@ -4,10 +4,10 @@
 
 ## 使用方式
 
-執行 [GPX-Animator-GPU.exe](dist/GPX-Animator-GPU.exe)，選擇 GPX 後設定畫面與輸出。也可以把 `.gpx` 拖入視窗，或用命令列直接開啟：
+執行最新的 [GPX-Animator-GPU-20260713.exe](dist/GPX-Animator-GPU-20260713.exe)，選擇 GPX 後設定畫面與輸出。也可以把 `.gpx` 拖入視窗，或用命令列直接開啟：
 
 ```powershell
-.\dist\GPX-Animator-GPU.exe "D:\path\route.gpx"
+.\dist\GPX-Animator-GPU-20260713.exe "D:\path\route.gpx"
 ```
 
 預設為 3840×2160、60 FPS、H.265、NVENC P5/CQ19 高畫質、衛星圖、6 px 路線。支援 16:9、1:1、9:16，完整、跟隨（結尾平滑縮放至全景）與自由拖曳／滾輪縮放視角，以及 HUD、海拔圖、H.264 和取消輸出。MP4 會在完成後自動將 `moov` 移到檔案前端（fast-start），方便播放器立即開始播放。
