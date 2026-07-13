@@ -86,6 +86,29 @@ fn resolution_label(long_edge: u32, language: UiLanguage) -> String {
     }
 }
 
+fn localized_error(language: UiLanguage, message: &str) -> String {
+    if language == UiLanguage::TraditionalChinese {
+        return message.to_owned();
+    }
+    if message.contains("需要具備所選 NVENC") {
+        return "A compatible NVIDIA RTX/NVENC adapter is required; duplicate exports are disabled."
+            .to_owned();
+    }
+    if message.contains("請先載入 GPX") {
+        return "Load a GPX track and choose an output file first.".to_owned();
+    }
+    if message.contains("匯出已取消") {
+        return "Export cancelled.".to_owned();
+    }
+    if message.contains("讀取 GPX 失敗") {
+        return message.replacen("讀取 GPX 失敗", "Failed to read GPX", 1);
+    }
+    if message.contains("地圖圖磚失敗") {
+        return message.replacen("地圖圖磚失敗", "Map tile failed", 1);
+    }
+    message.to_owned()
+}
+
 impl NativeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&cc.egui_ctx);
@@ -595,7 +618,10 @@ impl NativeApp {
                         }
                     }
                     if let Some(error) = &self.last_error {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            localized_error(self.language, error),
+                        );
                     }
                 });
             });
@@ -859,7 +885,10 @@ impl NativeApp {
                         }
                     }
                     if let Some(error) = &self.last_error {
-                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            localized_error(self.language, error),
+                        );
                     }
                 });
             });
@@ -1407,5 +1436,16 @@ mod tests {
         );
         assert_eq!(options.camera_mode, CameraMode::Free);
         assert!(options.free_camera_center.is_some());
+    }
+    #[test]
+    fn english_localizes_core_export_errors() {
+        assert!(localized_error(UiLanguage::English, "匯出已取消").contains("cancelled"));
+        assert!(
+            localized_error(UiLanguage::English, "請先載入 GPX 並選擇輸出檔案").contains("Load")
+        );
+        assert_eq!(
+            localized_error(UiLanguage::TraditionalChinese, "錯誤"),
+            "錯誤"
+        );
     }
 }

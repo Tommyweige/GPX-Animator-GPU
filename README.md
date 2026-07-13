@@ -10,13 +10,13 @@
 .\dist\GPX-Animator-GPU.exe "D:\path\route.gpx"
 ```
 
-預設為 3840×2160、60 FPS、H.265、NVENC P4/CQ22、淺色 OpenStreetMap、6 px 路線。支援 16:9、1:1、9:16，完整、跟隨與自由拖曳／滾輪縮放視角，以及 HUD、海拔圖、H.264 和取消輸出。
+預設為 3840×2160、60 FPS、H.265、NVENC P5/CQ19 高畫質、衛星圖、6 px 路線。支援 16:9、1:1、9:16，完整、跟隨（結尾平滑縮放至全景）與自由拖曳／滾輪縮放視角，以及 HUD、海拔圖、H.264 和取消輸出。MP4 會在完成後自動將 `moov` 移到檔案前端（fast-start），方便播放器立即開始播放。
 
 ## 系統需求
 
 - Windows 10/11 x64
 - NVIDIA RTX 顯示卡與支援 NVENC 的 NVIDIA 驅動
-- 網路連線用於首次下載 OpenStreetMap 圖磚
+- 網路連線只用於首次下載地圖圖磚；圖磚會保存於 `%LOCALAPPDATA%\GPX Animator\cache`，之後可離線重用
 
 沒有 RTX 或 NVENC 時會拒絕輸出，不會退回 Intel QSV、CPU、AMD 或 WARP。圖磚快取與設定位於 `%LOCALAPPDATA%\GPX Animator`。
 
@@ -32,4 +32,4 @@ RTX release Gate 位於 `desktop-app` 的 ignored tests，涵蓋 20 秒與 5 分
 
 舊瀏覽器版本保存在 `legacy-web`，不屬於正式 EXE。
 
-OpenStreetMap 圖磚資料 © OpenStreetMap contributors。
+OpenStreetMap 圖磚資料 © OpenStreetMap contributors；衛星圖資料 © Esri、Maxar、Earthstar Geographics。
