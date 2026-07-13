@@ -870,11 +870,12 @@ impl D2dSceneRenderer {
             self.context.FillEllipse(&ellipse, &marker_brush);
         }
         if options.show_hud {
+            let overlay = scene_core::overlay_layout(options.aspect);
             let rect = D2D_RECT_F {
-                left: width as f32 * 0.04,
-                top: height as f32 * 0.04,
-                right: width as f32 * 0.50,
-                bottom: height as f32 * 0.16,
+                left: width as f32 * overlay.hud[0],
+                top: height as f32 * overlay.hud[1],
+                right: width as f32 * (overlay.hud[0] + overlay.hud[2]),
+                bottom: height as f32 * (overlay.hud[1] + overlay.hud[3]),
             };
             let text_rect = D2D_RECT_F {
                 left: rect.left + 24.0,
@@ -917,12 +918,13 @@ impl D2dSceneRenderer {
             }
         }
         if options.show_elevation && frame.elevation_line.len() > 1 {
-            let chart_left = width as f32 * 0.73;
-            let chart_right = width as f32 * 0.96;
+            let overlay = scene_core::overlay_layout(options.aspect);
+            let chart_left = width as f32 * overlay.elevation[0];
+            let chart_right = width as f32 * (overlay.elevation[0] + overlay.elevation[2]);
             // Compact, panel-free profile in the upper-right. The map remains the
             // primary visual and the profile is only a contextual cue.
-            let chart_top = height as f32 * 0.05;
-            let chart_bottom = height as f32 * 0.16;
+            let chart_top = height as f32 * overlay.elevation[1];
+            let chart_bottom = height as f32 * (overlay.elevation[1] + overlay.elevation[3]);
             let completed_fill = unsafe {
                 self.context
                     .CreateSolidColorBrush(

@@ -222,6 +222,24 @@ pub struct Layout {
     pub elevation: [f32; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayLayout {
+    /// Normalized left, top, width and height values.
+    pub hud: [f32; 4],
+    pub elevation: [f32; 4],
+    pub safe_margin: f32,
+    pub reference_height: f32,
+}
+
+pub fn overlay_layout(_aspect: Aspect) -> OverlayLayout {
+    OverlayLayout {
+        hud: [0.04, 0.04, 0.46, 0.12],
+        elevation: [0.73, 0.05, 0.23, 0.11],
+        safe_margin: 0.04,
+        reference_height: 2160.0,
+    }
+}
+
 pub fn layout(aspect: Aspect, long_edge: u32) -> Layout {
     let (width, height) = match aspect {
         Aspect::Landscape => (long_edge, long_edge * 9 / 16),
@@ -238,10 +256,10 @@ pub fn layout(aspect: Aspect, long_edge: u32) -> Layout {
             height as f32 * 0.12,
         ],
         elevation: [
-            width as f32 * 0.04,
-            height as f32 * 0.78,
-            width as f32 * 0.92,
-            height as f32 * 0.16,
+            width as f32 * 0.73,
+            height as f32 * 0.05,
+            width as f32 * 0.23,
+            height as f32 * 0.11,
         ],
     }
 }
@@ -298,6 +316,19 @@ mod tests {
             let value = layout(aspect, 3840);
             assert!(value.hud[0] + value.hud[2] <= value.width as f32);
             assert!(value.elevation[1] + value.elevation[3] <= value.height as f32);
+        }
+    }
+
+    #[test]
+    fn overlay_layout_has_stable_safe_rects() {
+        for aspect in [Aspect::Landscape, Aspect::Square, Aspect::Portrait] {
+            let value = overlay_layout(aspect);
+            for rect in [value.hud, value.elevation] {
+                assert!(rect[0] >= value.safe_margin);
+                assert!(rect[1] >= value.safe_margin);
+                assert!(rect[0] + rect[2] <= 1.0);
+                assert!(rect[1] + rect[3] <= 1.0);
+            }
         }
     }
     #[test]

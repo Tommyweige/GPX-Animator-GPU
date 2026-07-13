@@ -314,240 +314,245 @@ impl NativeApp {
             .resizable(true)
             .default_width(340.0)
             .show(ctx, |ui| {
-                ui.heading("01 載入軌跡");
-                if ui.button("選擇 GPX 檔案…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("GPX 軌跡", &["gpx"])
-                        .pick_file()
-                {
-                    self.load_gpx(path)
-                }
-                if let Some(track) = &self.track {
-                    ui.group(|ui| {
-                        ui.strong(&track.name);
-                        ui.horizontal(|ui| {
-                            ui.label(format!("{:.2} km", track.distance_m / 1000.0));
-                            ui.label(format!("爬升 {:.0} m", track.elevation_gain_m));
-                            ui.label(format!("GPS {} 點", track.source_point_count));
-                        });
-                        ui.small(format!(
-                            "偵測到 {} 筆停留記錄；勻速動畫不使用停留時間。",
-                            track.removed_stop_points
-                        ));
-                    });
-                }
-                ui.separator();
-                ui.heading("02 畫面設定");
-                egui::ComboBox::from_label("比例")
-                    .selected_text(match self.model.settings.scene.aspect {
-                        Aspect::Landscape => "16:9",
-                        Aspect::Square => "1:1",
-                        Aspect::Portrait => "9:16",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.aspect,
-                            Aspect::Landscape,
-                            "16:9",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.aspect,
-                            Aspect::Square,
-                            "1:1",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.aspect,
-                            Aspect::Portrait,
-                            "9:16",
-                        );
-                    });
-                let mut long_edge = current_long_edge(&self.model.settings);
-                egui::ComboBox::from_label("解析度")
-                    .selected_text(resolution_label(long_edge, self.language))
-                    .show_ui(ui, |ui| {
-                        for (edge, label) in [
-                            (3840, "4K · 3840"),
-                            (2560, "2.5K · 2560"),
-                            (1920, "1080p · 1920"),
-                            (1280, "720p · 1280"),
-                        ] {
-                            if ui.selectable_label(long_edge == edge, label).clicked() {
-                                long_edge = edge;
-                            }
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("自訂長邊");
-                    ui.add(
-                        egui::DragValue::new(&mut long_edge)
-                            .range(320..=8192)
-                            .speed(16),
-                    );
-                });
-                apply_long_edge(&mut self.model.settings, long_edge);
-                egui::ComboBox::from_label("地圖樣式")
-                    .selected_text(format!("{:?}", self.model.settings.scene.map_style))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Light,
-                            "淺色地圖",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Dark,
-                            "深色地圖",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Satellite,
-                            "衛星圖",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Transparent,
-                            "透明背景",
-                        );
-                    });
-                egui::ComboBox::from_label("攝影機")
-                    .selected_text(format!("{:?}", self.model.settings.scene.camera_mode))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.camera_mode,
-                            CameraMode::Fit,
-                            "顯示完整路線",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.camera_mode,
-                            CameraMode::Follow,
-                            "跟隨標記",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.camera_mode,
-                            CameraMode::Free,
-                            "自由拖曳／縮放",
-                        );
-                    });
-                ui.add(
-                    egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
-                        .text("路線寬度 px"),
-                );
-                ui.checkbox(&mut self.model.settings.scene.show_hud, "顯示 HUD");
-                ui.checkbox(&mut self.model.settings.scene.show_elevation, "顯示海拔圖");
-                ui.separator();
-                ui.heading("03 輸出");
-                egui::ComboBox::from_label("Codec")
-                    .selected_text(format!("{:?}", self.model.settings.codec))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.codec,
-                            Codec::Hevc,
-                            "H.265 / HEVC",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.codec,
-                            Codec::H264,
-                            "H.264 / AVC",
-                        );
-                    });
-                egui::ComboBox::from_label("品質")
-                    .selected_text(format!("{:?}", self.model.settings.quality))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.quality,
-                            QualityPreset::Balanced,
-                            "平衡 P4 / CQ22",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.quality,
-                            QualityPreset::Quality,
-                            "高畫質 P5 / CQ19",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.quality,
-                            QualityPreset::Speed,
-                            "高速 P3 / CQ25",
-                        );
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("影片秒數");
-                    ui.add(
-                        egui::DragValue::new(&mut self.model.settings.duration_seconds)
-                            .range(1..=3600),
-                    );
-                });
-                egui::ComboBox::from_label("幀數 (FPS)")
-                    .selected_text(format!("{} FPS", self.model.settings.fps))
-                    .show_ui(ui, |ui| {
-                        for fps in [24, 30, 60, 120] {
-                            ui.selectable_value(
-                                &mut self.model.settings.fps,
-                                fps,
-                                format!("{fps} FPS"),
-                            );
-                        }
-                    });
-                if ui.button("選擇輸出 MP4…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("MP4 影片", &["mp4"])
-                        .set_file_name("gpx-animation.mp4")
-                        .save_file()
-                {
-                    self.output_path = Some(path)
-                }
-                if let Some(path) = &self.output_path {
-                    ui.small(path.display().to_string());
-                }
-                match &self.model.state {
-                    JobState::Running(value) => {
-                        if value.stage == nvenc_engine::ExportStage::Preflight {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("01 載入軌跡");
+                    if ui.button("選擇 GPX 檔案…").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("GPX 軌跡", &["gpx"])
+                            .pick_file()
+                    {
+                        self.load_gpx(path)
+                    }
+                    if let Some(track) = &self.track {
+                        ui.group(|ui| {
+                            ui.strong(&track.name);
                             ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("正在讀取本地地圖快取並補齊缺少圖磚…");
+                                ui.label(format!("{:.2} km", track.distance_m / 1000.0));
+                                ui.label(format!("爬升 {:.0} m", track.elevation_gain_m));
+                                ui.label(format!("GPS {} 點", track.source_point_count));
                             });
-                        }
-                        let ratio = if value.total_frames == 0 {
-                            0.0
-                        } else {
-                            value.completed_frames as f32 / value.total_frames as f32
-                        };
-                        let status = if value.stage == nvenc_engine::ExportStage::Preflight {
-                            format!("地圖圖磚 {}/{}", value.completed_frames, value.total_frames)
-                        } else {
-                            format!(
-                                "影片 {} FPS · 輸出 {:.1} fps ({:.2}×) · ETA {:.1}s",
-                                self.model.settings.fps,
-                                value.fps,
-                                value.fps / self.model.settings.fps as f64,
-                                value.eta_seconds
-                            )
-                        };
-                        ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
-                        if ui.button("取消匯出").clicked() {
-                            if let Some(token) = &self.active_token {
-                                token.cancel()
+                            ui.small(format!(
+                                "偵測到 {} 筆停留記錄；勻速動畫不使用停留時間。",
+                                track.removed_stop_points
+                            ));
+                        });
+                    }
+                    ui.separator();
+                    ui.heading("02 畫面設定");
+                    egui::ComboBox::from_label("比例")
+                        .selected_text(match self.model.settings.scene.aspect {
+                            Aspect::Landscape => "16:9",
+                            Aspect::Square => "1:1",
+                            Aspect::Portrait => "9:16",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.aspect,
+                                Aspect::Landscape,
+                                "16:9",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.aspect,
+                                Aspect::Square,
+                                "1:1",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.aspect,
+                                Aspect::Portrait,
+                                "9:16",
+                            );
+                        });
+                    let mut long_edge = current_long_edge(&self.model.settings);
+                    egui::ComboBox::from_label("解析度")
+                        .selected_text(resolution_label(long_edge, self.language))
+                        .show_ui(ui, |ui| {
+                            for (edge, label) in [
+                                (3840, "4K · 3840"),
+                                (2560, "2.5K · 2560"),
+                                (1920, "1080p · 1920"),
+                                (1280, "720p · 1280"),
+                            ] {
+                                if ui.selectable_label(long_edge == edge, label).clicked() {
+                                    long_edge = edge;
+                                }
                             }
-                            self.model.cancel();
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("自訂長邊");
+                        ui.add(
+                            egui::DragValue::new(&mut long_edge)
+                                .range(320..=8192)
+                                .speed(16),
+                        );
+                    });
+                    apply_long_edge(&mut self.model.settings, long_edge);
+                    egui::ComboBox::from_label("地圖樣式")
+                        .selected_text(format!("{:?}", self.model.settings.scene.map_style))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Light,
+                                "淺色地圖",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Dark,
+                                "深色地圖",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Satellite,
+                                "衛星圖",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Transparent,
+                                "透明背景",
+                            );
+                        });
+                    egui::ComboBox::from_label("攝影機")
+                        .selected_text(format!("{:?}", self.model.settings.scene.camera_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.camera_mode,
+                                CameraMode::Fit,
+                                "顯示完整路線",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.camera_mode,
+                                CameraMode::Follow,
+                                "跟隨標記",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.camera_mode,
+                                CameraMode::Free,
+                                "自由拖曳／縮放",
+                            );
+                        });
+                    ui.add(
+                        egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
+                            .text("路線寬度 px"),
+                    );
+                    ui.checkbox(&mut self.model.settings.scene.show_hud, "顯示 HUD");
+                    ui.checkbox(&mut self.model.settings.scene.show_elevation, "顯示海拔圖");
+                    ui.separator();
+                    ui.heading("03 輸出");
+                    egui::ComboBox::from_label("Codec")
+                        .selected_text(format!("{:?}", self.model.settings.codec))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.codec,
+                                Codec::Hevc,
+                                "H.265 / HEVC",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.codec,
+                                Codec::H264,
+                                "H.264 / AVC",
+                            );
+                        });
+                    egui::ComboBox::from_label("品質")
+                        .selected_text(format!("{:?}", self.model.settings.quality))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.quality,
+                                QualityPreset::Balanced,
+                                "平衡 P4 / CQ22",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.quality,
+                                QualityPreset::Quality,
+                                "高畫質 P5 / CQ19",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.quality,
+                                QualityPreset::Speed,
+                                "高速 P3 / CQ25",
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("影片秒數");
+                        ui.add(
+                            egui::DragValue::new(&mut self.model.settings.duration_seconds)
+                                .range(1..=3600),
+                        );
+                    });
+                    egui::ComboBox::from_label("幀數 (FPS)")
+                        .selected_text(format!("{} FPS", self.model.settings.fps))
+                        .show_ui(ui, |ui| {
+                            for fps in [24, 30, 60, 120] {
+                                ui.selectable_value(
+                                    &mut self.model.settings.fps,
+                                    fps,
+                                    format!("{fps} FPS"),
+                                );
+                            }
+                        });
+                    if ui.button("選擇輸出 MP4…").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("MP4 影片", &["mp4"])
+                            .set_file_name("gpx-animation.mp4")
+                            .save_file()
+                    {
+                        self.output_path = Some(path)
+                    }
+                    if let Some(path) = &self.output_path {
+                        ui.small(path.display().to_string());
+                    }
+                    match &self.model.state {
+                        JobState::Running(value) => {
+                            if value.stage == nvenc_engine::ExportStage::Preflight {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("正在讀取本地地圖快取並補齊缺少圖磚…");
+                                });
+                            }
+                            let ratio = if value.total_frames == 0 {
+                                0.0
+                            } else {
+                                value.completed_frames as f32 / value.total_frames as f32
+                            };
+                            let status = if value.stage == nvenc_engine::ExportStage::Preflight {
+                                format!(
+                                    "地圖圖磚 {}/{}",
+                                    value.completed_frames, value.total_frames
+                                )
+                            } else {
+                                format!(
+                                    "影片 {} FPS · 輸出 {:.1} fps ({:.2}×) · ETA {:.1}s",
+                                    self.model.settings.fps,
+                                    value.fps,
+                                    value.fps / self.model.settings.fps as f64,
+                                    value.eta_seconds
+                                )
+                            };
+                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
+                            if ui.button("取消匯出").clicked() {
+                                if let Some(token) = &self.active_token {
+                                    token.cancel()
+                                }
+                                self.model.cancel();
+                            }
+                        }
+                        _ => {
+                            if ui
+                                .add_enabled(
+                                    self.track.is_some() && self.model.can_export(),
+                                    egui::Button::new(format!(
+                                        "輸出 4K{} MP4",
+                                        self.model.settings.fps
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.start_export();
+                            }
                         }
                     }
-                    _ => {
-                        if ui
-                            .add_enabled(
-                                self.track.is_some() && self.model.can_export(),
-                                egui::Button::new(format!(
-                                    "輸出 4K{} MP4",
-                                    self.model.settings.fps
-                                )),
-                            )
-                            .clicked()
-                        {
-                            self.start_export();
-                        }
+                    if let Some(error) = &self.last_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
                     }
-                }
-                if let Some(error) = &self.last_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                }
+                });
             });
     }
 
@@ -556,249 +561,251 @@ impl NativeApp {
             .resizable(true)
             .default_width(340.0)
             .show(ctx, |ui| {
-                ui.heading("01  Load track");
-                if ui.button("Choose GPX file").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("GPX track", &["gpx"])
-                        .pick_file()
-                {
-                    self.load_gpx(path);
-                }
-                if let Some(track) = &self.track {
-                    ui.group(|ui| {
-                        ui.strong(&track.name);
-                        ui.horizontal(|ui| {
-                            ui.label(format!("{:.2} km", track.distance_m / 1000.0));
-                            ui.label(format!("Gain {:.0} m", track.elevation_gain_m));
-                            ui.label(format!("GPS points {}", track.source_point_count));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("01  Load track");
+                    if ui.button("Choose GPX file").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("GPX track", &["gpx"])
+                            .pick_file()
+                    {
+                        self.load_gpx(path);
+                    }
+                    if let Some(track) = &self.track {
+                        ui.group(|ui| {
+                            ui.strong(&track.name);
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{:.2} km", track.distance_m / 1000.0));
+                                ui.label(format!("Gain {:.0} m", track.elevation_gain_m));
+                                ui.label(format!("GPS points {}", track.source_point_count));
+                            });
+                            ui.small(format!("Filtered stops: {}", track.removed_stop_points));
                         });
-                        ui.small(format!("Filtered stops: {}", track.removed_stop_points));
-                    });
-                }
-                ui.separator();
-                ui.heading("02  Scene");
-                egui::ComboBox::from_label("Aspect ratio")
-                    .selected_text(match self.model.settings.scene.aspect {
-                        Aspect::Landscape => "16:9",
-                        Aspect::Square => "1:1",
-                        Aspect::Portrait => "9:16",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.aspect,
-                            Aspect::Landscape,
-                            "16:9",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.aspect,
-                            Aspect::Square,
-                            "1:1",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.aspect,
-                            Aspect::Portrait,
-                            "9:16",
-                        );
-                    });
-                let mut long_edge = current_long_edge(&self.model.settings);
-                egui::ComboBox::from_label("Resolution")
-                    .selected_text(resolution_label(long_edge, UiLanguage::English))
-                    .show_ui(ui, |ui| {
-                        for (edge, label) in [
-                            (3840, "4K · 3840"),
-                            (2560, "2.5K · 2560"),
-                            (1920, "1080p · 1920"),
-                            (1280, "720p · 1280"),
-                        ] {
-                            if ui.selectable_label(long_edge == edge, label).clicked() {
-                                long_edge = edge;
-                            }
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("Custom long edge");
-                    ui.add(
-                        egui::DragValue::new(&mut long_edge)
-                            .range(320..=8192)
-                            .speed(16),
-                    );
-                });
-                apply_long_edge(&mut self.model.settings, long_edge);
-                egui::ComboBox::from_label("Map style")
-                    .selected_text(match self.model.settings.scene.map_style {
-                        MapStyle::Light => "Light",
-                        MapStyle::Dark => "Dark",
-                        MapStyle::Satellite => "Satellite",
-                        MapStyle::Transparent => "Transparent",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Light,
-                            "Light",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Dark,
-                            "Dark",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Satellite,
-                            "Satellite",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Transparent,
-                            "Transparent",
-                        );
-                    });
-                egui::ComboBox::from_label("Camera")
-                    .selected_text(match self.model.settings.scene.camera_mode {
-                        CameraMode::Fit => "Fit route",
-                        CameraMode::Follow => "Follow route",
-                        CameraMode::Free => "Free pan / zoom",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.camera_mode,
-                            CameraMode::Fit,
-                            "Fit route",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.camera_mode,
-                            CameraMode::Follow,
-                            "Follow route",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.camera_mode,
-                            CameraMode::Free,
-                            "Free pan / zoom",
-                        );
-                    });
-                ui.add(
-                    egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
-                        .text("Route width (px)"),
-                );
-                ui.checkbox(&mut self.model.settings.scene.show_hud, "Show HUD");
-                ui.checkbox(
-                    &mut self.model.settings.scene.show_elevation,
-                    "Show elevation profile",
-                );
-                ui.separator();
-                ui.heading("03  Export");
-                egui::ComboBox::from_label("Codec")
-                    .selected_text(match self.model.settings.codec {
-                        Codec::Hevc => "H.265 / HEVC",
-                        Codec::H264 => "H.264 / AVC",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.codec,
-                            Codec::Hevc,
-                            "H.265 / HEVC",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.codec,
-                            Codec::H264,
-                            "H.264 / AVC",
-                        );
-                    });
-                egui::ComboBox::from_label("Quality")
-                    .selected_text(match self.model.settings.quality {
-                        QualityPreset::Balanced => "Balanced",
-                        QualityPreset::Quality => "High",
-                        QualityPreset::Speed => "Speed",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.model.settings.quality,
-                            QualityPreset::Balanced,
-                            "Balanced",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.quality,
-                            QualityPreset::Quality,
-                            "High",
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.quality,
-                            QualityPreset::Speed,
-                            "Speed",
-                        );
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("Route seconds");
-                    ui.add(
-                        egui::DragValue::new(&mut self.model.settings.duration_seconds)
-                            .range(1..=3600),
-                    );
-                });
-                egui::ComboBox::from_label("Frame rate")
-                    .selected_text(format!("{} FPS", self.model.settings.fps))
-                    .show_ui(ui, |ui| {
-                        for fps in [24, 30, 60, 120] {
+                    }
+                    ui.separator();
+                    ui.heading("02  Scene");
+                    egui::ComboBox::from_label("Aspect ratio")
+                        .selected_text(match self.model.settings.scene.aspect {
+                            Aspect::Landscape => "16:9",
+                            Aspect::Square => "1:1",
+                            Aspect::Portrait => "9:16",
+                        })
+                        .show_ui(ui, |ui| {
                             ui.selectable_value(
-                                &mut self.model.settings.fps,
-                                fps,
-                                format!("{fps} FPS"),
+                                &mut self.model.settings.scene.aspect,
+                                Aspect::Landscape,
+                                "16:9",
                             );
-                        }
-                    });
-                if ui.button("Choose output MP4").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("MP4 video", &["mp4"])
-                        .set_file_name("gpx-animation.mp4")
-                        .save_file()
-                {
-                    self.output_path = Some(path);
-                }
-                if let Some(path) = &self.output_path {
-                    ui.small(path.display().to_string());
-                }
-                match &self.model.state {
-                    JobState::Running(value) => {
-                        let ratio = if value.total_frames == 0 {
-                            0.0
-                        } else {
-                            value.completed_frames as f32 / value.total_frames as f32
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(ratio)
-                                .show_percentage()
-                                .text(format!(
-                                    "{} / {} · {:.1} FPS · ETA {:.1}s",
-                                    value.completed_frames,
-                                    value.total_frames,
-                                    value.fps,
-                                    value.eta_seconds
-                                )),
-                        );
-                        if ui.button("Cancel").clicked() {
-                            if let Some(token) = &self.active_token {
-                                token.cancel();
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.aspect,
+                                Aspect::Square,
+                                "1:1",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.aspect,
+                                Aspect::Portrait,
+                                "9:16",
+                            );
+                        });
+                    let mut long_edge = current_long_edge(&self.model.settings);
+                    egui::ComboBox::from_label("Resolution")
+                        .selected_text(resolution_label(long_edge, UiLanguage::English))
+                        .show_ui(ui, |ui| {
+                            for (edge, label) in [
+                                (3840, "4K · 3840"),
+                                (2560, "2.5K · 2560"),
+                                (1920, "1080p · 1920"),
+                                (1280, "720p · 1280"),
+                            ] {
+                                if ui.selectable_label(long_edge == edge, label).clicked() {
+                                    long_edge = edge;
+                                }
                             }
-                            self.model.cancel();
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("Custom long edge");
+                        ui.add(
+                            egui::DragValue::new(&mut long_edge)
+                                .range(320..=8192)
+                                .speed(16),
+                        );
+                    });
+                    apply_long_edge(&mut self.model.settings, long_edge);
+                    egui::ComboBox::from_label("Map style")
+                        .selected_text(match self.model.settings.scene.map_style {
+                            MapStyle::Light => "Light",
+                            MapStyle::Dark => "Dark",
+                            MapStyle::Satellite => "Satellite",
+                            MapStyle::Transparent => "Transparent",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Light,
+                                "Light",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Dark,
+                                "Dark",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Satellite,
+                                "Satellite",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.map_style,
+                                MapStyle::Transparent,
+                                "Transparent",
+                            );
+                        });
+                    egui::ComboBox::from_label("Camera")
+                        .selected_text(match self.model.settings.scene.camera_mode {
+                            CameraMode::Fit => "Fit route",
+                            CameraMode::Follow => "Follow route",
+                            CameraMode::Free => "Free pan / zoom",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.camera_mode,
+                                CameraMode::Fit,
+                                "Fit route",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.camera_mode,
+                                CameraMode::Follow,
+                                "Follow route",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.scene.camera_mode,
+                                CameraMode::Free,
+                                "Free pan / zoom",
+                            );
+                        });
+                    ui.add(
+                        egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
+                            .text("Route width (px)"),
+                    );
+                    ui.checkbox(&mut self.model.settings.scene.show_hud, "Show HUD");
+                    ui.checkbox(
+                        &mut self.model.settings.scene.show_elevation,
+                        "Show elevation profile",
+                    );
+                    ui.separator();
+                    ui.heading("03  Export");
+                    egui::ComboBox::from_label("Codec")
+                        .selected_text(match self.model.settings.codec {
+                            Codec::Hevc => "H.265 / HEVC",
+                            Codec::H264 => "H.264 / AVC",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.codec,
+                                Codec::Hevc,
+                                "H.265 / HEVC",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.codec,
+                                Codec::H264,
+                                "H.264 / AVC",
+                            );
+                        });
+                    egui::ComboBox::from_label("Quality")
+                        .selected_text(match self.model.settings.quality {
+                            QualityPreset::Balanced => "Balanced",
+                            QualityPreset::Quality => "High",
+                            QualityPreset::Speed => "Speed",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.model.settings.quality,
+                                QualityPreset::Balanced,
+                                "Balanced",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.quality,
+                                QualityPreset::Quality,
+                                "High",
+                            );
+                            ui.selectable_value(
+                                &mut self.model.settings.quality,
+                                QualityPreset::Speed,
+                                "Speed",
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("Route seconds");
+                        ui.add(
+                            egui::DragValue::new(&mut self.model.settings.duration_seconds)
+                                .range(1..=3600),
+                        );
+                    });
+                    egui::ComboBox::from_label("Frame rate")
+                        .selected_text(format!("{} FPS", self.model.settings.fps))
+                        .show_ui(ui, |ui| {
+                            for fps in [24, 30, 60, 120] {
+                                ui.selectable_value(
+                                    &mut self.model.settings.fps,
+                                    fps,
+                                    format!("{fps} FPS"),
+                                );
+                            }
+                        });
+                    if ui.button("Choose output MP4").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("MP4 video", &["mp4"])
+                            .set_file_name("gpx-animation.mp4")
+                            .save_file()
+                    {
+                        self.output_path = Some(path);
+                    }
+                    if let Some(path) = &self.output_path {
+                        ui.small(path.display().to_string());
+                    }
+                    match &self.model.state {
+                        JobState::Running(value) => {
+                            let ratio = if value.total_frames == 0 {
+                                0.0
+                            } else {
+                                value.completed_frames as f32 / value.total_frames as f32
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(ratio)
+                                    .show_percentage()
+                                    .text(format!(
+                                        "{} / {} · {:.1} FPS · ETA {:.1}s",
+                                        value.completed_frames,
+                                        value.total_frames,
+                                        value.fps,
+                                        value.eta_seconds
+                                    )),
+                            );
+                            if ui.button("Cancel").clicked() {
+                                if let Some(token) = &self.active_token {
+                                    token.cancel();
+                                }
+                                self.model.cancel();
+                            }
+                        }
+                        _ => {
+                            if ui
+                                .add_enabled(
+                                    self.track.is_some() && self.model.can_export(),
+                                    egui::Button::new(format!(
+                                        "Export {} FPS MP4",
+                                        self.model.settings.fps
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.start_export();
+                            }
                         }
                     }
-                    _ => {
-                        if ui
-                            .add_enabled(
-                                self.track.is_some() && self.model.can_export(),
-                                egui::Button::new(format!(
-                                    "Export {} FPS MP4",
-                                    self.model.settings.fps
-                                )),
-                            )
-                            .clicked()
-                        {
-                            self.start_export();
-                        }
+                    if let Some(error) = &self.last_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
                     }
-                }
-                if let Some(error) = &self.last_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, error);
-                }
+                });
             });
     }
 
@@ -937,14 +944,15 @@ impl NativeApp {
                 egui::Color32::from_rgb(255, 93, 59),
             );
             if self.model.settings.scene.show_elevation && frame.elevation_line.len() > 1 {
+                let overlay = scene_core::overlay_layout(self.model.settings.scene.aspect);
                 let chart = egui::Rect::from_min_max(
                     egui::pos2(
-                        rect.left() + rect.width() * 0.73,
-                        rect.top() + rect.height() * 0.05,
+                        rect.left() + rect.width() * overlay.elevation[0],
+                        rect.top() + rect.height() * overlay.elevation[1],
                     ),
                     egui::pos2(
-                        rect.left() + rect.width() * 0.96,
-                        rect.top() + rect.height() * 0.16,
+                        rect.left() + rect.width() * (overlay.elevation[0] + overlay.elevation[2]),
+                        rect.top() + rect.height() * (overlay.elevation[1] + overlay.elevation[3]),
                     ),
                 );
                 let elevation_point = |point: [f32; 2]| {
