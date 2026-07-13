@@ -3,7 +3,7 @@ use mp4::{
     TrackConfig, TrackType,
 };
 use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -370,6 +370,241 @@ impl<W: Write + Seek> HevcMp4Writer<W> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TopLevelBox {
+    kind: [u8; 4],
+    offset: u64,
+    size: u64,
+}
+
+fn box_header_at(
+    file: &mut File,
+    offset: u64,
+    file_len: u64,
+) -> Result<Option<TopLevelBox>, Mp4Error> {
+    if offset >= file_len {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header)?;
+    let size32 = u32::from_be_bytes(header[..4].try_into().unwrap());
+    let kind = header[4..8].try_into().unwrap();
+    let (header_size, size) = if size32 == 1 {
+        let mut extended = [0u8; 8];
+        file.read_exact(&mut extended)?;
+        (16, u64::from_be_bytes(extended))
+    } else if size32 == 0 {
+        (8, file_len - offset)
+    } else {
+        (8, size32 as u64)
+    };
+    if size < header_size || offset.saturating_add(size) > file_len {
+        return Err(Mp4Error::InvalidBox);
+    }
+    Ok(Some(TopLevelBox { kind, offset, size }))
+}
+
+fn read_top_level_boxes(path: &Path) -> Result<Vec<TopLevelBox>, Mp4Error> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut offset = 0;
+    let mut boxes = Vec::new();
+    while let Some(value) = box_header_at(&mut file, offset, length)? {
+        offset = offset.saturating_add(value.size);
+        boxes.push(value);
+    }
+    Ok(boxes)
+}
+
+fn read_box_bytes(file: &mut File, value: TopLevelBox) -> Result<Vec<u8>, Mp4Error> {
+    let size = usize::try_from(value.size).map_err(|_| Mp4Error::InvalidBox)?;
+    let mut bytes = vec![0u8; size];
+    file.seek(SeekFrom::Start(value.offset))?;
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn nested_box_size(
+    bytes: &[u8],
+    offset: usize,
+    end: usize,
+) -> Result<(usize, usize, [u8; 4]), Mp4Error> {
+    if offset.checked_add(8).is_none_or(|value| value > end) {
+        return Err(Mp4Error::InvalidBox);
+    }
+    let size32 = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let kind = bytes[offset + 4..offset + 8].try_into().unwrap();
+    let (header, size) = if size32 == 1 {
+        if offset + 16 > end {
+            return Err(Mp4Error::InvalidBox);
+        }
+        (
+            16,
+            usize::try_from(u64::from_be_bytes(
+                bytes[offset + 8..offset + 16].try_into().unwrap(),
+            ))
+            .map_err(|_| Mp4Error::InvalidBox)?,
+        )
+    } else if size32 == 0 {
+        (8, end - offset)
+    } else {
+        (8, size32 as usize)
+    };
+    if size < header || offset.saturating_add(size) > end {
+        return Err(Mp4Error::InvalidBox);
+    }
+    Ok((header, size, kind))
+}
+
+fn is_container(kind: &[u8; 4]) -> bool {
+    matches!(
+        kind,
+        b"moov"
+            | b"trak"
+            | b"mdia"
+            | b"minf"
+            | b"stbl"
+            | b"dinf"
+            | b"edts"
+            | b"udta"
+            | b"mvex"
+            | b"meta"
+            | b"ilst"
+            | b"ipro"
+            | b"sinf"
+            | b"schi"
+    )
+}
+
+fn patch_chunk_offsets(bytes: &mut [u8], delta: u64) -> Result<(), Mp4Error> {
+    fn walk(bytes: &mut [u8], start: usize, end: usize, delta: u64) -> Result<(), Mp4Error> {
+        let mut offset = start;
+        while offset < end {
+            let (header, size, kind) = nested_box_size(bytes, offset, end)?;
+            let payload = offset + header;
+            let box_end = offset + size;
+            match &kind {
+                b"stco" => {
+                    if payload + 8 > box_end {
+                        return Err(Mp4Error::InvalidBox);
+                    }
+                    let count =
+                        u32::from_be_bytes(bytes[payload + 4..payload + 8].try_into().unwrap())
+                            as usize;
+                    let end_entries = payload
+                        .checked_add(8)
+                        .and_then(|value| value.checked_add(count.saturating_mul(4)))
+                        .ok_or(Mp4Error::InvalidBox)?;
+                    if end_entries > box_end {
+                        return Err(Mp4Error::InvalidBox);
+                    }
+                    for index in 0..count {
+                        let at = payload + 8 + index * 4;
+                        let value =
+                            u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as u64;
+                        let shifted = value
+                            .checked_add(delta)
+                            .ok_or(Mp4Error::ChunkOffsetOverflow)?;
+                        let shifted =
+                            u32::try_from(shifted).map_err(|_| Mp4Error::ChunkOffsetOverflow)?;
+                        bytes[at..at + 4].copy_from_slice(&shifted.to_be_bytes());
+                    }
+                }
+                b"co64" => {
+                    if payload + 8 > box_end {
+                        return Err(Mp4Error::InvalidBox);
+                    }
+                    let count =
+                        u32::from_be_bytes(bytes[payload + 4..payload + 8].try_into().unwrap())
+                            as usize;
+                    let end_entries = payload
+                        .checked_add(8)
+                        .and_then(|value| value.checked_add(count.saturating_mul(8)))
+                        .ok_or(Mp4Error::InvalidBox)?;
+                    if end_entries > box_end {
+                        return Err(Mp4Error::InvalidBox);
+                    }
+                    for index in 0..count {
+                        let at = payload + 8 + index * 8;
+                        let value = u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+                        let shifted = value
+                            .checked_add(delta)
+                            .ok_or(Mp4Error::ChunkOffsetOverflow)?;
+                        bytes[at..at + 8].copy_from_slice(&shifted.to_be_bytes());
+                    }
+                }
+                _ if is_container(&kind) => {
+                    // `meta` is a FullBox and has a four-byte version/flags
+                    // prefix before its child boxes.
+                    let child_start = if &kind == b"meta" {
+                        payload + 4
+                    } else {
+                        payload
+                    };
+                    if child_start <= box_end {
+                        walk(bytes, child_start, box_end, delta)?;
+                    }
+                }
+                _ => {}
+            }
+            offset = box_end;
+        }
+        Ok(())
+    }
+    let (_, size, kind) = nested_box_size(bytes, 0, bytes.len())?;
+    if &kind != b"moov" {
+        return Err(Mp4Error::InvalidBox);
+    }
+    walk(bytes, 8, size, delta)
+}
+
+/// Move the metadata box before media data so players can start without
+/// seeking to the end of a large recording. The operation streams the mdat
+/// payload and only keeps the small moov box in memory.
+pub fn fast_start_file(path: impl AsRef<Path>) -> Result<(), Mp4Error> {
+    let path = path.as_ref();
+    let boxes = read_top_level_boxes(path)?;
+    let ftyp = boxes.iter().find(|value| &value.kind == b"ftyp").copied();
+    let mdat = boxes.iter().find(|value| &value.kind == b"mdat").copied();
+    let moov = boxes.iter().find(|value| &value.kind == b"moov").copied();
+    let (Some(ftyp), Some(mdat), Some(moov)) = (ftyp, mdat, moov) else {
+        return Err(Mp4Error::InvalidBox);
+    };
+    if moov.offset < mdat.offset {
+        return Ok(());
+    }
+    if ftyp.offset != 0 || ftyp.offset + ftyp.size != mdat.offset {
+        return Err(Mp4Error::InvalidBox);
+    }
+    let mut source = File::open(path)?;
+    let mut moov_bytes = read_box_bytes(&mut source, moov)?;
+    let new_mdat_offset = ftyp.size + moov.size;
+    let delta = new_mdat_offset
+        .checked_sub(mdat.offset)
+        .ok_or(Mp4Error::InvalidBox)?;
+    patch_chunk_offsets(&mut moov_bytes, delta)?;
+    let temporary = path.with_extension(format!(
+        "{}.faststart",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mp4")
+    ));
+    let mut output = File::create(&temporary)?;
+    source.seek(SeekFrom::Start(ftyp.offset))?;
+    let mut limited = (&mut source).take(ftyp.size);
+    std::io::copy(&mut limited, &mut output)?;
+    output.write_all(&moov_bytes)?;
+    source.seek(SeekFrom::Start(mdat.offset))?;
+    let mut limited = (&mut source).take(mdat.size);
+    std::io::copy(&mut limited, &mut output)?;
+    output.flush()?;
+    drop(output);
+    std::fs::remove_file(path)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 pub struct AtomicHevcFile {
     muxer: Option<HevcMp4Writer<BufWriter<File>>>,
     final_path: PathBuf,
@@ -419,6 +654,10 @@ impl AtomicHevcFile {
         let mut output = muxer.finalize()?;
         output.flush()?;
         drop(output);
+        if let Err(error) = fast_start_file(&self.partial_path) {
+            let _ = std::fs::remove_file(&self.partial_path);
+            return Err(error);
+        }
         if self.final_path.exists() {
             std::fs::remove_file(&self.final_path)?;
         }
@@ -488,6 +727,10 @@ impl AtomicAvcFile {
         let mut output = muxer.finalize()?;
         output.flush()?;
         drop(output);
+        if let Err(error) = fast_start_file(&self.partial_path) {
+            let _ = std::fs::remove_file(&self.partial_path);
+            return Err(error);
+        }
         if self.final_path.exists() {
             std::fs::remove_file(&self.final_path)?
         }
@@ -524,6 +767,10 @@ pub enum Mp4Error {
     TimestampOverflow,
     #[error("輸出已完成")]
     AlreadyFinalized,
+    #[error("MP4 box 結構不合法，無法啟用 fast-start")]
+    InvalidBox,
+    #[error("MP4 chunk offset 超出 32-bit 範圍")]
+    ChunkOffsetOverflow,
     #[error("檔案系統錯誤：{0}")]
     Io(#[from] std::io::Error),
     #[error("MP4 封裝失敗：{0}")]
@@ -612,6 +859,25 @@ mod tests {
         assert!(!base.exists());
     }
     #[test]
+    fn atomic_finalize_writes_fast_start_mp4() {
+        let base =
+            std::env::temp_dir().join(format!("gpx-faststart-atomic-{}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&base);
+        let packet = access_unit();
+        let sets = parameter_sets(&packet).unwrap();
+        let mut output = AtomicHevcFile::create(&base, 3840, 2160, 60, sets).unwrap();
+        output.write_access_unit(&packet, 0, 0).unwrap();
+        let path = output.finalize().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let moov = bytes.windows(4).position(|value| value == b"moov").unwrap();
+        let mdat = bytes.windows(4).position(|value| value == b"mdat").unwrap();
+        assert!(moov < mdat);
+        let reader =
+            mp4::Mp4Reader::read_header(Cursor::new(bytes.clone()), bytes.len() as u64).unwrap();
+        assert_eq!(reader.sample_count(1).unwrap(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
     fn writes_avc1_with_parameter_sets() {
         let packet = [
             0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80, 0, 0, 1, 0x65, 5, 6,
@@ -624,5 +890,37 @@ mod tests {
         let size = bytes.len() as u64;
         let reader = mp4::Mp4Reader::read_header(Cursor::new(bytes), size).unwrap();
         assert_eq!(reader.sample_count(1).unwrap(), 1);
+    }
+    #[test]
+    fn fast_start_moves_moov_and_updates_chunk_offsets() {
+        fn box_bytes(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut value = Vec::with_capacity(8 + payload.len());
+            value.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
+            value.extend_from_slice(kind);
+            value.extend_from_slice(payload);
+            value
+        }
+        let ftyp = box_bytes(b"ftyp", b"isom");
+        let mdat = box_bytes(b"mdat", b"frame");
+        let mut stco_payload = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stco_payload.extend_from_slice(&24u32.to_be_bytes());
+        let stco = box_bytes(b"stco", &stco_payload);
+        let trak = box_bytes(b"trak", &stco);
+        let moov = box_bytes(b"moov", &trak);
+        let path = std::env::temp_dir().join(format!("gpx-faststart-{}.mp4", std::process::id()));
+        std::fs::write(&path, [ftyp.clone(), mdat, moov.clone()].concat()).unwrap();
+        fast_start_file(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert_eq!(&bytes[ftyp.len() + 4..ftyp.len() + 8], b"moov");
+        assert!(bytes.windows(4).any(|value| value == b"mdat"));
+        let stco_position = bytes.windows(4).position(|value| value == b"stco").unwrap();
+        let value = u32::from_be_bytes(
+            bytes[stco_position + 12..stco_position + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(value, 24 + moov.len() as u32);
+        let _ = std::fs::remove_file(path);
     }
 }
