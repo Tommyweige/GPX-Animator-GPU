@@ -674,7 +674,7 @@ impl D2dSceneRenderer {
                     DWRITE_FONT_WEIGHT_SEMI_BOLD,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
-                    26.0,
+                    36.0,
                     PCWSTR(locale.as_ptr()),
                 )
                 .map_err(|error| RendererError::Api(error.to_string()))?
@@ -943,16 +943,16 @@ impl D2dSceneRenderer {
             };
             let text_rect = D2D_RECT_F {
                 left: rect.left + 24.0,
-                top: rect.top + 18.0,
+                top: rect.top + 14.0,
                 right: rect.right - 16.0,
-                bottom: rect.bottom - 12.0,
+                bottom: rect.bottom - 8.0,
             };
             let altitude = frame
                 .elevation_m
                 .map(|value| format!("{value:.0} m"))
                 .unwrap_or_else(|| "-- m".to_owned());
             let label = format!(
-                "公里數 {:.2} km    海拔 {altitude}",
+                "公里數 {:.2} km\n海拔 {altitude}",
                 frame.distance_m / 1000.0
             );
             let text: Vec<u16> = label.encode_utf16().collect();

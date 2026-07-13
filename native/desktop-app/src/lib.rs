@@ -291,7 +291,7 @@ mod tests {
             (app.settings.width, app.settings.height, app.settings.fps),
             (3840, 2160, 60)
         );
-        assert_eq!(app.settings.scene.line_width_px, 6.0);
+        assert_eq!(app.settings.scene.line_width_px, 8.0);
         assert_eq!(
             app.settings.scene.map_style,
             scene_core::MapStyle::Satellite

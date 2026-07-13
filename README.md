@@ -26,7 +26,7 @@ included below in [繁體中文](#繁體中文).
 - Follow, fit, and free camera modes; the follow camera eases into the full
   route view at the end instead of cutting to a black frame.
 - 16:9, 1:1, and 9:16 layouts; draggable/scrollable preview; HUD and elevation
-  profile overlays; 6 px route width by default.
+  profile overlays; 8 px route width by default.
 - English and Traditional Chinese UI, persisted preferences, resizable panels,
   cancellation, progress reporting, and a GPU diagnostics view.
 
@@ -34,17 +34,17 @@ included below in [繁體中文](#繁體中文).
 
 The latest checked-in Windows build is:
 
-[GPX-Animator-GPU-20260713.exe](dist/GPX-Animator-GPU-20260713.exe)
+[GPX-Animator-GPU-20260713-hud8.exe](dist/GPX-Animator-GPU-20260713-hud8.exe)
 
 Download the executable from the repository, then open a GPX file by using the
 file picker, dragging it onto the window, or passing it on the command line:
 
 ```powershell
-.\dist\GPX-Animator-GPU-20260713.exe "D:\path\to\route.gpx"
+.\dist\GPX-Animator-GPU-20260713-hud8.exe "D:\path\to\route.gpx"
 ```
 
 The default export profile is 3840×2160 at 60 FPS, H.265, High quality
-(NVENC P5/CQ19), Satellite imagery, and a 6 px route. All of these can be
+(NVENC P5/CQ19), Satellite imagery, and an 8 px route. All of these can be
 changed in the left settings panel. If an older EXE is still running, close it
 before replacing that file; Windows keeps an executable locked while its
 process is alive.
@@ -192,23 +192,23 @@ GPX Animator GPU Edition 是原生 Windows GPX 路線動畫工具，採用
 - 衛星、深色、淺色、透明地圖；磁碟圖磚快取與離線父層／placeholder fallback。
 - 跟隨、完整、自由攝影機；結尾平滑縮放到全路線，不切成黑畫面。
 - 16:9、1:1、9:16；預覽可拖曳與滾輪縮放；HUD、海拔圖；預設路線寬度
-  6 px。
+  8 px。
 - 繁體中文／英文 UI、設定保存、可調整面板、取消、進度及 GPU 診斷。
 
 ## 下載與啟動
 
 最新的 Windows 版本是：
 
-[GPX-Animator-GPU-20260713.exe](dist/GPX-Animator-GPU-20260713.exe)
+[GPX-Animator-GPU-20260713-hud8.exe](dist/GPX-Animator-GPU-20260713-hud8.exe)
 
 可用檔案選擇器、把 GPX 拖進視窗，或從命令列開啟：
 
 ```powershell
-.\dist\GPX-Animator-GPU-20260713.exe "D:\path\to\route.gpx"
+.\dist\GPX-Animator-GPU-20260713-hud8.exe "D:\path\to\route.gpx"
 ```
 
 預設輸出為 3840×2160、60 FPS、H.265、高畫質（NVENC P5/CQ19）、衛星圖
-與 6 px 路線；左側設定面板可修改。若要覆蓋舊 EXE，請先關閉仍在執行的
+與 8 px 路線；左側設定面板可修改。若要覆蓋舊 EXE，請先關閉仍在執行的
 舊版本，否則 Windows 會鎖定檔案。
 
 ## 系統需求與 GPU 政策

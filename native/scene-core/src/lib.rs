@@ -54,7 +54,7 @@ impl Default for SceneOptions {
             camera_mode: CameraMode::Follow,
             route_color: [255, 93, 59, 255],
             marker_color: [255, 243, 214, 255],
-            line_width_px: 6.0,
+            line_width_px: 8.0,
             show_hud: true,
             show_elevation: true,
             free_camera_center: None,
@@ -307,7 +307,7 @@ mod tests {
         let value = SceneOptions::default();
         assert_eq!(value.map_style, MapStyle::Satellite);
         assert_eq!(value.camera_mode, CameraMode::Follow);
-        assert_eq!(value.line_width_px, 6.0);
+        assert_eq!(value.line_width_px, 8.0);
     }
     #[test]
     fn web_mercator_matches_known_taiwan_coordinate() {

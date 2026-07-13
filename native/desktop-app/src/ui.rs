@@ -1133,33 +1133,45 @@ impl NativeApp {
             if self.model.settings.scene.show_hud && self.language == UiLanguage::TraditionalChinese
             {
                 painter.text(
-                    frame_rect.min + egui::vec2(24.0, 24.0),
+                    frame_rect.min + egui::vec2(24.0, 22.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("公里數 {:.2} km", frame.distance_m / 1000.0),
+                    egui::FontId::proportional(24.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    frame_rect.min + egui::vec2(24.0, 54.0),
                     egui::Align2::LEFT_TOP,
                     format!(
-                        "公里數 {:.2} km    海拔 {}",
-                        frame.distance_m / 1000.0,
+                        "海拔 {}",
                         frame
                             .elevation_m
                             .map(|value| format!("{value:.0} m"))
                             .unwrap_or_else(|| "-- m".to_owned())
                     ),
-                    egui::FontId::proportional(18.0),
+                    egui::FontId::proportional(24.0),
                     egui::Color32::WHITE,
                 );
             }
             if self.model.settings.scene.show_hud && self.language == UiLanguage::English {
                 painter.text(
-                    frame_rect.min + egui::vec2(24.0, 24.0),
+                    frame_rect.min + egui::vec2(24.0, 22.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("Distance {:.2} km", frame.distance_m / 1000.0),
+                    egui::FontId::proportional(24.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    frame_rect.min + egui::vec2(24.0, 54.0),
                     egui::Align2::LEFT_TOP,
                     format!(
-                        "Distance {:.2} km    Elevation {}",
-                        frame.distance_m / 1000.0,
+                        "Elevation {}",
                         frame
                             .elevation_m
                             .map(|value| format!("{value:.0} m"))
                             .unwrap_or_else(|| "-- m".to_owned())
                     ),
-                    egui::FontId::proportional(18.0),
+                    egui::FontId::proportional(24.0),
                     egui::Color32::WHITE,
                 );
             }
