@@ -1,6 +1,7 @@
 use crate::{
-    AppModel, Diagnostics, ExportOutcome, ExportProgress, ExportRequest, ExportSettings, JobState,
-    detect_gpu_capabilities, load_gpx_file, run_native_export,
+    AppModel, AppPreferences, Diagnostics, ExportOutcome, ExportProgress, ExportRequest,
+    ExportSettings, JobState, UiLanguage, detect_gpu_capabilities, load_gpx_file,
+    run_native_export,
 };
 use eframe::egui;
 use gpx_core::{ParseOptions, Track};
@@ -20,12 +21,6 @@ enum TileMessage {
     Failed(d3d11_renderer::TileKey),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Language {
-    TraditionalChinese,
-    English,
-}
-
 pub struct NativeApp {
     model: AppModel,
     track: Option<Track>,
@@ -41,8 +36,9 @@ pub struct NativeApp {
     preview_tiles: HashMap<d3d11_renderer::TileKey, egui::TextureHandle>,
     pending_tiles: HashSet<d3d11_renderer::TileKey>,
     preview_map_style: MapStyle,
-    language: Language,
+    language: UiLanguage,
     show_settings: bool,
+    preferences: AppPreferences,
 }
 
 fn current_long_edge(settings: &ExportSettings) -> u32 {
@@ -70,8 +66,8 @@ fn apply_long_edge(settings: &mut ExportSettings, long_edge: u32) {
     }
 }
 
-fn resolution_label(long_edge: u32, language: Language) -> String {
-    if language == Language::English {
+fn resolution_label(long_edge: u32, language: UiLanguage) -> String {
+    if language == UiLanguage::English {
         return match long_edge {
             3840 => "4K · 3840".to_owned(),
             2560 => "2.5K · 2560".to_owned(),
@@ -92,7 +88,9 @@ fn resolution_label(long_edge: u32, language: Language) -> String {
 impl NativeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&cc.egui_ctx);
+        let preferences = AppPreferences::load();
         let mut model = AppModel::default();
+        model.settings = preferences.settings.clone();
         match detect_gpu_capabilities() {
             Ok(value) => model.capabilities = Some(value),
             Err(error) => model.state = JobState::Failed(error.to_string()),
@@ -114,8 +112,9 @@ impl NativeApp {
             preview_tiles: HashMap::new(),
             pending_tiles: HashSet::new(),
             preview_map_style,
-            language: Language::TraditionalChinese,
+            language: preferences.language,
             show_settings: false,
+            preferences,
         }
     }
 
@@ -288,8 +287,8 @@ impl NativeApp {
                     egui::RichText::new("GPU EDITION").color(egui::Color32::from_rgb(255, 93, 59)),
                 );
                 let settings_label = match self.language {
-                    Language::TraditionalChinese => "設定",
-                    Language::English => "Settings",
+                    UiLanguage::TraditionalChinese => "設定",
+                    UiLanguage::English => "Settings",
                 };
                 if ui.button(settings_label).clicked() {
                     self.show_settings = true;
@@ -307,7 +306,7 @@ impl NativeApp {
     }
 
     fn draw_controls(&mut self, ctx: &egui::Context) {
-        if self.language == Language::English {
+        if self.language == UiLanguage::English {
             self.draw_controls_english(ctx);
             return;
         }
@@ -603,7 +602,7 @@ impl NativeApp {
                     });
                 let mut long_edge = current_long_edge(&self.model.settings);
                 egui::ComboBox::from_label("Resolution")
-                    .selected_text(resolution_label(long_edge, Language::English))
+                    .selected_text(resolution_label(long_edge, UiLanguage::English))
                     .show_ui(ui, |ui| {
                         for (edge, label) in [
                             (3840, "4K · 3840"),
@@ -810,7 +809,7 @@ impl NativeApp {
             self.pending_tiles.clear();
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.language == Language::English {
+            if self.language == UiLanguage::English {
                 ui.horizontal(|ui| {
                     ui.label("Timeline");
                     ui.add(
@@ -819,7 +818,7 @@ impl NativeApp {
                     ui.label("Drag to pan · Scroll to zoom");
                 });
             }
-            if self.language == Language::TraditionalChinese {
+            if self.language == UiLanguage::TraditionalChinese {
                 ui.horizontal(|ui| {
                     ui.label("預覽位置");
                     ui.add(
@@ -1015,7 +1014,8 @@ impl NativeApp {
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_gray(90),
             );
-            if self.model.settings.scene.show_hud && self.language == Language::TraditionalChinese {
+            if self.model.settings.scene.show_hud && self.language == UiLanguage::TraditionalChinese
+            {
                 painter.text(
                     rect.min + egui::vec2(24.0, 24.0),
                     egui::Align2::LEFT_TOP,
@@ -1031,7 +1031,7 @@ impl NativeApp {
                     egui::Color32::WHITE,
                 );
             }
-            if self.model.settings.scene.show_hud && self.language == Language::English {
+            if self.model.settings.scene.show_hud && self.language == UiLanguage::English {
                 painter.text(
                     rect.min + egui::vec2(24.0, 24.0),
                     egui::Align2::LEFT_TOP,
@@ -1054,7 +1054,7 @@ impl NativeApp {
         if !self.show_diagnostics {
             return;
         }
-        if self.language == Language::English {
+        if self.language == UiLanguage::English {
             self.diagnostics_window_english(ctx);
             return;
         }
@@ -1123,8 +1123,8 @@ impl NativeApp {
             return;
         }
         let title = match self.language {
-            Language::TraditionalChinese => "設定",
-            Language::English => "Settings",
+            UiLanguage::TraditionalChinese => "設定",
+            UiLanguage::English => "Settings",
         };
         egui::Window::new(title)
             .open(&mut self.show_settings)
@@ -1132,28 +1132,40 @@ impl NativeApp {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label(match self.language {
-                    Language::TraditionalChinese => "語言",
-                    Language::English => "Language",
+                    UiLanguage::TraditionalChinese => "語言",
+                    UiLanguage::English => "Language",
                 });
                 egui::ComboBox::from_id_salt("language")
                     .selected_text(match self.language {
-                        Language::TraditionalChinese => "繁體中文",
-                        Language::English => "English",
+                        UiLanguage::TraditionalChinese => "繁體中文",
+                        UiLanguage::English => "English",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.language,
-                            Language::TraditionalChinese,
+                            UiLanguage::TraditionalChinese,
                             "繁體中文",
                         );
-                        ui.selectable_value(&mut self.language, Language::English, "English");
+                        ui.selectable_value(&mut self.language, UiLanguage::English, "English");
                     });
                 ui.separator();
                 ui.small(match self.language {
-                    Language::TraditionalChinese => "語言會立即套用到介面。",
-                    Language::English => "Language changes apply immediately.",
+                    UiLanguage::TraditionalChinese => "語言會立即套用到介面。",
+                    UiLanguage::English => "Language changes apply immediately.",
                 });
             });
+    }
+
+    fn persist_preferences(&mut self) {
+        let mut current = self.preferences.clone();
+        current.language = self.language;
+        current.settings = self.model.settings.clone();
+        if current != self.preferences {
+            if let Err(error) = current.save() {
+                self.last_error = Some(format!("Failed to save settings: {error}"));
+            }
+            self.preferences = current;
+        }
     }
 }
 
@@ -1179,6 +1191,7 @@ impl eframe::App for NativeApp {
         self.draw_preview(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
+        self.persist_preferences();
         if matches!(self.model.state, JobState::Running(_)) {
             ctx.request_repaint_after(Duration::from_millis(33));
         }

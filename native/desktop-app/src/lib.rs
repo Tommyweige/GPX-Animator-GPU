@@ -2,6 +2,8 @@ use nvenc_engine::{
     CancellationToken, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
 };
 use scene_core::{Codec, QualityPreset, SceneOptions};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 pub mod export;
 pub use export::{
     ExportError, ExportOutcome, ExportRequest, detect_gpu_capabilities, load_gpx_file,
@@ -9,7 +11,7 @@ pub use export::{
 };
 pub mod ui;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExportSettings {
     pub width: u32,
     pub height: u32,
@@ -18,6 +20,89 @@ pub struct ExportSettings {
     pub codec: Codec,
     pub quality: QualityPreset,
     pub scene: SceneOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UiLanguage {
+    TraditionalChinese,
+    English,
+}
+
+impl Default for UiLanguage {
+    fn default() -> Self {
+        Self::TraditionalChinese
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppPreferences {
+    pub schema_version: u32,
+    pub language: UiLanguage,
+    pub settings: ExportSettings,
+    pub last_input_directory: Option<PathBuf>,
+    pub last_output_directory: Option<PathBuf>,
+    pub cache_limit_bytes: u64,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            language: UiLanguage::default(),
+            settings: ExportSettings::default(),
+            last_input_directory: None,
+            last_output_directory: None,
+            cache_limit_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl AppPreferences {
+    pub fn path() -> PathBuf {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("GPX Animator")
+            .join("settings.json")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(mut value) => {
+                value.schema_version = 1;
+                value
+            }
+            Err(_) => {
+                let corrupt = path.with_extension(format!(
+                    "corrupt-{}.json",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |value| value.as_secs())
+                ));
+                let _ = std::fs::rename(path, corrupt);
+                Self::default()
+            }
+        }
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::path();
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(parent)?;
+        let temporary = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(&temporary, bytes)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(temporary, path)
+    }
 }
 impl Default for ExportSettings {
     fn default() -> Self {
