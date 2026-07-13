@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::convert::TryFrom;
 use std::io::{Read, Seek, Write};
 
-use crate::mp4box::*;
+use crate::mp4box::{colr::ColrBox, *};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Hev1Box {
@@ -19,6 +19,7 @@ pub struct Hev1Box {
     pub frame_count: u16,
     pub depth: u16,
     pub hvcc: HvcCBox,
+    pub colr: ColrBox,
 }
 
 impl Default for Hev1Box {
@@ -32,6 +33,7 @@ impl Default for Hev1Box {
             frame_count: 1,
             depth: 0x0018,
             hvcc: HvcCBox::default(),
+            colr: ColrBox::default(),
         }
     }
 }
@@ -47,6 +49,7 @@ impl Hev1Box {
             frame_count: 1,
             depth: 0x0018,
             hvcc: HvcCBox::new(config),
+            colr: ColrBox::default(),
         }
     }
 
@@ -55,7 +58,7 @@ impl Hev1Box {
     }
 
     pub fn get_size(&self) -> u64 {
-        HEADER_SIZE + 8 + 70 + self.hvcc.box_size()
+        HEADER_SIZE + 8 + 70 + self.hvcc.box_size() + self.colr.box_size()
     }
 }
 
@@ -111,7 +114,16 @@ impl<R: Read + Seek> ReadBox<&mut R> for Hev1Box {
         }
         if name == BoxType::HvcCBox {
             let hvcc = HvcCBox::read_box(reader, s)?;
-
+            let colr = if reader.stream_position()? < start + size {
+                let colr_header = BoxHeader::read(reader)?;
+                if colr_header.name == BoxType::ColrBox {
+                    ColrBox::read_box(reader, colr_header.size)?
+                } else {
+                    ColrBox::default()
+                }
+            } else {
+                ColrBox::default()
+            };
             skip_bytes_to(reader, start + size)?;
 
             Ok(Hev1Box {
@@ -123,6 +135,7 @@ impl<R: Read + Seek> ReadBox<&mut R> for Hev1Box {
                 frame_count,
                 depth,
                 hvcc,
+                colr,
             })
         } else {
             Err(Error::InvalidData("hvcc not found"))
@@ -154,6 +167,7 @@ impl<W: Write> WriteBox<&mut W> for Hev1Box {
         writer.write_i16::<BigEndian>(-1)?; // pre-defined
 
         self.hvcc.write_box(writer)?;
+        self.colr.write_box(writer)?;
 
         Ok(size)
     }
@@ -294,6 +308,7 @@ mod tests {
                 sps: vec![],
                 pps: vec![],
             },
+            colr: ColrBox::default(),
         };
         let mut buf = Vec::new();
         src_box.write_box(&mut buf).unwrap();

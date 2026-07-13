@@ -2,7 +2,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use serde::Serialize;
 use std::io::{Read, Seek, Write};
 
-use crate::mp4box::*;
+use crate::mp4box::{colr::ColrBox, *};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Avc1Box {
@@ -18,6 +18,7 @@ pub struct Avc1Box {
     pub frame_count: u16,
     pub depth: u16,
     pub avcc: AvcCBox,
+    pub colr: ColrBox,
 }
 
 impl Default for Avc1Box {
@@ -31,6 +32,7 @@ impl Default for Avc1Box {
             frame_count: 1,
             depth: 0x0018,
             avcc: AvcCBox::default(),
+            colr: ColrBox::default(),
         }
     }
 }
@@ -46,6 +48,7 @@ impl Avc1Box {
             frame_count: 1,
             depth: 0x0018,
             avcc: AvcCBox::new(&config.seq_param_set, &config.pic_param_set),
+            colr: ColrBox::default(),
         }
     }
 
@@ -54,7 +57,7 @@ impl Avc1Box {
     }
 
     pub fn get_size(&self) -> u64 {
-        HEADER_SIZE + 8 + 70 + self.avcc.box_size()
+        HEADER_SIZE + 8 + 70 + self.avcc.box_size() + self.colr.box_size()
     }
 }
 
@@ -110,7 +113,16 @@ impl<R: Read + Seek> ReadBox<&mut R> for Avc1Box {
         }
         if name == BoxType::AvcCBox {
             let avcc = AvcCBox::read_box(reader, s)?;
-
+            let colr = if reader.stream_position()? < start + size {
+                let colr_header = BoxHeader::read(reader)?;
+                if colr_header.name == BoxType::ColrBox {
+                    ColrBox::read_box(reader, colr_header.size)?
+                } else {
+                    ColrBox::default()
+                }
+            } else {
+                ColrBox::default()
+            };
             skip_bytes_to(reader, start + size)?;
 
             Ok(Avc1Box {
@@ -122,6 +134,7 @@ impl<R: Read + Seek> ReadBox<&mut R> for Avc1Box {
                 frame_count,
                 depth,
                 avcc,
+                colr,
             })
         } else {
             Err(Error::InvalidData("avcc not found"))
@@ -153,6 +166,7 @@ impl<W: Write> WriteBox<&mut W> for Avc1Box {
         writer.write_i16::<BigEndian>(-1)?; // pre-defined
 
         self.avcc.write_box(writer)?;
+        self.colr.write_box(writer)?;
 
         Ok(size)
     }
@@ -331,6 +345,7 @@ mod tests {
                     bytes: vec![0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0],
                 }],
             },
+            colr: ColrBox::default(),
         };
         let mut buf = Vec::new();
         src_box.write_box(&mut buf).unwrap();
