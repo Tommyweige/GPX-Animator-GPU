@@ -1054,6 +1054,10 @@ impl NativeApp {
         if !self.show_diagnostics {
             return;
         }
+        if self.language == Language::English {
+            self.diagnostics_window_english(ctx);
+            return;
+        }
         egui::Window::new("GPU 診斷")
             .open(&mut self.show_diagnostics)
             .show(ctx, |ui| {
@@ -1070,6 +1074,37 @@ impl NativeApp {
                     ));
                 }
                 let d: &Diagnostics = &self.model.diagnostics;
+                ui.separator();
+                ui.label(format!("CPU frame readbacks: {}", d.cpu_frame_readbacks));
+                ui.label(format!(
+                    "Encoded: {} · dropped: {} · duplicated: {}",
+                    d.encoded_frames, d.dropped_frames, d.duplicated_frames
+                ));
+                ui.label(format!(
+                    "Render p95: {:.2} ms · elapsed: {:.2} s",
+                    d.render_p95_ms, d.elapsed_seconds
+                ));
+            });
+    }
+
+    fn diagnostics_window_english(&mut self, ctx: &egui::Context) {
+        egui::Window::new("GPU Diagnostics")
+            .open(&mut self.show_diagnostics)
+            .fixed_pos(egui::pos2(24.0, 72.0))
+            .show(ctx, |ui| {
+                if let Some(gpu) = &self.model.capabilities {
+                    ui.label(format!("Adapter: {}", gpu.adapter_name));
+                    ui.label(format!("LUID: {}", gpu.luid));
+                    ui.label(format!(
+                        "Dedicated VRAM: {:.1} GB",
+                        gpu.dedicated_vram as f64 / (1u64 << 30) as f64
+                    ));
+                    ui.label(format!(
+                        "NVENC HEVC: {} · H.264: {} · Async: {}",
+                        gpu.hevc, gpu.h264, gpu.async_encode
+                    ));
+                }
+                let d = &self.model.diagnostics;
                 ui.separator();
                 ui.label(format!("CPU frame readbacks: {}", d.cpu_frame_readbacks));
                 ui.label(format!(
