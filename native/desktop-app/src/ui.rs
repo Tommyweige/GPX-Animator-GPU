@@ -161,6 +161,11 @@ impl NativeApp {
     fn load_gpx(&mut self, path: PathBuf) {
         match load_gpx_file(&path, ParseOptions::default()) {
             Ok(track) => {
+                // A saved free-camera center belongs to the previous route and
+                // can place a newly loaded GPX completely outside the viewport.
+                // Start every track at a deterministic visible camera; users
+                // can still choose Fit or Free after the route is displayed.
+                reset_camera_for_new_track(&mut self.model.settings.scene);
                 self.output_path = Some(path.with_extension("mp4"));
                 self.gpx_path = Some(path);
                 self.track = Some(track);
@@ -1416,6 +1421,12 @@ fn apply_pan(
     options.camera_mode = CameraMode::Free;
 }
 
+fn reset_camera_for_new_track(options: &mut scene_core::SceneOptions) {
+    options.camera_mode = CameraMode::Follow;
+    options.free_camera_center = None;
+    options.camera_zoom = 1.0;
+}
+
 fn install_chinese_font(ctx: &egui::Context) {
     let path = PathBuf::from(r"C:\Windows\Fonts\msjh.ttc");
     if let Ok(bytes) = std::fs::read(path) {
@@ -1451,6 +1462,19 @@ mod tests {
         );
         assert_eq!(options.camera_mode, CameraMode::Free);
         assert!(options.free_camera_center.is_some());
+    }
+    #[test]
+    fn loading_a_track_resets_saved_free_camera() {
+        let mut options = scene_core::SceneOptions {
+            camera_mode: CameraMode::Free,
+            free_camera_center: Some([121.3, 23.0]),
+            camera_zoom: 8.0,
+            ..scene_core::SceneOptions::default()
+        };
+        reset_camera_for_new_track(&mut options);
+        assert_eq!(options.camera_mode, CameraMode::Follow);
+        assert_eq!(options.free_camera_center, None);
+        assert_eq!(options.camera_zoom, 1.0);
     }
     #[test]
     fn english_localizes_core_export_errors() {
