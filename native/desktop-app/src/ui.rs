@@ -91,6 +91,9 @@ impl NativeApp {
         let preferences = AppPreferences::load();
         let mut model = AppModel::default();
         model.settings = preferences.settings.clone();
+        model.settings.cache_limit_bytes = preferences
+            .cache_limit_bytes
+            .max(crate::default_cache_limit_bytes() / 8);
         match detect_gpu_capabilities() {
             Ok(value) => model.capabilities = Some(value),
             Err(error) => model.state = JobState::Failed(error.to_string()),
@@ -507,16 +510,13 @@ impl NativeApp {
                                     ui.label("正在讀取本地地圖快取並補齊缺少圖磚…");
                                 });
                             }
-                            let ratio = if value.total_frames == 0 {
+                            let ratio = if value.stage_total == 0 {
                                 0.0
                             } else {
-                                value.completed_frames as f32 / value.total_frames as f32
+                                value.stage_completed as f32 / value.stage_total as f32
                             };
                             let status = if value.stage == nvenc_engine::ExportStage::Preflight {
-                                format!(
-                                    "地圖圖磚 {}/{}",
-                                    value.completed_frames, value.total_frames
-                                )
+                                format!("地圖圖磚 {}/{}", value.stage_completed, value.stage_total)
                             } else {
                                 format!(
                                     "影片 {} FPS · 輸出 {:.1} fps ({:.2}×) · ETA {:.1}s",
@@ -764,18 +764,18 @@ impl NativeApp {
                     }
                     match &self.model.state {
                         JobState::Running(value) => {
-                            let ratio = if value.total_frames == 0 {
+                            let ratio = if value.stage_total == 0 {
                                 0.0
                             } else {
-                                value.completed_frames as f32 / value.total_frames as f32
+                                value.stage_completed as f32 / value.stage_total as f32
                             };
                             ui.add(
                                 egui::ProgressBar::new(ratio)
                                     .show_percentage()
                                     .text(format!(
                                         "{} / {} · {:.1} FPS · ETA {:.1}s",
-                                        value.completed_frames,
-                                        value.total_frames,
+                                        value.stage_completed,
+                                        value.stage_total,
                                         value.fps,
                                         value.eta_seconds
                                     )),
@@ -1157,6 +1157,43 @@ impl NativeApp {
                         ui.selectable_value(&mut self.language, UiLanguage::English, "English");
                     });
                 ui.separator();
+                let mut cache_gb =
+                    self.model.settings.cache_limit_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+                ui.add(
+                    egui::Slider::new(&mut cache_gb, 0.25..=8.0)
+                        .text(match self.language {
+                            UiLanguage::TraditionalChinese => "地圖快取上限 GB",
+                            UiLanguage::English => "Map cache limit GB",
+                        })
+                        .step_by(0.25),
+                );
+                self.model.settings.cache_limit_bytes =
+                    (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+                ui.small(match self.language {
+                    UiLanguage::TraditionalChinese => "地圖只會預載一次；已快取的圖磚會離線重用。",
+                    UiLanguage::English => "Tiles are reused locally after the first preload.",
+                });
+                if ui
+                    .button(match self.language {
+                        UiLanguage::TraditionalChinese => "清除目前地圖快取",
+                        UiLanguage::English => "Clear map cache",
+                    })
+                    .clicked()
+                {
+                    let style = self.model.settings.scene.map_style;
+                    if let Err(error) = d3d11_renderer::TileDiskCache::for_map_style_with_limit(
+                        style,
+                        Some(self.model.settings.cache_limit_bytes),
+                    )
+                    .clear()
+                    {
+                        self.last_error = Some(error.to_string());
+                    } else {
+                        self.preview_tiles.clear();
+                        self.pending_tiles.clear();
+                    }
+                }
+                ui.separator();
                 ui.small(match self.language {
                     UiLanguage::TraditionalChinese => "語言會立即套用到介面。",
                     UiLanguage::English => "Language changes apply immediately.",
@@ -1168,6 +1205,7 @@ impl NativeApp {
         let mut current = self.preferences.clone();
         current.language = self.language;
         current.settings = self.model.settings.clone();
+        current.cache_limit_bytes = current.settings.cache_limit_bytes;
         if current != self.preferences {
             if let Err(error) = current.save() {
                 self.last_error = Some(format!("Failed to save settings: {error}"));

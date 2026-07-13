@@ -118,6 +118,12 @@ pub struct ExportProgress {
     pub stage: ExportStage,
     pub completed_frames: u64,
     pub total_frames: u64,
+    /// Work completed for the current stage. During preflight this is the
+    /// number of prepared tiles; during rendering/encoding it is frames.
+    pub stage_completed: u64,
+    /// Total work for the current stage. This keeps tile preparation from
+    /// being displayed as an incorrect video FPS/frame count.
+    pub stage_total: u64,
     pub fps: f64,
     pub eta_seconds: f64,
 }
@@ -191,6 +197,8 @@ where
                 stage: ExportStage::Encoding,
                 completed_frames: completed,
                 total_frames,
+                stage_completed: completed,
+                stage_total: total_frames,
                 fps,
                 eta_seconds: (total_frames - completed) as f64 / fps,
             });

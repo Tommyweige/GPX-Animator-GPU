@@ -20,6 +20,33 @@ pub struct DecodedTile {
     pub bgra: Vec<u8>,
 }
 
+/// Immutable list of tiles required by one export. Keeping the manifest
+/// separate from the worker queue makes preflight deterministic and lets the
+/// UI report cached/missing work without treating it as video frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileManifest {
+    pub keys: Vec<TileKey>,
+    pub cached: usize,
+    pub missing: usize,
+}
+
+impl TileManifest {
+    pub fn new(cache: &TileDiskCache, mut keys: Vec<TileKey>) -> Self {
+        keys.sort_unstable_by_key(|key| (key.zoom, key.y, key.x));
+        keys.dedup();
+        let cached = keys.iter().filter(|key| cache.is_cached(**key)).count();
+        Self {
+            missing: keys.len().saturating_sub(cached),
+            keys,
+            cached,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.keys.len()
+    }
+}
+
 pub fn tile_zoom(view_span: f64, output_width: u32) -> u8 {
     ((output_width as f64 / (256.0 * view_span.max(1e-9)))
         .log2()
@@ -119,6 +146,10 @@ impl TileDiskCache {
         Self::new(root, 512 * 1024 * 1024)
     }
     pub fn for_map_style(style: scene_core::MapStyle) -> Self {
+        Self::for_map_style_with_limit(style, None)
+    }
+    pub fn for_map_style_with_limit(style: scene_core::MapStyle, limit_bytes: Option<u64>) -> Self {
+        let limit = limit_bytes.filter(|value| *value > 0);
         match style {
             scene_core::MapStyle::Satellite => {
                 let root = std::env::var_os("GPX_ANIMATOR_TILE_CACHE")
@@ -131,10 +162,33 @@ impl TileDiskCache {
                             .join("cache")
                     })
                     .join("esri-satellite");
-                Self::new(root, 1024 * 1024 * 1024).with_source(TileSource::EsriSatellite)
+                Self::new(root, limit.unwrap_or(1024 * 1024 * 1024))
+                    .with_source(TileSource::EsriSatellite)
             }
-            _ => Self::default_osm(),
+            _ => {
+                let mut cache = Self::default_osm();
+                if let Some(limit) = limit {
+                    cache.max_bytes = limit;
+                }
+                cache
+            }
         }
+    }
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn is_cached(&self, key: TileKey) -> bool {
+        self.path(key).is_file()
+    }
+    pub fn clear(&self) -> Result<(), RendererError> {
+        if self.root.exists() {
+            std::fs::remove_dir_all(&self.root)
+                .map_err(|error| RendererError::Api(error.to_string()))?;
+        }
+        Ok(())
     }
     fn path(&self, key: TileKey) -> PathBuf {
         self.root
@@ -174,15 +228,20 @@ impl TileDiskCache {
         let bytes = if path.exists() {
             std::fs::read(&path).map_err(|e| RendererError::Tile(e.to_string()))?
         } else {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| RendererError::Tile(e.to_string()))?;
+            if let Some(parent) = path.parent()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                let _ = error;
+                return Ok(self.offline_placeholder(key));
             }
             let url = self.tile_url(key);
             match fetch(&url) {
                 Ok(bytes) => {
-                    std::fs::write(&path, &bytes)
-                        .map_err(|e| RendererError::Tile(e.to_string()))?;
-                    self.evict()?;
+                    // A read-only cache must not make an export fail. The
+                    // decoded tile is still useful for this run even when it
+                    // cannot be persisted.
+                    let _ = std::fs::write(&path, &bytes);
+                    let _ = self.evict();
                     bytes
                 }
                 Err(_) => return Ok(self.offline_placeholder(key)),
@@ -1273,6 +1332,61 @@ mod tests {
         assert!(tile.bgra.is_empty());
         assert!(!root.join("17/109773/56579.png").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn tile_manifest_is_sorted_deduplicated_and_counts_disk_hits() {
+        let root = std::env::temp_dir().join(format!("gpx-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = TileDiskCache::new(&root, 1024 * 1024);
+        let cached = root.join("3/2/1.png");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"cached").unwrap();
+        let keys = vec![
+            TileKey {
+                zoom: 3,
+                x: 3,
+                y: 1,
+            },
+            TileKey {
+                zoom: 3,
+                x: 2,
+                y: 1,
+            },
+            TileKey {
+                zoom: 3,
+                x: 2,
+                y: 1,
+            },
+        ];
+        let manifest = TileManifest::new(&cache, keys);
+        assert_eq!(manifest.total(), 2);
+        assert_eq!(manifest.cached, 1);
+        assert_eq!(manifest.missing, 1);
+        assert_eq!(
+            manifest.keys[0],
+            TileKey {
+                zoom: 3,
+                x: 2,
+                y: 1
+            }
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn read_only_cache_degrades_to_placeholder() {
+        let root = std::env::temp_dir().join(format!("gpx-read-only-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::write(&root, b"not a directory").unwrap();
+        let key = TileKey {
+            zoom: 4,
+            x: 2,
+            y: 3,
+        };
+        let cache = TileDiskCache::new(&root, 1024);
+        let tile = cache.load_with_fetch(key, |_| Ok(vec![1, 2, 3])).unwrap();
+        assert_eq!(tile.key, key);
+        assert!(tile.bgra.is_empty());
+        let _ = std::fs::remove_file(root);
     }
     #[test]
     fn view_tiles_and_zoom_cover_frame() {

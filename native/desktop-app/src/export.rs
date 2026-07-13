@@ -118,6 +118,8 @@ where
         stage,
         completed_frames: completed,
         total_frames,
+        stage_completed: completed,
+        stage_total: total_frames,
         fps,
         eta_seconds: eta,
     };
@@ -182,15 +184,29 @@ where
                 }
             }
         }
-        let keys: Arc<Vec<_>> = Arc::new(keys.into_iter().collect());
-        let tile_total = keys.len();
+        let cache_limit = request.settings.cache_limit_bytes;
+        let style = scene.options.map_style;
+        let manifest_cache =
+            d3d11_renderer::TileDiskCache::for_map_style_with_limit(style, Some(cache_limit));
+        let manifest =
+            d3d11_renderer::TileManifest::new(&manifest_cache, keys.into_iter().collect());
+        let keys: Arc<Vec<_>> = Arc::new(manifest.keys.clone());
+        let tile_total = manifest.total();
         let workers = std::thread::available_parallelism()
             .map_or(4, usize::from)
-            .clamp(1, 8)
+            .clamp(1, 4)
             .min(tile_total.max(1));
         let next = Arc::new(AtomicUsize::new(0));
         let (tile_tx, tile_rx) = mpsc::channel();
-        let style = scene.options.map_style;
+        progress(ExportProgress {
+            stage: ExportStage::Preflight,
+            completed_frames: 0,
+            total_frames,
+            stage_completed: 0,
+            stage_total: tile_total as u64,
+            fps: 0.0,
+            eta_seconds: 0.0,
+        });
         let decoded = std::thread::scope(|scope| -> Result<Vec<_>, ExportError> {
             for _ in 0..workers {
                 let keys = Arc::clone(&keys);
@@ -198,7 +214,10 @@ where
                 let tx = tile_tx.clone();
                 let token = token.clone();
                 scope.spawn(move || {
-                    let cache = d3d11_renderer::TileDiskCache::for_map_style(style);
+                    let cache = d3d11_renderer::TileDiskCache::for_map_style_with_limit(
+                        style,
+                        Some(cache_limit),
+                    );
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         if index >= keys.len() || token.is_cancelled() {
@@ -217,8 +236,10 @@ where
                 decoded.push(result?);
                 progress(ExportProgress {
                     stage: ExportStage::Preflight,
-                    completed_frames: (index + 1) as u64,
-                    total_frames: tile_total as u64,
+                    completed_frames: 0,
+                    total_frames,
+                    stage_completed: (index + 1) as u64,
+                    stage_total: tile_total as u64,
                     fps: 0.0,
                     eta_seconds: 0.0,
                 });

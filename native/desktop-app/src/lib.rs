@@ -20,6 +20,12 @@ pub struct ExportSettings {
     pub codec: Codec,
     pub quality: QualityPreset,
     pub scene: SceneOptions,
+    #[serde(default = "default_cache_limit_bytes")]
+    pub cache_limit_bytes: u64,
+}
+
+pub const fn default_cache_limit_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +41,7 @@ impl Default for UiLanguage {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppPreferences {
     pub schema_version: u32,
     pub language: UiLanguage,
@@ -52,7 +59,7 @@ impl Default for AppPreferences {
             settings: ExportSettings::default(),
             last_input_directory: None,
             last_output_directory: None,
-            cache_limit_bytes: 2 * 1024 * 1024 * 1024,
+            cache_limit_bytes: default_cache_limit_bytes(),
         }
     }
 }
@@ -74,6 +81,12 @@ impl AppPreferences {
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(mut value) => {
                 value.schema_version = 1;
+                if value.cache_limit_bytes == 0 {
+                    value.cache_limit_bytes = default_cache_limit_bytes();
+                }
+                if value.settings.cache_limit_bytes == 0 {
+                    value.settings.cache_limit_bytes = value.cache_limit_bytes;
+                }
                 value
             }
             Err(_) => {
@@ -114,6 +127,7 @@ impl Default for ExportSettings {
             codec: Codec::Hevc,
             quality: QualityPreset::Quality,
             scene: SceneOptions::default(),
+            cache_limit_bytes: default_cache_limit_bytes(),
         }
     }
 }
@@ -195,6 +209,8 @@ impl AppModel {
             stage: ExportStage::Preflight,
             completed_frames: 0,
             total_frames: self.settings.total_frames(),
+            stage_completed: 0,
+            stage_total: 0,
             fps: 0.0,
             eta_seconds: 0.0,
         };
@@ -322,5 +338,16 @@ mod tests {
         app.fail("device lost");
         assert!(matches!(app.state, JobState::Failed(_)));
         assert!(app.can_export());
+    }
+    #[test]
+    fn preferences_round_trip_preserves_language_and_cache_policy() {
+        let mut value = AppPreferences::default();
+        value.language = UiLanguage::English;
+        value.settings.cache_limit_bytes = 512 * 1024 * 1024;
+        value.cache_limit_bytes = value.settings.cache_limit_bytes;
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let decoded: AppPreferences = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.language, UiLanguage::English);
+        assert_eq!(decoded.settings.cache_limit_bytes, 512 * 1024 * 1024);
     }
 }
