@@ -27,7 +27,7 @@ impl Default for ExportSettings {
             fps: 60,
             duration_seconds: 20,
             codec: Codec::Hevc,
-            quality: QualityPreset::Balanced,
+            quality: QualityPreset::Quality,
             scene: SceneOptions::default(),
         }
     }
@@ -178,6 +178,15 @@ mod tests {
             (3840, 2160, 60)
         );
         assert_eq!(app.settings.scene.line_width_px, 6.0);
+        assert_eq!(
+            app.settings.scene.map_style,
+            scene_core::MapStyle::Satellite
+        );
+        assert_eq!(
+            app.settings.scene.camera_mode,
+            scene_core::CameraMode::Follow
+        );
+        assert_eq!(app.settings.quality, scene_core::QualityPreset::Quality);
     }
     #[test]
     fn follow_export_appends_transition_and_hold() {

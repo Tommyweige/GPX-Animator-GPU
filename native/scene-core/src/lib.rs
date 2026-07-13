@@ -50,8 +50,8 @@ impl Default for SceneOptions {
     fn default() -> Self {
         Self {
             aspect: Aspect::Landscape,
-            map_style: MapStyle::Light,
-            camera_mode: CameraMode::Fit,
+            map_style: MapStyle::Satellite,
+            camera_mode: CameraMode::Follow,
             route_color: [255, 93, 59, 255],
             marker_color: [255, 243, 214, 255],
             line_width_px: 6.0,
@@ -251,12 +251,15 @@ mod tests {
     use super::*;
     use gpx_core::{ParseOptions, parse_gpx};
     fn scene() -> Scene {
-        Scene { track: parse_gpx(r#"<gpx><trk><trkseg><trkpt lat="25" lon="121"><ele>10</ele></trkpt><trkpt lat="25.01" lon="121.01"><ele>20</ele></trkpt><trkpt lat="25.02" lon="121.03"><ele>15</ele></trkpt></trkseg></trk></gpx>"#, ParseOptions::default()).unwrap(), options: SceneOptions::default() }
+        let mut options = SceneOptions::default();
+        options.camera_mode = CameraMode::Fit;
+        Scene { track: parse_gpx(r#"<gpx><trk><trkseg><trkpt lat="25" lon="121"><ele>10</ele></trkpt><trkpt lat="25.01" lon="121.01"><ele>20</ele></trkpt><trkpt lat="25.02" lon="121.03"><ele>15</ele></trkpt></trkseg></trk></gpx>"#, ParseOptions::default()).unwrap(), options }
     }
     #[test]
     fn defaults_match_product_contract() {
         let value = SceneOptions::default();
-        assert_eq!(value.map_style, MapStyle::Light);
+        assert_eq!(value.map_style, MapStyle::Satellite);
+        assert_eq!(value.camera_mode, CameraMode::Follow);
         assert_eq!(value.line_width_px, 6.0);
     }
     #[test]

@@ -413,6 +413,7 @@ mod tests {
             ..ExportSettings::default()
         };
         settings.scene.map_style = scene_core::MapStyle::Transparent;
+        settings.scene.camera_mode = scene_core::CameraMode::Fit;
         settings
     }
     #[test]
