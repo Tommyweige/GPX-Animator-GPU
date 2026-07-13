@@ -1,4 +1,7 @@
 #![doc = include_str!("../README.md")]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::redundant_field_names)]
+#![allow(clippy::too_many_arguments)]
 
 use std::{mem::MaybeUninit, sync::OnceLock};
 

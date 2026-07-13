@@ -170,7 +170,7 @@ fn main() {
                 let lock = output.try_lock(true).unwrap();
                 out.write_all(lock.as_slice()).unwrap();
                 drop(lock);
-                if let Err(_) = processed.send(output) {
+                if processed.send(output).is_err() {
                     break;
                 }
             }

@@ -296,8 +296,10 @@ mod tests {
     use super::*;
     use gpx_core::{ParseOptions, parse_gpx};
     fn scene() -> Scene {
-        let mut options = SceneOptions::default();
-        options.camera_mode = CameraMode::Fit;
+        let options = SceneOptions {
+            camera_mode: CameraMode::Fit,
+            ..SceneOptions::default()
+        };
         Scene { track: parse_gpx(r#"<gpx><trk><trkseg><trkpt lat="25" lon="121"><ele>10</ele></trkpt><trkpt lat="25.01" lon="121.01"><ele>20</ele></trkpt><trkpt lat="25.02" lon="121.03"><ele>15</ele></trkpt></trkseg></trk></gpx>"#, ParseOptions::default()).unwrap(), options }
     }
     #[test]

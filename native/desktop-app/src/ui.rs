@@ -113,11 +113,14 @@ impl NativeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&cc.egui_ctx);
         let preferences = AppPreferences::load();
-        let mut model = AppModel::default();
-        model.settings = preferences.settings.clone();
-        model.settings.cache_limit_bytes = preferences
+        let mut settings = preferences.settings.clone();
+        settings.cache_limit_bytes = preferences
             .cache_limit_bytes
             .max(crate::default_cache_limit_bytes() / 8);
+        let model = AppModel {
+            settings,
+            ..AppModel::default()
+        };
         let (gpu_tx, gpu_receiver) = channel();
         std::thread::spawn(move || {
             let result = detect_gpu_capabilities().map_err(|error| error.to_string());

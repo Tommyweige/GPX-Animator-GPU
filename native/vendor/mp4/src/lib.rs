@@ -1,3 +1,9 @@
+#![allow(clippy::get_first)]
+#![allow(clippy::legacy_numeric_constants)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::needless_as_bytes)]
+#![allow(mismatched_lifetime_syntaxes)]
+
 //! `mp4` is a Rust library to read and write ISO-MP4 files.
 //!
 //! This package contains MPEG-4 specifications defined in parts:

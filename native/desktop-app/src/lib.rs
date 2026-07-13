@@ -28,16 +28,11 @@ pub const fn default_cache_limit_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UiLanguage {
+    #[default]
     TraditionalChinese,
     English,
-}
-
-impl Default for UiLanguage {
-    fn default() -> Self {
-        Self::TraditionalChinese
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
