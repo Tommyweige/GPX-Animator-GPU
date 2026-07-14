@@ -94,6 +94,41 @@ pub struct NativeApp {
 
 const DEFAULT_POI_MANIFEST_URL: &str =
     "https://github.com/Tommyweige/GPX-Animator-GPU/releases/latest/download/poi-manifest.json";
+// Public verification key for the signed release data-pack channel.  The
+// private signing key never belongs in the repository or the executable.
+const DEFAULT_POI_PACK_PUBLIC_KEY_HEX: &str =
+    "6c39c86798e836d9f312c5737ed916bfd5ed4b964dee43dd51eaf9d0b01bd207";
+
+fn poi_data_root() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("GPX Animator")
+        .join("poi")
+}
+
+fn offline_poi_pack_summary() -> String {
+    let Ok(catalog) = places_core::LocalPoiCatalog::from_app_data(poi_data_root()) else {
+        return "Offline POI data pack status unavailable.".into();
+    };
+    let overture = catalog
+        .overture
+        .as_ref()
+        .and_then(|store| store.stats().ok())
+        .map(|stats| stats.place_count)
+        .unwrap_or_default();
+    let osm = catalog
+        .osm
+        .as_ref()
+        .and_then(|store| store.stats().ok())
+        .map(|stats| stats.place_count)
+        .unwrap_or_default();
+    if overture == 0 && osm == 0 {
+        "Offline POI data pack is empty; download it before using Offline Free.".into()
+    } else {
+        format!("Offline POI data: Overture {overture} places · OSM {osm} places")
+    }
+}
 
 fn current_long_edge(settings: &ExportSettings) -> u32 {
     match settings.scene.aspect {
@@ -233,7 +268,7 @@ impl NativeApp {
             gateway_token_status: None,
             gateway_url_input,
             poi_pack_loading: false,
-            poi_pack_status: None,
+            poi_pack_status: Some(offline_poi_pack_summary()),
         }
     }
 
@@ -349,11 +384,7 @@ impl NativeApp {
         let profile = self.preferences.poi_profile;
         let online = self.preferences.nearby_online;
         let gateway_url = self.preferences.gateway_base_url.clone();
-        let app_data = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("GPX Animator")
-            .join("poi");
+        let app_data = poi_data_root();
         std::thread::spawn(move || {
             let request = NearbySearchRequest {
                 coordinate,
@@ -403,14 +434,12 @@ impl NativeApp {
         self.poi_pack_loading = true;
         self.poi_pack_status = Some("Downloading and verifying Overture/OSM data pack…".into());
         let tx = self.places_tx.clone();
-        let root = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("GPX Animator")
-            .join("poi");
+        let root = poi_data_root();
         let manifest_url = std::env::var("GPX_ANIMATOR_POI_MANIFEST_URL")
             .unwrap_or_else(|_| DEFAULT_POI_MANIFEST_URL.to_owned());
-        let public_key = std::env::var("GPX_ANIMATOR_POI_PACK_PUBLIC_KEY_HEX").ok();
+        let public_key = std::env::var("GPX_ANIMATOR_POI_PACK_PUBLIC_KEY_HEX")
+            .ok()
+            .or_else(|| Some(DEFAULT_POI_PACK_PUBLIC_KEY_HEX.to_owned()));
         std::thread::spawn(move || {
             let result = DataPackManager::new(root)
                 .map(|manager| manager.with_signature_policy(public_key, true))
@@ -446,7 +475,9 @@ impl NativeApp {
                 PlacesMessage::PackFinished { result } => {
                     self.poi_pack_loading = false;
                     self.poi_pack_status = Some(match result {
-                        Ok(message) => message,
+                        Ok(message) => {
+                            format!("{message} {}", offline_poi_pack_summary())
+                        }
                         Err(error) => format!("Data pack: {error}"),
                     });
                 }
@@ -507,6 +538,7 @@ impl NativeApp {
         let language = self.language;
         let mut close = false;
         let mut retry = false;
+        let mut open_settings = false;
         let screen = ctx.content_rect();
         let position = egui::pos2(
             (screen.right() - 440.0).max(8.0),
@@ -649,6 +681,29 @@ impl NativeApp {
                     }
                 });
             }
+            if !dialog.loading && dialog.places.is_empty() && dialog.error.is_none() {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(210, 150, 40),
+                    match language {
+                        UiLanguage::TraditionalChinese => {
+                            "Offline Free 沒有可用的本地 POI 資料包。請先下載離線資料包。"
+                        }
+                        UiLanguage::English => {
+                            "Offline Free has no local POI data pack. Download the offline data pack first."
+                        }
+                    },
+                );
+                if ui
+                    .button(match language {
+                        UiLanguage::TraditionalChinese => "開啟設定並下載資料包",
+                        UiLanguage::English => "Open Settings and download the data pack",
+                    })
+                    .clicked()
+                {
+                    open_settings = true;
+                }
+            }
             if dialog.places.iter().any(|place| place.provider == PlaceProvider::Google) {
                 ui.small("Google Maps and Places attribution is required when Google data is shown.");
             }
@@ -670,6 +725,9 @@ impl NativeApp {
             self.nearby_dialog = None;
         } else if retry {
             self.start_nearby_lookup(coordinate);
+        }
+        if open_settings {
+            self.show_settings = true;
         }
     }
 

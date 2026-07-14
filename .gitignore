@@ -7,6 +7,12 @@
 !/dist/GPX-Animator-GPU-20260713.exe
 !/dist/GPX-Animator-GPU-20260713-tomtom.exe
 /cache/
+/build/*.geoparquet
+/build/*.state
+/build/*.sqlite3
+/build/*.zst
+/build/poi-manifest.json
+/packaging/__pycache__/
 *.part
 *.mp4
 *.trk.gpx

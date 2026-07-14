@@ -154,6 +154,11 @@ pub struct DataPackManager {
     pub require_signature: bool,
 }
 
+/// Maximum compressed payload accepted by the signed release channel.  Taiwan
+/// place snapshots are currently below 100 MiB, but the limit leaves room for
+/// future regional packs without falling back to ureq's 10 MiB JSON default.
+const MAX_DATA_PACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 impl DataPackManager {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, PlacesError> {
         let root = root.into();
@@ -235,6 +240,8 @@ impl DataPackManager {
         let status = response.status().as_u16();
         let bytes = response
             .into_body()
+            .with_config()
+            .limit(MAX_DATA_PACK_BYTES)
             .read_to_vec()
             .map_err(|error| PlacesError::Http(error.to_string()))?;
         if !(200..300).contains(&status) {

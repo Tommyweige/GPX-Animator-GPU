@@ -54,6 +54,13 @@ local, deterministic, and do not contact a public OSM endpoint. Data-pack
 release metadata must include the source snapshot date, licence/NOTICE files,
 coverage region, row count, compressed/uncompressed hashes, and signed version.
 
+If both local SQLite files contain zero rows, **Offline Free intentionally
+returns no places** instead of silently calling a paid or rate-limited service.
+The result window now explains this state and links back to Settings. Release
+builders can create a current Overture pack with
+`packaging/build_overture_pack.py`; the desktop installer must publish the
+resulting signed archive before enabling first-use download.
+
 ## Credentials and privacy
 
 API keys/tokens are stored in the Windows per-user Credential Manager only:
