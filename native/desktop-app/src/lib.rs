@@ -5,6 +5,7 @@ use scene_core::{Codec, QualityPreset, SceneOptions};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 pub mod export;
+pub mod project;
 pub mod secrets;
 pub use export::{
     ExportError, ExportOutcome, ExportRequest, detect_gpu_capabilities, load_gpx_file,

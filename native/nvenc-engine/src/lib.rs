@@ -891,6 +891,8 @@ mod tests {
         let scene = Scene {
             track,
             options: SceneOptions::default(),
+            landmarks: Vec::new(),
+            route_duration_seconds: 2.0,
         };
         let device = d3d11_renderer::D3d11ExportDevice::create_rtx().unwrap();
         let textures = device.create_export_textures(3840, 2160).unwrap();

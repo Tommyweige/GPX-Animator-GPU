@@ -31,8 +31,9 @@ included below in [繁體中文](#繁體中文).
   cancellation, progress reporting, and a GPU diagnostics view.
 - Right-click any visible map coordinate to browse nearby places in a fixed
   results window. Select Offline Free (Overture + OSM), TomTom Live, Foursquare
-  Enhanced, Gateway Pro, or explicit Google BYOK mode. Results preserve source
-  provenance and are never written to map tiles, GPX files, or exported video.
+  Enhanced, Gateway Pro, or explicit Google BYOK mode. Search results preserve
+  source provenance; only an open-data match or a user-authored marker can be
+  added to the route project and rendered into the export.
 
 ## Download and run
 
@@ -105,6 +106,26 @@ specific. Keys/tokens live only in Windows Credential Manager and never enter
 `settings.json`, logs, Git, or MP4 metadata. See
 [docs/nearby-places.md](docs/nearby-places.md) for the profiles, pack format,
 attribution, privacy, and test matrix.
+
+## Route landmarks and Relive-style moments
+
+After a nearby search, use **Add to route** (or **Match & add** for a live
+TomTom/Foursquare result). The app keeps the POI's real WGS84 coordinate and
+computes the closest GPX segment only for its reveal time. A result that cannot
+be matched to the open Overture/OSM catalog can still be added with **Add
+custom route marker** from the map context menu; Google/Gateway results remain
+view-only until the user creates a manual marker.
+
+Landmarks are saved beside the source as `<route>.gpxanimator.json` (with an
+AppData fallback if the GPX directory is read-only). The GPX file is never
+modified. The route-place manager lets users preview, rename, recategorize,
+disable, or remove each marker. During preview/export a marker is hidden until
+the route reaches its anchor, then pops with a short overshoot, a stem and
+soft shadow, briefly expands its label, and remains visible for the final fit
+view. The final camera transition does not pause or insert black frames.
+
+See [docs/route-landmarks.md](docs/route-landmarks.md) for the data model,
+provider policy, sidecar format, rendering contract, and test matrix.
 
 ## Export behavior
 

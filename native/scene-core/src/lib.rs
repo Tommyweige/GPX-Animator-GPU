@@ -1,4 +1,4 @@
-use gpx_core::{Track, sample_distance};
+use gpx_core::{EARTH_RADIUS_M, Track, haversine_m, sample_distance};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +30,74 @@ pub enum QualityPreset {
     Balanced,
     Quality,
     Speed,
+}
+
+/// The dataset that supplied a route landmark.  Open-data landmarks can be
+/// persisted in a project; provider-specific results are resolved to open data
+/// or converted to a user-authored `Manual` landmark before export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LandmarkSource {
+    Overture,
+    OpenStreetMap,
+    TomTom,
+    Foursquare,
+    Google,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LandmarkStyle {
+    pub pin_color: [u8; 4],
+    pub show_label: bool,
+}
+
+impl Default for LandmarkStyle {
+    fn default() -> Self {
+        Self {
+            pin_color: [255, 93, 59, 255],
+            show_label: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteLandmark {
+    pub id: String,
+    pub source: LandmarkSource,
+    pub source_id: Option<String>,
+    pub name: String,
+    pub category: Option<String>,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub anchor_distance_m: f64,
+    pub anchor_progress: f64,
+    pub distance_from_route_m: f64,
+    pub enabled: bool,
+    pub style: LandmarkStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RouteAnchor {
+    pub anchor_distance_m: f64,
+    pub anchor_progress: f64,
+    pub distance_from_route_m: f64,
+    pub nearest_latitude: f64,
+    pub nearest_longitude: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandmarkFrame {
+    pub id: String,
+    pub ndc: [f32; 2],
+    pub pin_opacity: f32,
+    pub pin_scale: f32,
+    pub pulse_progress: f32,
+    pub label_opacity: f32,
+    pub label_side: i8,
+    pub name: String,
+    pub category: Option<String>,
+    pub color: [u8; 4],
+    pub show_label: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +135,8 @@ impl Default for SceneOptions {
 pub struct Scene {
     pub track: Track,
     pub options: SceneOptions,
+    pub landmarks: Vec<RouteLandmark>,
+    pub route_duration_seconds: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +150,126 @@ pub struct FramePlan {
     pub progress: f32,
     pub distance_m: f64,
     pub elevation_m: Option<f64>,
+    pub landmarks: Vec<LandmarkFrame>,
+}
+
+fn wrapped_longitude_delta(from: f64, to: f64) -> f64 {
+    (to - from + 180.0).rem_euclid(360.0) - 180.0
+}
+
+fn local_meters(
+    latitude: f64,
+    longitude: f64,
+    origin_latitude: f64,
+    origin_longitude: f64,
+) -> [f64; 2] {
+    let latitude_scale = origin_latitude.to_radians().cos().abs().max(0.1);
+    [
+        wrapped_longitude_delta(origin_longitude, longitude).to_radians()
+            * EARTH_RADIUS_M
+            * latitude_scale,
+        (latitude - origin_latitude).to_radians() * EARTH_RADIUS_M,
+    ]
+}
+
+/// Find the closest point on the GPX polyline to a real-world POI.  The POI is
+/// deliberately not moved: the returned anchor only controls when its marker
+/// is revealed during the animation.
+pub fn anchor_landmark_to_route(
+    track: &Track,
+    latitude: f64,
+    longitude: f64,
+) -> Option<RouteAnchor> {
+    if track.points.len() < 2 || !latitude.is_finite() || !longitude.is_finite() {
+        return None;
+    }
+    let mut best: Option<(f64, usize, f64, [f64; 2])> = None;
+    for (index, pair) in track.points.windows(2).enumerate() {
+        let a = pair[0];
+        let b = pair[1];
+        let origin = [latitude, longitude];
+        let p0 = local_meters(a.lat, a.lon, origin[0], origin[1]);
+        let p1 = local_meters(b.lat, b.lon, origin[0], origin[1]);
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let length_squared = dx * dx + dy * dy;
+        let t = if length_squared > f64::EPSILON {
+            (-(p0[0] * dx + p0[1] * dy) / length_squared).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let closest = [p0[0] + dx * t, p0[1] + dy * t];
+        let distance_squared = closest[0] * closest[0] + closest[1] * closest[1];
+        if best.is_none_or(|value| distance_squared < value.0) {
+            let delta_lon = wrapped_longitude_delta(a.lon, b.lon);
+            let nearest_latitude = a.lat + (b.lat - a.lat) * t;
+            let nearest_longitude = a.lon + delta_lon * t;
+            best = Some((
+                distance_squared,
+                index,
+                t,
+                [nearest_latitude, nearest_longitude],
+            ));
+        }
+    }
+    let (distance_squared, index, t, nearest) = best?;
+    let segment_distance = haversine_m(&track.points[index], &track.points[index + 1]);
+    let anchor_distance_m = (track.points[index].distance_m + segment_distance * t)
+        .clamp(0.0, track.distance_m.max(0.0));
+    Some(RouteAnchor {
+        anchor_distance_m,
+        anchor_progress: if track.distance_m > f64::EPSILON {
+            (anchor_distance_m / track.distance_m).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        distance_from_route_m: distance_squared.max(0.0).sqrt(),
+        nearest_latitude: nearest[0],
+        nearest_longitude: nearest[1],
+    })
+}
+
+fn ease_out_back(value: f64) -> f32 {
+    let t = value.clamp(0.0, 1.0);
+    let c1 = 1.70158;
+    let c3 = c1 + 1.0;
+    (1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)) as f32
+}
+
+fn landmark_frame(
+    landmark: &RouteLandmark,
+    ndc: [f32; 2],
+    progress: f64,
+    duration: f64,
+) -> LandmarkFrame {
+    let duration = duration.max(1.0);
+    let elapsed = progress.clamp(0.0, 1.0) * duration;
+    let activation = landmark.anchor_progress.clamp(0.0, 1.0) * duration;
+    let reveal = ((elapsed - activation) / 0.65).clamp(0.0, 1.0);
+    let label_in = ((elapsed - activation - 0.10) / 0.35).clamp(0.0, 1.0);
+    let label_out = ((elapsed - activation - 2.2) / 0.30).clamp(0.0, 1.0);
+    let label_opacity = if reveal <= 0.0 {
+        0.0
+    } else {
+        (label_in * (1.0 - label_out)).clamp(0.0, 1.0)
+    } as f32;
+    LandmarkFrame {
+        id: landmark.id.clone(),
+        ndc,
+        pin_opacity: reveal as f32,
+        pin_scale: 0.2 + ease_out_back(reveal) * 0.8,
+        pulse_progress: if reveal < 1.0 { reveal as f32 } else { 0.0 },
+        label_opacity: if landmark.style.show_label {
+            label_opacity
+        } else {
+            0.0
+        },
+        label_side: 1,
+        name: landmark.name.clone(),
+        category: landmark.category.clone(),
+        color: landmark.style.pin_color,
+        show_label: landmark.style.show_label,
+    }
 }
 
 fn mercator(lon: f64, lat: f64) -> [f64; 2] {
@@ -132,22 +322,25 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
         .iter()
         .map(|point| mercator(point.lon, point.lat))
         .collect();
-    let min_x = projected
+    let landmark_projected: Vec<_> = scene
+        .landmarks
         .iter()
-        .map(|value| value[0])
-        .fold(f64::INFINITY, f64::min);
-    let max_x = projected
-        .iter()
-        .map(|value| value[0])
-        .fold(f64::NEG_INFINITY, f64::max);
-    let min_y = projected
-        .iter()
-        .map(|value| value[1])
-        .fold(f64::INFINITY, f64::min);
-    let max_y = projected
-        .iter()
-        .map(|value| value[1])
-        .fold(f64::NEG_INFINITY, f64::max);
+        .filter(|landmark| landmark.enabled)
+        .map(|landmark| mercator(landmark.longitude, landmark.latitude))
+        .collect();
+    let mut bounds = projected.iter().chain(landmark_projected.iter());
+    let first = bounds.next().copied().unwrap_or([0.5, 0.5]);
+    let (min_x, max_x, min_y, max_y) = bounds.fold(
+        (first[0], first[0], first[1], first[1]),
+        |(min_x, max_x, min_y, max_y), value| {
+            (
+                min_x.min(value[0]),
+                max_x.max(value[0]),
+                min_y.min(value[1]),
+                max_y.max(value[1]),
+            )
+        },
+    );
     let fit_center = [(min_x + max_x) * 0.5, (min_y + max_y) * 0.5];
     let fit_span = (max_x - min_x).max(max_y - min_y).max(1e-12) * 1.20;
     let sample = sample_distance(&scene.track, progress);
@@ -205,6 +398,19 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
             })
         })
         .collect();
+    let landmarks = scene
+        .landmarks
+        .iter()
+        .filter(|landmark| landmark.enabled)
+        .map(|landmark| {
+            landmark_frame(
+                landmark,
+                to_ndc(mercator(landmark.longitude, landmark.latitude)),
+                progress,
+                scene.route_duration_seconds,
+            )
+        })
+        .collect();
     FramePlan {
         view_center_mercator: center,
         view_span: span,
@@ -215,6 +421,7 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
         progress: progress as f32,
         distance_m: sample.distance_m,
         elevation_m: sample.elevation_m,
+        landmarks,
     }
 }
 
@@ -246,6 +453,14 @@ pub fn blend_frames(from: &FramePlan, to: &FramePlan, amount: f64) -> FramePlan 
         progress: to.progress,
         distance_m: to.distance_m,
         elevation_m: to.elevation_m,
+        landmarks: from
+            .landmarks
+            .iter()
+            .map(|landmark| LandmarkFrame {
+                ndc: convert(landmark.ndc, from),
+                ..landmark.clone()
+            })
+            .collect(),
     }
 }
 
@@ -335,7 +550,7 @@ mod tests {
             camera_mode: CameraMode::Fit,
             ..SceneOptions::default()
         };
-        Scene { track: parse_gpx(r#"<gpx><trk><trkseg><trkpt lat="25" lon="121"><ele>10</ele></trkpt><trkpt lat="25.01" lon="121.01"><ele>20</ele></trkpt><trkpt lat="25.02" lon="121.03"><ele>15</ele></trkpt></trkseg></trk></gpx>"#, ParseOptions::default()).unwrap(), options }
+        Scene { track: parse_gpx(r#"<gpx><trk><trkseg><trkpt lat="25" lon="121"><ele>10</ele></trkpt><trkpt lat="25.01" lon="121.01"><ele>20</ele></trkpt><trkpt lat="25.02" lon="121.03"><ele>15</ele></trkpt></trkseg></trk></gpx>"#, ParseOptions::default()).unwrap(), options, landmarks: vec![], route_duration_seconds: 20.0 }
     }
     #[test]
     fn defaults_match_product_contract() {
@@ -436,6 +651,66 @@ mod tests {
         scene.options.camera_mode = CameraMode::Follow;
         let frame = build_frame(&scene, 0.6);
         assert!(frame.marker_ndc[0].abs() < 1e-5 && frame.marker_ndc[1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn landmark_anchor_keeps_real_coordinate_and_finds_route_progress() {
+        let value = scene();
+        let anchor = anchor_landmark_to_route(&value.track, 25.005, 121.005).unwrap();
+        assert!(anchor.anchor_progress > 0.1 && anchor.anchor_progress < 0.6);
+        assert!(anchor.distance_from_route_m < 100.0);
+        assert!((anchor.nearest_latitude - 25.005).abs() < 0.002);
+    }
+
+    #[test]
+    fn landmark_reveal_is_hidden_then_persistent() {
+        let mut value = scene();
+        let anchor = anchor_landmark_to_route(&value.track, 25.01, 121.01).unwrap();
+        value.landmarks.push(RouteLandmark {
+            id: "overture:test".into(),
+            source: LandmarkSource::Overture,
+            source_id: Some("test".into()),
+            name: "Test place".into(),
+            category: Some("park".into()),
+            latitude: 25.01,
+            longitude: 121.01,
+            anchor_distance_m: anchor.anchor_distance_m,
+            anchor_progress: anchor.anchor_progress,
+            distance_from_route_m: anchor.distance_from_route_m,
+            enabled: true,
+            style: LandmarkStyle::default(),
+        });
+        let before = build_frame(&value, (anchor.anchor_progress - 0.05).max(0.0));
+        assert_eq!(before.landmarks[0].pin_opacity, 0.0);
+        let visible = build_frame(&value, anchor.anchor_progress + 0.02);
+        assert!(visible.landmarks[0].pin_opacity > 0.0);
+        let final_frame = build_frame(&value, 1.0);
+        assert_eq!(final_frame.landmarks[0].pin_opacity, 1.0);
+        assert_eq!(final_frame.landmarks[0].label_opacity, 0.0);
+    }
+
+    #[test]
+    fn fit_camera_includes_enabled_landmarks() {
+        let mut value = scene();
+        value.options.camera_mode = CameraMode::Fit;
+        let route_only = build_frame(&value, 1.0);
+        let anchor = anchor_landmark_to_route(&value.track, 25.10, 121.30).unwrap();
+        value.landmarks.push(RouteLandmark {
+            id: "manual:far".into(),
+            source: LandmarkSource::Manual,
+            source_id: None,
+            name: "Far marker".into(),
+            category: None,
+            latitude: 25.10,
+            longitude: 121.30,
+            anchor_distance_m: anchor.anchor_distance_m,
+            anchor_progress: anchor.anchor_progress,
+            distance_from_route_m: anchor.distance_from_route_m,
+            enabled: true,
+            style: LandmarkStyle::default(),
+        });
+        let with_landmark = build_frame(&value, 1.0);
+        assert!(with_landmark.view_span > route_only.view_span);
     }
     #[test]
     fn follow_to_fit_blend_has_exact_camera_endpoints() {

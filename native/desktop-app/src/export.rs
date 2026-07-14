@@ -5,7 +5,7 @@ use nvenc_engine::{
     CancellationToken, EncoderConfig, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
     NativeEncoder, NvencError,
 };
-use scene_core::{CameraMode, Codec, Scene, blend_frames, build_frame};
+use scene_core::{CameraMode, Codec, RouteLandmark, Scene, blend_frames, build_frame};
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ pub struct ExportRequest {
     pub track: Track,
     pub output_path: PathBuf,
     pub settings: ExportSettings,
+    pub landmarks: Vec<RouteLandmark>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +129,8 @@ where
     let scene = Scene {
         track: request.track,
         options: request.settings.scene.clone(),
+        landmarks: request.landmarks,
+        route_duration_seconds: request.settings.duration_seconds as f64,
     };
     let device = d3d11_renderer::D3d11ExportDevice::create_rtx()?;
     let textures =
@@ -452,6 +455,7 @@ mod tests {
             track: track(),
             output_path: output.clone(),
             settings: ExportSettings::default(),
+            landmarks: Vec::new(),
         };
         assert!(matches!(
             run_native_export(request, &token, |_| {}),
@@ -478,6 +482,7 @@ mod tests {
             track: track(),
             output_path: output.clone(),
             settings,
+            landmarks: Vec::new(),
         };
         let mut stages = Vec::new();
         let outcome = run_native_export(request, &CancellationToken::default(), |value| {
@@ -541,6 +546,7 @@ mod tests {
             track: track(),
             output_path: output.clone(),
             settings,
+            landmarks: Vec::new(),
         };
         let result = run_native_export(request, &token, move |value| {
             if value.completed_frames >= 5 {
@@ -565,6 +571,7 @@ mod tests {
             track: track(),
             output_path: output.clone(),
             settings,
+            landmarks: Vec::new(),
         };
         let outcome = run_native_export(request, &CancellationToken::default(), |_| {}).unwrap();
         assert_eq!(outcome.metrics.encoded_frames, 60);
@@ -614,6 +621,7 @@ mod tests {
                 track: track(),
                 output_path: output.clone(),
                 settings,
+                landmarks: Vec::new(),
             },
             &CancellationToken::default(),
             |_| {},
@@ -659,6 +667,7 @@ mod tests {
             track: track(),
             output_path: output.clone(),
             settings,
+            landmarks: Vec::new(),
         };
         let outcome = run_native_export(request, &CancellationToken::default(), |_| {}).unwrap();
         assert_eq!(outcome.metrics.encoded_frames, 1200);
@@ -723,6 +732,7 @@ mod tests {
                 track: track(),
                 output_path: output.clone(),
                 settings,
+                landmarks: Vec::new(),
             },
             &CancellationToken::default(),
             |_| {},
@@ -759,6 +769,7 @@ mod tests {
                 track: track(),
                 output_path: warmup.clone(),
                 settings: offline_settings(1),
+                landmarks: Vec::new(),
             },
             &CancellationToken::default(),
             |_| {},
@@ -778,6 +789,7 @@ mod tests {
                     track: track(),
                     output_path: output.clone(),
                     settings: offline_settings(2),
+                    landmarks: Vec::new(),
                 },
                 &CancellationToken::default(),
                 |_| {},

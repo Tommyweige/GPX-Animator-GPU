@@ -12,7 +12,8 @@ use places_core::{
     SearchCoordinate,
 };
 use scene_core::{
-    Aspect, CameraMode, Codec, MapStyle, QualityPreset, Scene, build_frame, screen_point_to_geo,
+    Aspect, CameraMode, Codec, LandmarkSource, LandmarkStyle, MapStyle, QualityPreset,
+    RouteLandmark, Scene, anchor_landmark_to_route, build_frame, screen_point_to_geo,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,6 +56,12 @@ struct NearbyDialogState {
     degraded: bool,
 }
 
+struct CustomLandmarkState {
+    coordinate: SearchCoordinate,
+    name: String,
+    category: String,
+}
+
 pub struct NativeApp {
     model: AppModel,
     track: Option<Track>,
@@ -76,6 +83,10 @@ pub struct NativeApp {
     preferences: AppPreferences,
     context_menu: Option<ContextMenuState>,
     nearby_dialog: Option<NearbyDialogState>,
+    landmarks: Vec<RouteLandmark>,
+    project_path: Option<PathBuf>,
+    project_warning: Option<String>,
+    custom_landmark: Option<CustomLandmarkState>,
     places_tx: Sender<PlacesMessage>,
     places_rx: Receiver<PlacesMessage>,
     next_places_request_id: u64,
@@ -128,6 +139,21 @@ fn offline_poi_pack_summary() -> String {
     } else {
         format!("Offline POI data: Overture {overture} places · OSM {osm} places")
     }
+}
+
+fn place_name_matches(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|character| {
+                !character.is_whitespace() && !"，。、,.()（）-".contains(*character)
+            })
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let left = normalize(left);
+    let right = normalize(right);
+    !left.is_empty() && (left == right || left.contains(&right) || right.contains(&left))
 }
 
 fn current_long_edge(settings: &ExportSettings) -> u32 {
@@ -255,6 +281,10 @@ impl NativeApp {
             preferences,
             context_menu: None,
             nearby_dialog: None,
+            landmarks: Vec::new(),
+            project_path: None,
+            project_warning: None,
+            custom_landmark: None,
             places_tx,
             places_rx,
             next_places_request_id: 0,
@@ -291,6 +321,21 @@ impl NativeApp {
                 self.output_path = Some(path.with_extension("mp4"));
                 self.gpx_path = Some(path);
                 self.track = Some(track);
+                if let (Some(gpx_path), Some(track)) = (&self.gpx_path, &self.track) {
+                    match crate::project::load_for_route(gpx_path, track) {
+                        Ok(project) => {
+                            self.landmarks = project.landmarks;
+                            self.project_path = Some(project.path);
+                            self.project_warning = project.warning;
+                        }
+                        Err(error) => {
+                            self.landmarks.clear();
+                            self.project_path = None;
+                            self.project_warning =
+                                Some(format!("Could not load route project: {error}"));
+                        }
+                    }
+                }
                 if let Some(input) = self.gpx_path.as_ref().and_then(|value| value.parent()) {
                     self.preferences.last_input_directory = Some(input.to_path_buf());
                 }
@@ -299,6 +344,269 @@ impl NativeApp {
                 self.last_error = None
             }
             Err(error) => self.last_error = Some(error.to_string()),
+        }
+    }
+
+    fn save_landmarks(&mut self) {
+        let (Some(gpx_path), Some(track)) = (&self.gpx_path, &self.track) else {
+            return;
+        };
+        match crate::project::save_for_route(gpx_path, &self.landmarks, track) {
+            Ok(crate::project::ProjectSaveLocation::Sidecar(path)) => {
+                self.project_path = Some(path);
+                self.project_warning = None;
+            }
+            Ok(crate::project::ProjectSaveLocation::AppData(path)) => {
+                self.project_path = Some(path.clone());
+                self.project_warning = Some(format!(
+                    "Route project saved in AppData: {}",
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                self.project_warning = Some(format!("Could not save route project: {error}"));
+            }
+        }
+    }
+
+    fn route_landmark_from_place(&self, place: &PlaceSummary) -> Option<RouteLandmark> {
+        let open_place = match place.provider {
+            PlaceProvider::Overture | PlaceProvider::OpenStreetMap => place.clone(),
+            PlaceProvider::TomTom | PlaceProvider::Foursquare => {
+                let catalog = places_core::LocalPoiCatalog::from_app_data(poi_data_root()).ok()?;
+                let request = NearbySearchRequest {
+                    coordinate: SearchCoordinate {
+                        latitude: place.latitude,
+                        longitude: place.longitude,
+                    },
+                    radius_m: 100,
+                    limit: 20,
+                    language: PlaceLanguage::TraditionalChinese,
+                };
+                catalog
+                    .search(request)
+                    .ok()?
+                    .into_iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.provider,
+                            PlaceProvider::Overture | PlaceProvider::OpenStreetMap
+                        ) && place_name_matches(&place.name, &candidate.name)
+                    })
+                    .min_by(|a, b| a.distance_m.total_cmp(&b.distance_m))?
+            }
+            PlaceProvider::Google | PlaceProvider::Gateway => return None,
+        };
+        let source = match open_place.provider {
+            PlaceProvider::Overture => LandmarkSource::Overture,
+            PlaceProvider::OpenStreetMap => LandmarkSource::OpenStreetMap,
+            _ => return None,
+        };
+        let track = self.track.as_ref()?;
+        let anchor = anchor_landmark_to_route(track, open_place.latitude, open_place.longitude)?;
+        let source_tag = match open_place.provider {
+            PlaceProvider::Overture => "overture",
+            PlaceProvider::OpenStreetMap => "osm",
+            _ => "provider",
+        };
+        Some(RouteLandmark {
+            id: format!("{source_tag}:{}", open_place.id),
+            source,
+            source_id: Some(open_place.id.clone()),
+            name: open_place.name.clone(),
+            category: open_place.category.clone(),
+            latitude: open_place.latitude,
+            longitude: open_place.longitude,
+            anchor_distance_m: anchor.anchor_distance_m,
+            anchor_progress: anchor.anchor_progress,
+            distance_from_route_m: anchor.distance_from_route_m,
+            enabled: true,
+            style: LandmarkStyle::default(),
+        })
+    }
+
+    fn add_landmark(&mut self, mut landmark: RouteLandmark) {
+        if let Some(existing) = self.landmarks.iter_mut().find(|value| {
+            value.id == landmark.id
+                || ((value.latitude - landmark.latitude).abs() < 0.0003
+                    && (value.longitude - landmark.longitude).abs() < 0.0003
+                    && value.name.eq_ignore_ascii_case(&landmark.name))
+        }) {
+            existing.enabled = true;
+            return;
+        }
+        landmark.anchor_progress = landmark.anchor_progress.clamp(0.0, 1.0);
+        self.landmarks.push(landmark);
+        self.landmarks.sort_by(|a, b| {
+            a.anchor_distance_m
+                .total_cmp(&b.anchor_distance_m)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        self.save_landmarks();
+    }
+
+    fn add_place_from_dialog(&mut self, index: usize) {
+        let Some(dialog) = &self.nearby_dialog else {
+            return;
+        };
+        let Some(place) = dialog.places.get(index).cloned() else {
+            return;
+        };
+        if let Some(landmark) = self.route_landmark_from_place(&place) {
+            let progress = landmark.anchor_progress;
+            self.add_landmark(landmark);
+            self.preview_progress = progress;
+        } else {
+            self.last_error = Some(if self.language == UiLanguage::English {
+                "This provider result has no matching open-data place; use Add custom route marker from the map."
+                    .into()
+            } else {
+                "找不到對應的開放資料地點，請從地圖右鍵使用「新增自訂沿途地點」。".into()
+            });
+        }
+    }
+
+    fn add_custom_landmark(&mut self) {
+        let Some(state) = self.custom_landmark.take() else {
+            return;
+        };
+        let Some(track) = &self.track else {
+            return;
+        };
+        let Some(anchor) =
+            anchor_landmark_to_route(track, state.coordinate.latitude, state.coordinate.longitude)
+        else {
+            return;
+        };
+        let id = format!(
+            "manual:{:.6}:{:.6}:{}",
+            state.coordinate.latitude,
+            state.coordinate.longitude,
+            self.landmarks.len()
+        );
+        self.add_landmark(RouteLandmark {
+            id,
+            source: LandmarkSource::Manual,
+            source_id: None,
+            name: if state.name.trim().is_empty() {
+                "Route location".into()
+            } else {
+                state.name.trim().into()
+            },
+            category: (!state.category.trim().is_empty()).then(|| state.category.trim().into()),
+            latitude: state.coordinate.latitude,
+            longitude: state.coordinate.longitude,
+            anchor_distance_m: anchor.anchor_distance_m,
+            anchor_progress: anchor.anchor_progress,
+            distance_from_route_m: anchor.distance_from_route_m,
+            enabled: true,
+            style: LandmarkStyle::default(),
+        });
+        self.preview_progress = anchor.anchor_progress;
+    }
+
+    fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
+        if self.track.is_none() {
+            return;
+        }
+        let english = self.language == UiLanguage::English;
+        ui.separator();
+        ui.heading(if english {
+            "03  Route places"
+        } else {
+            "03  沿途地點"
+        });
+        ui.small(if english {
+            "Markers appear when the route reaches them and remain on the final fit view."
+        } else {
+            "路線抵達地點時標記會浮起，最後完整視角會保留所有圖釘。"
+        });
+        let mut changed = false;
+        let mut remove = None;
+        let mut jump = None;
+        for index in 0..self.landmarks.len() {
+            let landmark = &mut self.landmarks[index];
+            let id = landmark.id.clone();
+            ui.push_id(id, |ui| {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut landmark.enabled, "").changed() {
+                            changed = true;
+                        }
+                        let source = match landmark.source {
+                            LandmarkSource::Overture => "Overture",
+                            LandmarkSource::OpenStreetMap => "OSM",
+                            LandmarkSource::Manual => "Manual",
+                            LandmarkSource::TomTom => "TomTom",
+                            LandmarkSource::Foursquare => "Foursquare",
+                            LandmarkSource::Google => "Google",
+                        };
+                        if ui
+                            .button(if english { "Preview" } else { "預覽" })
+                            .clicked()
+                        {
+                            jump = Some(landmark.anchor_progress);
+                        }
+                        ui.small(format!(
+                            "{:.2} km · {source}",
+                            landmark.anchor_distance_m / 1000.0
+                        ));
+                        if ui.button(if english { "Remove" } else { "移除" }).clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut landmark.name).hint_text(if english {
+                                "Place name"
+                            } else {
+                                "地點名稱"
+                            }),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(if english { "Category" } else { "分類" });
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(
+                                    landmark.category.get_or_insert_with(String::new),
+                                )
+                                .desired_width(150.0),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.small(format!(
+                            "{} m from route",
+                            landmark.distance_from_route_m.round()
+                        ));
+                    });
+                });
+            });
+        }
+        if let Some(index) = remove {
+            self.landmarks.remove(index);
+            changed = true;
+        }
+        if let Some(progress) = jump {
+            self.preview_progress = progress;
+        }
+        if changed {
+            self.save_landmarks();
+        }
+        if let Some(warning) = &self.project_warning {
+            ui.colored_label(egui::Color32::YELLOW, warning);
+        }
+        if self.landmarks.is_empty() {
+            ui.small(if english {
+                "No route places yet. Right-click the map and search nearby places."
+            } else {
+                "尚未加入地點；在地圖上按右鍵即可搜尋附近地點。"
+            });
         }
     }
 
@@ -490,6 +798,7 @@ impl NativeApp {
             return;
         };
         let mut search = false;
+        let mut custom = false;
         let language = self.language;
         egui::Area::new(egui::Id::new("nearby-context-menu"))
             .order(egui::Order::Foreground)
@@ -515,6 +824,15 @@ impl NativeApp {
                     }
                     if ui
                         .button(match language {
+                            UiLanguage::TraditionalChinese => "新增自訂沿途地點",
+                            UiLanguage::English => "Add custom route marker",
+                        })
+                        .clicked()
+                    {
+                        custom = true;
+                    }
+                    if ui
+                        .button(match language {
                             UiLanguage::TraditionalChinese => "關閉",
                             UiLanguage::English => "Close",
                         })
@@ -529,8 +847,17 @@ impl NativeApp {
             self.context_menu = None;
             self.start_nearby_lookup(menu.coordinate);
         }
+        if custom {
+            self.context_menu = None;
+            self.custom_landmark = Some(CustomLandmarkState {
+                coordinate: menu.coordinate,
+                name: String::new(),
+                category: String::new(),
+            });
+        }
     }
 
+    #[allow(clippy::collapsible_else_if)]
     fn draw_nearby_dialog(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.nearby_dialog.as_mut() else {
             return;
@@ -539,6 +866,12 @@ impl NativeApp {
         let mut close = false;
         let mut retry = false;
         let mut open_settings = false;
+        let mut add_index = None;
+        let landmark_ids: HashSet<String> = self
+            .landmarks
+            .iter()
+            .map(|value| value.id.clone())
+            .collect();
         let screen = ctx.content_rect();
         let position = egui::pos2(
             (screen.right() - 440.0).max(8.0),
@@ -633,6 +966,50 @@ impl NativeApp {
                             ui.horizontal(|ui| {
                                 ui.strong(format!("{}.", index + 1));
                                 ui.strong(&place.name);
+                                let source_tag = match place.provider {
+                                    PlaceProvider::Overture => "overture",
+                                    PlaceProvider::OpenStreetMap => "osm",
+                                    _ => "provider",
+                                };
+                                let place_id = format!("{source_tag}:{}", place.id);
+                                if matches!(
+                                    place.provider,
+                                    PlaceProvider::Overture
+                                        | PlaceProvider::OpenStreetMap
+                                        | PlaceProvider::TomTom
+                                        | PlaceProvider::Foursquare
+                                ) {
+                                    if landmark_ids.contains(&place_id) {
+                                        ui.label(if language == UiLanguage::English {
+                                            "✓ Added"
+                                        } else {
+                                            "✓ 已加入"
+                                        });
+                                    } else if ui
+                                        .button(if language == UiLanguage::English {
+                                            if matches!(place.provider, PlaceProvider::TomTom | PlaceProvider::Foursquare) {
+                                                "Match & add"
+                                            } else {
+                                                "Add to route"
+                                            }
+                                        } else {
+                                            if matches!(place.provider, PlaceProvider::TomTom | PlaceProvider::Foursquare) {
+                                                "匹配後加入"
+                                            } else {
+                                                "加入路線"
+                                            }
+                                        })
+                                        .clicked()
+                                    {
+                                        add_index = Some(index);
+                                    }
+                                } else {
+                                    ui.small(if language == UiLanguage::English {
+                                        "Use open-data match or custom marker"
+                                    } else {
+                                        "請使用開放資料匹配或自訂標記"
+                                    });
+                                }
                             });
                             if let Some(category) = &place.category {
                                 ui.small(category);
@@ -726,8 +1103,56 @@ impl NativeApp {
         } else if retry {
             self.start_nearby_lookup(coordinate);
         }
+        if let Some(index) = add_index {
+            self.add_place_from_dialog(index);
+        }
         if open_settings {
             self.show_settings = true;
+        }
+    }
+
+    fn draw_custom_landmark_dialog(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.custom_landmark.as_mut() else {
+            return;
+        };
+        let english = self.language == UiLanguage::English;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new(if english {
+            "Add custom route marker"
+        } else {
+            "新增自訂沿途地點"
+        })
+        .id(egui::Id::new("custom-route-landmark"))
+        .fixed_pos(egui::pos2(460.0, 110.0))
+        .default_size(egui::vec2(360.0, 190.0))
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.small(format!(
+                "{:.6}, {:.6}",
+                state.coordinate.latitude, state.coordinate.longitude
+            ));
+            ui.label(if english { "Name" } else { "名稱" });
+            ui.text_edit_singleline(&mut state.name);
+            ui.label(if english {
+                "Category (optional)"
+            } else {
+                "分類（可選）"
+            });
+            ui.text_edit_singleline(&mut state.category);
+            ui.horizontal(|ui| {
+                if ui.button(if english { "Add" } else { "加入" }).clicked() {
+                    save = true;
+                }
+                if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if save {
+            self.add_custom_landmark();
+        } else if cancel {
+            self.custom_landmark = None;
         }
     }
 
@@ -748,6 +1173,7 @@ impl NativeApp {
             track,
             output_path: output,
             settings: self.model.settings.clone(),
+            landmarks: self.landmarks.clone(),
         };
         let (tx, rx) = channel();
         let worker_token = token.clone();
@@ -997,6 +1423,7 @@ impl NativeApp {
                     );
                     ui.checkbox(&mut self.model.settings.scene.show_hud, "顯示 HUD");
                     ui.checkbox(&mut self.model.settings.scene.show_elevation, "顯示海拔圖");
+                    self.draw_landmark_manager(ui);
                     ui.separator();
                     ui.heading("03 輸出");
                     egui::ComboBox::from_label("Codec")
@@ -1261,6 +1688,7 @@ impl NativeApp {
                         &mut self.model.settings.scene.show_elevation,
                         "Show elevation profile",
                     );
+                    self.draw_landmark_manager(ui);
                     ui.separator();
                     ui.heading("03  Export");
                     egui::ComboBox::from_label("Codec")
@@ -1393,6 +1821,7 @@ impl NativeApp {
             });
     }
 
+    #[allow(clippy::collapsible_if)]
     fn draw_preview(&mut self, ctx: &egui::Context) {
         if self.preview_map_style != self.model.settings.scene.map_style {
             self.preview_map_style = self.model.settings.scene.map_style;
@@ -1473,6 +1902,8 @@ impl NativeApp {
             let scene = Scene {
                 track: track.clone(),
                 options: self.model.settings.scene.clone(),
+                landmarks: self.landmarks.clone(),
+                route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
             let frame = build_frame(&scene, self.preview_progress);
             if response.secondary_clicked()
@@ -1563,6 +1994,103 @@ impl NativeApp {
                 9.0,
                 egui::Color32::from_rgb(255, 93, 59),
             );
+            let landmark_scale = frame_rect.height() / 2160.0;
+            for landmark in &frame.landmarks {
+                if landmark.pin_opacity <= 0.0
+                    || landmark.ndc[0] < -1.25
+                    || landmark.ndc[0] > 1.25
+                    || landmark.ndc[1] < -1.25
+                    || landmark.ndc[1] > 1.25
+                {
+                    continue;
+                }
+                let point = to_screen(landmark.ndc);
+                let alpha = (landmark.pin_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    landmark.color[0],
+                    landmark.color[1],
+                    landmark.color[2],
+                    alpha,
+                );
+                let radius = 18.0 * landmark_scale * landmark.pin_scale.max(0.2);
+                painter.circle_filled(
+                    point + egui::vec2(6.0 * landmark_scale, 9.0 * landmark_scale),
+                    radius * 1.08,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, (alpha as f32 * 0.45) as u8),
+                );
+                painter.line_segment(
+                    [
+                        point + egui::vec2(0.0, radius * 0.55),
+                        point + egui::vec2(0.0, 27.0 * landmark_scale),
+                    ],
+                    egui::Stroke::new(5.0 * landmark_scale, color),
+                );
+                painter.circle_filled(
+                    point,
+                    radius,
+                    egui::Color32::from_rgba_unmultiplied(255, 246, 218, alpha),
+                );
+                painter.circle_filled(point, radius * 0.66, color);
+                if landmark.pulse_progress > 0.0 {
+                    painter.circle_stroke(
+                        point,
+                        radius * (1.25 + landmark.pulse_progress * 0.7),
+                        egui::Stroke::new(
+                            2.0 * landmark_scale,
+                            egui::Color32::from_rgba_unmultiplied(
+                                landmark.color[0],
+                                landmark.color[1],
+                                landmark.color[2],
+                                (alpha as f32 * (1.0 - landmark.pulse_progress) * 0.7) as u8,
+                            ),
+                        ),
+                    );
+                }
+                if landmark.label_opacity > 0.0 && landmark.show_label {
+                    let label_alpha = (landmark.label_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+                    let label_width = 260.0 * landmark_scale;
+                    let label_height = if landmark.category.is_some() {
+                        54.0 * landmark_scale
+                    } else {
+                        34.0 * landmark_scale
+                    };
+                    let side = if landmark.ndc[0] > 0.55 { -1.0 } else { 1.0 };
+                    let left = if side > 0.0 {
+                        point.x + 28.0 * landmark_scale
+                    } else {
+                        point.x - 28.0 * landmark_scale - label_width
+                    };
+                    let top = point.y - label_height - 18.0 * landmark_scale;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, top),
+                        egui::vec2(label_width, label_height),
+                    );
+                    painter.rect_filled(
+                        rect,
+                        8.0 * landmark_scale,
+                        egui::Color32::from_rgba_unmultiplied(
+                            9,
+                            14,
+                            18,
+                            (label_alpha as f32 * 0.86) as u8,
+                        ),
+                    );
+                    let mut label = landmark.name.clone();
+                    if let Some(category) = &landmark.category {
+                        if !category.trim().is_empty() {
+                            label.push('\n');
+                            label.push_str(category);
+                        }
+                    }
+                    painter.text(
+                        rect.left_top() + egui::vec2(12.0 * landmark_scale, 7.0 * landmark_scale),
+                        egui::Align2::LEFT_TOP,
+                        label,
+                        egui::FontId::proportional(28.0 * landmark_scale),
+                        egui::Color32::from_rgba_unmultiplied(255, 248, 230, label_alpha),
+                    );
+                }
+            }
             if self.model.settings.scene.show_elevation && frame.elevation_line.len() > 1 {
                 let overlay = scene_core::overlay_layout(self.model.settings.scene.aspect);
                 let chart = egui::Rect::from_min_max(
@@ -2174,6 +2702,7 @@ impl eframe::App for NativeApp {
         self.draw_preview(ctx);
         self.draw_context_menu(ctx);
         self.draw_nearby_dialog(ctx);
+        self.draw_custom_landmark_dialog(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
         self.persist_preferences();

@@ -933,6 +933,227 @@ impl D2dSceneRenderer {
         unsafe {
             self.context.FillEllipse(&ellipse, &marker_brush);
         }
+        // Route landmarks are deliberately drawn as lightweight vector layers:
+        // a soft offset shadow, a stem, a highlighted pin and an optional
+        // two-line label.  This gives the Relive-like depth cue without an
+        // image asset, GPU readback, or a per-frame bitmap allocation.
+        if !frame.landmarks.is_empty() {
+            let shadow_brush = unsafe {
+                self.context
+                    .CreateSolidColorBrush(
+                        &D2D1_COLOR_F {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.48,
+                        },
+                        None,
+                    )
+                    .map_err(|error| RendererError::Api(error.to_string()))?
+            };
+            let label_background = unsafe {
+                self.context
+                    .CreateSolidColorBrush(
+                        &D2D1_COLOR_F {
+                            r: 0.035,
+                            g: 0.055,
+                            b: 0.07,
+                            a: 0.86,
+                        },
+                        None,
+                    )
+                    .map_err(|error| RendererError::Api(error.to_string()))?
+            };
+            let reference_scale = height as f32 / 2160.0;
+            for landmark in &frame.landmarks {
+                if landmark.pin_opacity <= 0.0
+                    || landmark.ndc[0] < -1.25
+                    || landmark.ndc[0] > 1.25
+                    || landmark.ndc[1] < -1.25
+                    || landmark.ndc[1] > 1.25
+                {
+                    continue;
+                }
+                let point = to_pixel(landmark.ndc);
+                let scale = reference_scale * landmark.pin_scale.max(0.2);
+                let radius = 18.0 * scale;
+                let opacity = landmark.pin_opacity.clamp(0.0, 1.0);
+                let shadow = D2D1_ELLIPSE {
+                    point: Vector2 {
+                        X: point.X + 6.0 * reference_scale,
+                        Y: point.Y + 9.0 * reference_scale,
+                    },
+                    radiusX: radius * 1.10,
+                    radiusY: radius * 0.78,
+                };
+                let stem_start = Vector2 {
+                    X: point.X,
+                    Y: point.Y + radius * 0.55,
+                };
+                let stem_end = Vector2 {
+                    X: point.X,
+                    Y: point.Y + 27.0 * reference_scale,
+                };
+                let outer = D2D1_ELLIPSE {
+                    point,
+                    radiusX: radius,
+                    radiusY: radius,
+                };
+                let inner = D2D1_ELLIPSE {
+                    point,
+                    radiusX: radius * 0.66,
+                    radiusY: radius * 0.66,
+                };
+                let pin_color = D2D1_COLOR_F {
+                    r: landmark.color[0] as f32 / 255.0,
+                    g: landmark.color[1] as f32 / 255.0,
+                    b: landmark.color[2] as f32 / 255.0,
+                    a: (landmark.color[3] as f32 / 255.0) * opacity,
+                };
+                let pin_brush = unsafe {
+                    self.context
+                        .CreateSolidColorBrush(&pin_color, None)
+                        .map_err(|error| RendererError::Api(error.to_string()))?
+                };
+                let pulse_brush = unsafe {
+                    self.context
+                        .CreateSolidColorBrush(
+                            &D2D1_COLOR_F {
+                                r: landmark.color[0] as f32 / 255.0,
+                                g: landmark.color[1] as f32 / 255.0,
+                                b: landmark.color[2] as f32 / 255.0,
+                                a: 0.20 * opacity,
+                            },
+                            None,
+                        )
+                        .map_err(|error| RendererError::Api(error.to_string()))?
+                };
+                let outer_brush = unsafe {
+                    self.context
+                        .CreateSolidColorBrush(
+                            &D2D1_COLOR_F {
+                                r: 1.0,
+                                g: 0.96,
+                                b: 0.84,
+                                a: 0.95 * opacity,
+                            },
+                            None,
+                        )
+                        .map_err(|error| RendererError::Api(error.to_string()))?
+                };
+                unsafe {
+                    if landmark.pulse_progress > 0.0 {
+                        let pulse = D2D1_ELLIPSE {
+                            point,
+                            radiusX: radius * (1.25 + landmark.pulse_progress * 0.7),
+                            radiusY: radius * (1.25 + landmark.pulse_progress * 0.7),
+                        };
+                        self.context.FillEllipse(&pulse, &pulse_brush);
+                    }
+                    self.context.FillEllipse(&shadow, &shadow_brush);
+                    self.context.DrawLine(
+                        stem_start,
+                        stem_end,
+                        &shadow_brush,
+                        8.0 * reference_scale,
+                        None,
+                    );
+                    self.context.DrawLine(
+                        stem_start,
+                        stem_end,
+                        &pin_brush,
+                        4.0 * reference_scale,
+                        None,
+                    );
+                    self.context.FillEllipse(&outer, &outer_brush);
+                    self.context.FillEllipse(&inner, &pin_brush);
+                }
+                if landmark.label_opacity > 0.0 && landmark.show_label {
+                    let label_scale = reference_scale;
+                    let label_width = 520.0 * label_scale;
+                    let label_height = if landmark.category.is_some() {
+                        94.0 * label_scale
+                    } else {
+                        60.0 * label_scale
+                    };
+                    let side = if landmark.ndc[0] > 0.55 { -1.0 } else { 1.0 };
+                    let left = if side > 0.0 {
+                        point.X + 28.0 * label_scale
+                    } else {
+                        point.X - 28.0 * label_scale - label_width
+                    };
+                    let top = point.Y - label_height - 18.0 * label_scale;
+                    let rect = D2D_RECT_F {
+                        left,
+                        top,
+                        right: left + label_width,
+                        bottom: top + label_height,
+                    };
+                    let mut text = landmark.name.clone();
+                    if let Some(category) = &landmark.category
+                        && !category.trim().is_empty()
+                    {
+                        text.push('\n');
+                        text.push_str(category);
+                    }
+                    let utf16: Vec<u16> = text.encode_utf16().collect();
+                    let text_rect = D2D_RECT_F {
+                        left: rect.left + 20.0 * label_scale,
+                        top: rect.top + 10.0 * label_scale,
+                        right: rect.right - 16.0 * label_scale,
+                        bottom: rect.bottom - 8.0 * label_scale,
+                    };
+                    let alpha = landmark.label_opacity.clamp(0.0, 1.0);
+                    let label_shadow = D2D1_COLOR_F {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.9 * alpha,
+                    };
+                    let label_foreground = D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 0.97,
+                        b: 0.89,
+                        a: alpha,
+                    };
+                    let label_shadow_brush = unsafe {
+                        self.context
+                            .CreateSolidColorBrush(&label_shadow, None)
+                            .map_err(|error| RendererError::Api(error.to_string()))?
+                    };
+                    let label_foreground_brush = unsafe {
+                        self.context
+                            .CreateSolidColorBrush(&label_foreground, None)
+                            .map_err(|error| RendererError::Api(error.to_string()))?
+                    };
+                    unsafe {
+                        self.context.FillRectangle(&rect, &label_background);
+                        let shadow_rect = D2D_RECT_F {
+                            left: text_rect.left + 2.0 * label_scale,
+                            top: text_rect.top + 2.0 * label_scale,
+                            right: text_rect.right + 2.0 * label_scale,
+                            bottom: text_rect.bottom + 2.0 * label_scale,
+                        };
+                        self.context.DrawText(
+                            &utf16,
+                            &self.text_format,
+                            &shadow_rect,
+                            &label_shadow_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        self.context.DrawText(
+                            &utf16,
+                            &self.text_format,
+                            &text_rect,
+                            &label_foreground_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                }
+            }
+        }
         if options.show_hud {
             let overlay = scene_core::overlay_layout(options.aspect);
             let rect = D2D_RECT_F {
@@ -1428,6 +1649,8 @@ mod tests {
         let scene = Scene {
             track,
             options: SceneOptions::default(),
+            landmarks: Vec::new(),
+            route_duration_seconds: 2.0,
         };
         let frame = build_frame(&scene, 0.5);
         let device = D3d11ExportDevice::create_rtx().unwrap();

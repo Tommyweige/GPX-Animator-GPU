@@ -1481,6 +1481,7 @@ dependencies = [
  "scene-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "windows 0.62.2",
 ]
