@@ -7,7 +7,9 @@ use eframe::egui;
 use gpx_core::{ParseOptions, Track};
 use nvenc_engine::CancellationToken;
 use places_core::{
-    NearbySearchRequest, PlaceLanguage, PlaceProvider, PlaceSummary, SearchCoordinate,
+    DataPackManager, GatewayConfig, NearbyProviderPreference, NearbySearchRequest, PlaceLanguage,
+    PlaceProvider, PlaceSummary, PoiProfile, PoiSearchResponse, PoiService, ProviderCredentials,
+    SearchCoordinate,
 };
 use scene_core::{
     Aspect, CameraMode, Codec, MapStyle, QualityPreset, Scene, build_frame, screen_point_to_geo,
@@ -29,7 +31,10 @@ enum TileMessage {
 enum PlacesMessage {
     Finished {
         request_id: u64,
-        result: Result<Vec<PlaceSummary>, String>,
+        result: Result<PoiSearchResponse, String>,
+    },
+    PackFinished {
+        result: Result<String, String>,
     },
 }
 
@@ -45,6 +50,9 @@ struct NearbyDialogState {
     loading: bool,
     places: Vec<PlaceSummary>,
     error: Option<String>,
+    attempts: Vec<places_core::FallbackAttempt>,
+    attribution: Vec<String>,
+    degraded: bool,
 }
 
 pub struct NativeApp {
@@ -73,7 +81,19 @@ pub struct NativeApp {
     next_places_request_id: u64,
     google_key_input: String,
     google_key_status: Option<String>,
+    tomtom_key_input: String,
+    tomtom_key_status: Option<String>,
+    foursquare_key_input: String,
+    foursquare_key_status: Option<String>,
+    gateway_token_input: String,
+    gateway_token_status: Option<String>,
+    gateway_url_input: String,
+    poi_pack_loading: bool,
+    poi_pack_status: Option<String>,
 }
+
+const DEFAULT_POI_MANIFEST_URL: &str =
+    "https://github.com/Tommyweige/GPX-Animator-GPU/releases/latest/download/poi-manifest.json";
 
 fn current_long_edge(settings: &ExportSettings) -> u32 {
     match settings.scene.aspect {
@@ -165,6 +185,19 @@ impl NativeApp {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let tomtom_key_input = crate::secrets::read_tomtom_api_key()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let foursquare_key_input = crate::secrets::read_foursquare_api_key()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let gateway_token_input = crate::secrets::read_gateway_bearer_token()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let gateway_url_input = preferences.gateway_base_url.clone().unwrap_or_default();
         let preview_map_style = model.settings.scene.map_style;
         Self {
             model,
@@ -192,6 +225,15 @@ impl NativeApp {
             next_places_request_id: 0,
             google_key_input,
             google_key_status: None,
+            tomtom_key_input,
+            tomtom_key_status: None,
+            foursquare_key_input,
+            foursquare_key_status: None,
+            gateway_token_input,
+            gateway_token_status: None,
+            gateway_url_input,
+            poi_pack_loading: false,
+            poi_pack_status: None,
         }
     }
 
@@ -294,6 +336,9 @@ impl NativeApp {
             loading: true,
             places: Vec::new(),
             error: None,
+            attempts: Vec::new(),
+            attribution: Vec::new(),
+            degraded: false,
         });
         let tx = self.places_tx.clone();
         let radius_m = places_core::normalize_radius(self.preferences.nearby_radius_m);
@@ -301,6 +346,14 @@ impl NativeApp {
             UiLanguage::TraditionalChinese => PlaceLanguage::TraditionalChinese,
             UiLanguage::English => PlaceLanguage::English,
         };
+        let profile = self.preferences.poi_profile;
+        let online = self.preferences.nearby_online;
+        let gateway_url = self.preferences.gateway_base_url.clone();
+        let app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("GPX Animator")
+            .join("poi");
         std::thread::spawn(move || {
             let request = NearbySearchRequest {
                 coordinate,
@@ -308,47 +361,95 @@ impl NativeApp {
                 limit: 20,
                 language,
             };
+            let tomtom_key = crate::secrets::read_tomtom_api_key()
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty());
             let google_key = crate::secrets::read_google_places_api_key()
                 .ok()
                 .flatten()
                 .filter(|value| !value.trim().is_empty());
-            let google_result = google_key
-                .as_deref()
-                .map(|key| places_core::GooglePlacesClient::default().search(key, request.clone()));
-            let result = match google_result {
-                Some(Ok(value)) => Ok(value),
-                Some(Err(google_error)) => {
-                    match places_core::OverpassClient::default().search(request) {
-                        Ok(value) => Ok(value),
-                        Err(osm_error) => Err(format!(
-                            "Google: {google_error}; OpenStreetMap: {osm_error}"
-                        )),
-                    }
-                }
-                None => places_core::OverpassClient::default()
-                    .search(request)
-                    .map_err(|error| error.to_string()),
+            let foursquare_key = crate::secrets::read_foursquare_api_key()
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty());
+            let gateway_token = crate::secrets::read_gateway_bearer_token()
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty());
+            let local = places_core::LocalPoiCatalog::from_app_data(&app_data).ok();
+            let service = PoiService::new(local);
+            let credentials = ProviderCredentials {
+                tomtom_api_key: tomtom_key,
+                foursquare_api_key: foursquare_key,
+                google_api_key: google_key,
+                gateway_bearer_token: gateway_token,
+                gateway: gateway_url.map(|base_url| GatewayConfig {
+                    base_url,
+                    enabled: true,
+                }),
             };
+            let result = service
+                .search(profile, request, &credentials, online, false)
+                .map_err(|error| error.to_string());
             let _ = tx.send(PlacesMessage::Finished { request_id, result });
+        });
+    }
+
+    fn start_poi_pack_download(&mut self) {
+        if self.poi_pack_loading {
+            return;
+        }
+        self.poi_pack_loading = true;
+        self.poi_pack_status = Some("Downloading and verifying Overture/OSM data pack…".into());
+        let tx = self.places_tx.clone();
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("GPX Animator")
+            .join("poi");
+        let manifest_url = std::env::var("GPX_ANIMATOR_POI_MANIFEST_URL")
+            .unwrap_or_else(|_| DEFAULT_POI_MANIFEST_URL.to_owned());
+        let public_key = std::env::var("GPX_ANIMATOR_POI_PACK_PUBLIC_KEY_HEX").ok();
+        std::thread::spawn(move || {
+            let result = DataPackManager::new(root)
+                .map(|manager| manager.with_signature_policy(public_key, true))
+                .and_then(|manager| manager.download_manifest_and_install(&manifest_url))
+                .map(|paths| format!("Installed {} local data pack(s).", paths.len()))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(PlacesMessage::PackFinished { result });
         });
     }
 
     fn poll_places(&mut self) {
         while let Ok(message) = self.places_rx.try_recv() {
-            let PlacesMessage::Finished { request_id, result } = message;
-            let Some(dialog) = self.nearby_dialog.as_mut() else {
-                continue;
-            };
-            if dialog.request_id != request_id {
-                continue;
-            }
-            dialog.loading = false;
-            match result {
-                Ok(places) => {
-                    dialog.places = places;
-                    dialog.error = None;
+            match message {
+                PlacesMessage::Finished { request_id, result } => {
+                    let Some(dialog) = self.nearby_dialog.as_mut() else {
+                        continue;
+                    };
+                    if dialog.request_id != request_id {
+                        continue;
+                    }
+                    dialog.loading = false;
+                    match result {
+                        Ok(places) => {
+                            dialog.places = places.places;
+                            dialog.attempts = places.attempts;
+                            dialog.attribution = places.attribution;
+                            dialog.degraded = places.degraded;
+                            dialog.error = None;
+                        }
+                        Err(error) => dialog.error = Some(error),
+                    }
                 }
-                Err(error) => dialog.error = Some(error),
+                PlacesMessage::PackFinished { result } => {
+                    self.poi_pack_loading = false;
+                    self.poi_pack_status = Some(match result {
+                        Ok(message) => message,
+                        Err(error) => format!("Data pack: {error}"),
+                    });
+                }
             }
         }
     }
@@ -469,8 +570,8 @@ impl NativeApp {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(match language {
-                        UiLanguage::TraditionalChinese => "正在查詢 Google / OpenStreetMap…",
-                        UiLanguage::English => "Querying Google / OpenStreetMap…",
+                        UiLanguage::TraditionalChinese => "正在查詢 TomTom / Google / OpenStreetMap…",
+                        UiLanguage::English => "Querying TomTom / Google / OpenStreetMap…",
                     });
                 });
             }
@@ -478,14 +579,20 @@ impl NativeApp {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
                 ui.small(match language {
                     UiLanguage::TraditionalChinese => "請確認網路、防火牆與 Google API 設定；結果只在目前視窗保存。",
-                    UiLanguage::English => "Check network, firewall, and Google API settings. Results remain in memory only.",
+                    UiLanguage::English => "Check the network, TomTom/Google key, or firewall. Results remain in memory only.",
                 });
             }
             if !dialog.places.is_empty() {
                 let provider = dialog.places.first().map(|place| place.provider);
                 ui.small(match provider {
                     Some(PlaceProvider::Google) => "Powered by Google · sorted by review count",
+                    Some(PlaceProvider::TomTom) => {
+                        "Powered by TomTom · sorted by provider relevance and distance"
+                    }
                     Some(PlaceProvider::OpenStreetMap) => "OpenStreetMap · sorted by distance (no review data)",
+                    Some(PlaceProvider::Overture) => "Overture local snapshot - sorted by distance",
+                    Some(PlaceProvider::Foursquare) => "Foursquare - sorted by popularity/rating",
+                    Some(PlaceProvider::Gateway) => "Gateway provider - organisation policy",
                     None => "",
                 });
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -500,10 +607,18 @@ impl NativeApp {
                             }
                             ui.horizontal(|ui| {
                                 if let Some(rating) = place.rating {
+                                    ui.label(format!("Rating {rating:.1}/{}", place.rating_scale.unwrap_or(5)));
                                     ui.label(format!("★ {rating:.1}"));
-                                    ui.label(format!("{} reviews", place.review_count));
+                                    if place.review_count > 0 {
+                                        ui.label(format!("{} ratings", place.review_count));
+                                    }
+                                } else if let Some(score) = place.provider_score {
+                                    ui.label(format!("TomTom relevance {score:.2}"));
                                 } else {
                                     ui.label("No review data");
+                                }
+                                if let Some(popularity) = place.popularity {
+                                    ui.label(format!("Popularity {:.0}%", popularity * 100.0));
                                 }
                                 ui.label(format!("{:.0} m", place.distance_m));
                                 if let Some(open_now) = place.open_now {
@@ -513,10 +628,20 @@ impl NativeApp {
                             if let Some(address) = &place.address {
                                 ui.small(address);
                             }
+                            if let Some(phone) = &place.phone {
+                                ui.small(phone);
+                            }
+                            if let Some(website) = &place.website {
+                                ui.hyperlink_to("Open website", website);
+                            }
                             ui.hyperlink_to(
                                 match place.provider {
                                     PlaceProvider::Google => "Open in Google Maps",
+                                    PlaceProvider::TomTom => "Open in Google Maps",
                                     PlaceProvider::OpenStreetMap => "Open in OpenStreetMap",
+                                    PlaceProvider::Overture => "Open in Google Maps",
+                                    PlaceProvider::Foursquare => "Open in Foursquare",
+                                    PlaceProvider::Gateway => "Open in Google Maps",
                                 },
                                 &place.external_url,
                             );
@@ -526,6 +651,18 @@ impl NativeApp {
             }
             if dialog.places.iter().any(|place| place.provider == PlaceProvider::Google) {
                 ui.small("Google Maps and Places attribution is required when Google data is shown.");
+            }
+            for attribution in &dialog.attribution {
+                ui.small(attribution);
+            }
+            if dialog.degraded {
+                ui.small("Some providers were unavailable; results are from the configured fallback.");
+            }
+            if !dialog.attempts.is_empty() {
+                ui.small(format!("Fallback stages checked: {}", dialog.attempts.len()));
+            }
+            if dialog.places.iter().any(|place| place.provider == PlaceProvider::TomTom) {
+                ui.small("TomTom POI data · free daily allowance applies to your own API key.");
             }
         });
         let coordinate = dialog.coordinate;
@@ -1588,6 +1725,7 @@ impl NativeApp {
             UiLanguage::TraditionalChinese => "設定",
             UiLanguage::English => "Settings",
         };
+        let mut download_pack = false;
         egui::Window::new(title)
             .open(&mut self.show_settings)
             .fixed_pos(egui::pos2(24.0, 72.0))
@@ -1609,7 +1747,155 @@ impl NativeApp {
                             "繁體中文",
                         );
                         ui.selectable_value(&mut self.language, UiLanguage::English, "English");
+                });
+                ui.separator();
+                ui.label(match self.language {
+                    UiLanguage::TraditionalChinese => "附近地點資料來源",
+                    UiLanguage::English => "Nearby places provider",
+                });
+                egui::ComboBox::from_id_salt("nearby-provider")
+                    .selected_text(match self.preferences.nearby_provider {
+                        NearbyProviderPreference::TomTomFirst => match self.language {
+                            UiLanguage::TraditionalChinese => "TomTom（免費、較新）",
+                            UiLanguage::English => "Legacy TomTom-first (migration only)",
+                        },
+                        NearbyProviderPreference::GoogleFirst => match self.language {
+                            UiLanguage::TraditionalChinese => "Google（評分優先）",
+                            UiLanguage::English => "Legacy Google-first (migration only)",
+                        },
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.preferences.nearby_provider,
+                            NearbyProviderPreference::TomTomFirst,
+                            match self.language {
+                                UiLanguage::TraditionalChinese => "TomTom（免費、較新）",
+                                UiLanguage::English => "Legacy TomTom-first (migration only)",
+                            },
+                        );
+                        ui.selectable_value(
+                            &mut self.preferences.nearby_provider,
+                            NearbyProviderPreference::GoogleFirst,
+                            match self.language {
+                                UiLanguage::TraditionalChinese => "Google（評分優先）",
+                                UiLanguage::English => "Legacy Google-first (migration only)",
+                            },
+                        );
                     });
+                ui.label(match self.language {
+                    UiLanguage::TraditionalChinese => "POI 模式",
+                    UiLanguage::English => "POI profile",
+                });
+                egui::ComboBox::from_id_salt("poi-profile")
+                    .selected_text(self.preferences.poi_profile.label())
+                    .show_ui(ui, |ui| {
+                        for profile in [
+                            PoiProfile::OfflineFree,
+                            PoiProfile::TomTomLive,
+                            PoiProfile::FoursquareEnhanced,
+                            PoiProfile::GatewayPro,
+                            PoiProfile::GoogleByok,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.preferences.poi_profile,
+                                profile,
+                                profile.label(),
+                            );
+                        }
+                    });
+                ui.checkbox(
+                    &mut self.preferences.nearby_online,
+                    match self.language {
+                        UiLanguage::TraditionalChinese => "允許線上更新",
+                        UiLanguage::English => "Allow online refresh",
+                    },
+                );
+                if ui
+                    .button(if self.poi_pack_loading {
+                        "Downloading POI data pack…"
+                    } else {
+                        "Download / update offline POI data pack"
+                    })
+                    .clicked()
+                {
+                    download_pack = true;
+                }
+                if let Some(status) = &self.poi_pack_status {
+                    ui.small(status);
+                }
+                ui.small(match self.language {
+                    UiLanguage::TraditionalChinese => {
+                        "TomTom 需要使用者自己的免費 API Key；沒有金鑰時會使用 OSM 備援。"
+                    }
+                    UiLanguage::English => {
+                        "The POI profile above is authoritative. Offline Free uses the installed Overture + OSM pack; live profiles use their configured provider and documented fallbacks."
+                    }
+                });
+                ui.hyperlink_to(
+                    match self.language {
+                        UiLanguage::TraditionalChinese => "申請免費 TomTom API Key",
+                        UiLanguage::English => "Create a free TomTom API key",
+                    },
+                    "https://developer.tomtom.com/user/register",
+                );
+                ui.label(match self.language {
+                    UiLanguage::TraditionalChinese => {
+                        "TomTom Search API Key（儲存在 Windows Credential Manager）"
+                    }
+                    UiLanguage::English => {
+                        "TomTom Search API key (stored in Windows Credential Manager)"
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tomtom_key_input)
+                        .password(true)
+                        .hint_text("TomTom key"),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(match self.language {
+                            UiLanguage::TraditionalChinese => "儲存 TomTom 金鑰",
+                            UiLanguage::English => "Save TomTom key",
+                        })
+                        .clicked()
+                    {
+                        self.tomtom_key_status = match crate::secrets::write_tomtom_api_key(
+                            &self.tomtom_key_input,
+                        ) {
+                            Ok(()) => Some(match self.language {
+                                UiLanguage::TraditionalChinese => {
+                                    "TomTom 金鑰已儲存。預設查詢會優先使用 TomTom。".to_owned()
+                                }
+                                UiLanguage::English => {
+                                    "TomTom key saved. TomTom is now preferred by default.".to_owned()
+                                }
+                            }),
+                            Err(error) => Some(error),
+                        };
+                    }
+                    if ui
+                        .button(match self.language {
+                            UiLanguage::TraditionalChinese => "移除",
+                            UiLanguage::English => "Remove",
+                        })
+                        .clicked()
+                    {
+                        self.tomtom_key_input.clear();
+                        self.tomtom_key_status =
+                            match crate::secrets::write_tomtom_api_key("") {
+                                Ok(()) => Some(match self.language {
+                                    UiLanguage::TraditionalChinese => {
+                                        "TomTom API 金鑰已移除。".to_owned()
+                                    }
+                                    UiLanguage::English => "TomTom API key removed.".to_owned(),
+                                }),
+                                Err(error) => Some(error),
+                            };
+                    }
+                });
+                if let Some(status) = &self.tomtom_key_status {
+                    ui.small(status);
+                }
                 ui.separator();
                 ui.label(match self.language {
                     UiLanguage::TraditionalChinese => {
@@ -1640,7 +1926,7 @@ impl NativeApp {
                                     "已儲存；查詢時優先使用 Google，失敗會回退 OSM。".to_owned()
                                 }
                                 UiLanguage::English => {
-                                    "Saved. Google is preferred; OSM is used as fallback."
+                                    "Saved. Google is contacted only when the explicit Google Places (BYOK) profile is selected."
                                         .to_owned()
                                 }
                             }),
@@ -1661,7 +1947,7 @@ impl NativeApp {
                                     UiLanguage::TraditionalChinese => {
                                         "已移除 Google API 金鑰。".to_owned()
                                     }
-                                    UiLanguage::English => "Google API key removed.".to_owned(),
+                                    UiLanguage::English => "Google API key removed; TomTom remains available.".to_owned(),
                                 }),
                                 Err(error) => Some(error),
                             };
@@ -1670,6 +1956,79 @@ impl NativeApp {
                 if let Some(status) = &self.google_key_status {
                     ui.small(status);
                 }
+                ui.separator();
+                ui.label(match self.language {
+                    UiLanguage::TraditionalChinese => "Foursquare Places Premium API Key",
+                    UiLanguage::English => "Foursquare Places Premium API key (Credential Manager)",
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.foursquare_key_input)
+                        .password(true)
+                        .hint_text("Foursquare key"),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(match self.language {
+                            UiLanguage::TraditionalChinese => "儲存 Foursquare key",
+                            UiLanguage::English => "Save Foursquare key",
+                        })
+                        .clicked()
+                    {
+                        self.foursquare_key_status =
+                            match crate::secrets::write_foursquare_api_key(&self.foursquare_key_input) {
+                                Ok(()) => Some("Foursquare key saved; Premium metrics are optional.".into()),
+                                Err(error) => Some(error),
+                            };
+                    }
+                    if ui.button("Remove").clicked() {
+                        self.foursquare_key_input.clear();
+                        self.foursquare_key_status =
+                            match crate::secrets::write_foursquare_api_key("") {
+                                Ok(()) => Some("Foursquare key removed.".into()),
+                                Err(error) => Some(error),
+                            };
+                    }
+                });
+                if let Some(status) = &self.foursquare_key_status {
+                    ui.small(status);
+                }
+                ui.label(match self.language {
+                    UiLanguage::TraditionalChinese => "Gateway Base URL / Bearer Token（選配）",
+                    UiLanguage::English => "Gateway Base URL / bearer token (optional)",
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.gateway_url_input)
+                        .hint_text("https://gateway.example")
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.gateway_token_input)
+                        .password(true)
+                        .hint_text("Gateway token"),
+                );
+                if ui
+                    .button(match self.language {
+                        UiLanguage::TraditionalChinese => "儲存 Gateway token",
+                        UiLanguage::English => "Save Gateway token",
+                    })
+                    .clicked()
+                {
+                    self.gateway_token_status =
+                        match crate::secrets::write_gateway_bearer_token(&self.gateway_token_input) {
+                            Ok(()) => Some("Gateway token saved.".into()),
+                            Err(error) => Some(error),
+                        };
+                }
+                if let Some(status) = &self.gateway_token_status {
+                    ui.small(status);
+                }
+                ui.small(match self.language {
+                    UiLanguage::TraditionalChinese => {
+                        "Google 評分與評論欄位可能產生 API 費用；未選擇 Google-first 時不會使用。"
+                    }
+                    UiLanguage::English => {
+                        "Google rating/review fields may incur API charges; they are used only in the explicit Google Places (BYOK) profile."
+                    }
+                });
                 ui.separator();
                 let mut cache_gb =
                     self.model.settings.cache_limit_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
@@ -1713,6 +2072,9 @@ impl NativeApp {
                     UiLanguage::English => "Language changes apply immediately.",
                 });
             });
+        if download_pack {
+            self.start_poi_pack_download();
+        }
     }
 
     fn persist_preferences(&mut self) {
@@ -1720,6 +2082,8 @@ impl NativeApp {
         current.language = self.language;
         current.settings = self.model.settings.clone();
         current.cache_limit_bytes = current.settings.cache_limit_bytes;
+        current.gateway_base_url = (!self.gateway_url_input.trim().is_empty())
+            .then(|| self.gateway_url_input.trim().to_owned());
         if current != self.preferences {
             if let Err(error) = current.save() {
                 self.last_error = Some(format!("Failed to save settings: {error}"));

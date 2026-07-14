@@ -30,14 +30,13 @@ included below in [繁體中文](#繁體中文).
 - English and Traditional Chinese UI, persisted preferences, resizable panels,
   cancellation, progress reporting, and a GPU diagnostics view.
 - Right-click any visible map coordinate to browse nearby places in a fixed
-  results window. Google Places is used first when its key is configured; the
-  free Overpass/OpenStreetMap service is used automatically as a fallback.
-  Results are ranked by review count, then rating and distance, and are never
-  written to the map tiles, GPX file, or exported video.
+  results window. Select Offline Free (Overture + OSM), TomTom Live, Foursquare
+  Enhanced, Gateway Pro, or explicit Google BYOK mode. Results preserve source
+  provenance and are never written to map tiles, GPX files, or exported video.
 
 ## Download and run
 
-The repository publishes one canonical Windows build:
+The repository publishes the current native Windows build:
 
 [GPX-Animator-GPU-20260713.exe](dist/GPX-Animator-GPU-20260713.exe)
 
@@ -91,13 +90,21 @@ the result window stays at a stable top-right position so it does not jump
 around with the pointer. The radius is persisted as a normal preference (500
 m, 1 km, 2 km, or 5 km).
 
-Google Places API keys are stored only in the Windows per-user Credential
-Manager. They are never serialized to `settings.json`, logs, Git, or MP4
-metadata. A Google response is kept in memory for the current result window
-only and includes the required Google attribution/link. If no key is configured
-or the Google request is unavailable, the app queries Overpass and labels the
-result as OpenStreetMap. See [docs/nearby-places.md](docs/nearby-places.md)
-for provider setup, quotas, privacy, and test details.
+The default profile is **Offline Free**. Download the signed Overture/OSM data
+pack once from Settings; the two licences remain in separate SQLite files under
+`%LOCALAPPDATA%\GPX Animator\poi`. The local store uses an RTree spatial index
+and FTS5 text index, so later lookups are offline and do not hit public
+Overpass/Nominatim servers.
+
+TomTom Places Search v3, Foursquare Premium, Google Places, and Gateway Pro are
+explicit BYOK options. TomTom v3 is attempted before the legacy endpoint; a
+failure falls back to the local snapshot. Foursquare enriches only the visible
+results and keeps rating (0–10), rating count, and popularity (0–1) distinct.
+Google is never an automatic fallback because its billing/quotas are account
+specific. Keys/tokens live only in Windows Credential Manager and never enter
+`settings.json`, logs, Git, or MP4 metadata. See
+[docs/nearby-places.md](docs/nearby-places.md) for the profiles, pack format,
+attribution, privacy, and test matrix.
 
 ## Export behavior
 
@@ -166,7 +173,8 @@ native/d3d11-renderer    D3D11/Direct2D renderer and tile cache
 native/nvenc-engine      RTX texture ring and NVENC session
 native/mp4-output        HEVC/H.264 sample conversion and MP4 muxing
 native/desktop-app       egui UI, export state machine, diagnostics
-native/places-core        Google/Overpass lookup, ranking, parsing, HTTP mocks
+native/places-core        POI profiles, Overture/OSM SQLite, TomTom v3, Foursquare,
+                          Google BYOK, Gateway contract, pack verification, tests
 legacy-web/              Previous browser prototype (not the release path)
 packaging/               Windows packaging helpers
 dist/                    Checked-in packaged executable

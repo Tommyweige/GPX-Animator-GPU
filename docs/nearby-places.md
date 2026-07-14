@@ -1,46 +1,88 @@
-# Nearby places lookup (English)
+# Nearby places: data sources, profiles, and fallbacks
 
-This feature is a browse helper, not a route editor. A right-click in the map
-preview is converted to WGS84, then the app queries nearby places and displays
-the list in a fixed-position native window. No place marker or place metadata is
-added to an exported video.
+This feature is a read-only browse helper. Right-click a visible map location,
+choose **Search nearby places**, and the native UI converts the screen point to
+WGS84 before querying the selected profile. POI data is never written into a
+GPX file or exported video.
 
-## Providers and ranking
+## Profiles
 
-1. Google Places Nearby Search (New) is the primary provider when a key exists.
-2. Overpass API with OpenStreetMap tags is the free fallback when no key exists
-   or Google is unavailable.
-3. Results are sorted locally by `userRatingCount` descending, rating
-   descending, distance ascending, and stable provider id. OSM has no review
-   count, so its list is distance ordered after the Google path is unavailable.
+| Profile | Cost/key | Primary source | Fallback | Rating/popularity |
+| --- | --- | --- | --- | --- |
+| **Offline Free** | Free; no key | Overture Taiwan snapshot, then OSM snapshot | No network fallback | No rating claim; distance ordering |
+| **TomTom Live (BYOK)** | TomTom key; use your own quota | Local snapshot, then TomTom Places Search v3 | TomTom legacy Search, then local snapshot | TomTom relevance only, never called popularity |
+| **Foursquare Enhanced (BYOK)** | Foursquare Premium plan/key | TomTom/local base plus Foursquare enrichment | Base results without Premium fields | Foursquare rating (0–10), rating count, popularity (0–1) |
+| **Google Places (BYOK)** | Google Cloud project/key | Explicit Google Nearby Search (New) | Local snapshot only | Google rating (0–5) and user rating count |
+| **Gateway Pro** | Organisation gateway/token | `/v1/nearby-places` gateway contract | TomTom/local chain | Gateway-supplied, provenance preserved |
 
-Google requires a field mask and attribution. The app shows a Google
-attribution line and opens the provider URL rather than copying Google content
-into the map renderer. OSM links open the corresponding OSM object.
+Google is an explicit manual option; it is never silently called as a cost-
+incurring fallback. Public Overpass/Nominatim endpoints are not production
+fallbacks. The old Overpass client remains only as a compatibility parser for
+fixtures and migration tests.
 
-## Configuration
+## What the numbers mean
 
-Open **Settings** and paste a Google Places API key. Saving writes it to the
-Windows Credential Manager target `GPX Animator/Google Places API Key`; the
-settings JSON contains only the selected radius. Remove clears the credential.
-The radius choices are 500 m, 1 km, 2 km (default), and 5 km.
+- **Rating** is the provider's consumer rating. The UI keeps the source scale
+  (`5` for Google, `10` for Foursquare) instead of pretending they are equal.
+- **Rating count** is the number of ratings reported by the provider. It is not
+  automatically labelled as a text-review count.
+- **Popularity** is only shown when a provider supplies a documented popularity
+  metric. Foursquare's value is normalised to `0..1`; TomTom `score` is a
+  relevance value and is labelled as such.
+- **Freshness/provenance** remains attached to each local or live result. A
+  failed live request produces a visible degraded/fallback state.
 
-Google Cloud billing and Places API enablement are required for Google results;
-the application does not embed a shared key. The fallback does not require a
-key but is subject to the public Overpass instance's fair-use and rate limits.
+## Local data packs
+
+Overture and OSM are stored in separate SQLite files under:
+
+```text
+%LOCALAPPDATA%\GPX Animator\poi\overture-taiwan.sqlite3
+%LOCALAPPDATA%\GPX Animator\poi\osm-taiwan.sqlite3
+```
+
+The first-use **Download / update offline POI data pack** action downloads the
+release manifest and archives, verifies SHA-256, optionally verifies the
+Ed25519 release signature, decompresses zstd archives, and atomically replaces
+the SQLite file. Overture and OSM files stay separate for attribution and
+licence compliance. Set `GPX_ANIMATOR_POI_MANIFEST_URL` to a private mirror;
+release builds should also set `GPX_ANIMATOR_POI_PACK_PUBLIC_KEY_HEX` and keep
+signature verification enabled.
+
+The SQLite schema uses an RTree spatial index and FTS5 text index. Queries are
+local, deterministic, and do not contact a public OSM endpoint. Data-pack
+release metadata must include the source snapshot date, licence/NOTICE files,
+coverage region, row count, compressed/uncompressed hashes, and signed version.
+
+## Credentials and privacy
+
+API keys/tokens are stored in the Windows per-user Credential Manager only:
+
+- `GPX Animator/TomTom Search API Key`
+- `GPX Animator/Foursquare Places API Key`
+- `GPX Animator/Google Places API Key`
+- `GPX Animator/POI Gateway Bearer Token`
+
+The settings JSON stores profile, radius, online-refresh preference, and gateway
+base URL, but never stores secrets. Live requests contain only the clicked
+coordinate, radius, result limit, and language. Results are retained in memory
+for the result window. Provider attribution and usage restrictions remain the
+user's responsibility.
 
 ## Test coverage
 
-`native/places-core` has deterministic tests for coordinate normalization,
-Haversine distance, ranking tie-breakers, Google and Overpass fixture decoding,
-request normalization, missing-key behavior, and local TCP mock HTTP responses
-(including rate limiting). The desktop app tests that preferences migrate
-without storing an API key and that the Credential Manager UI masks secrets.
-The real provider tests remain network-independent; a manual run with a
-user-owned key is intentionally not part of CI.
+`places-core` includes deterministic tests for:
 
-## Privacy
+- TomTom v3 and legacy response parsing, headers, details shape, and rate-limit
+  mapping;
+- Foursquare rating/count/popularity parsing and scale preservation;
+- Google field-mask parsing and review-count ordering;
+- Overture/OSM SQLite RTree/FTS5 queries, separate-store merge/dedupe, metadata,
+  and upsert behavior;
+- manifest hash checks, Ed25519 signatures, zstd extraction, atomic install,
+  and tamper rejection;
+- every profile's fallback matrix, including offline/no-key degradation;
+- a 40-coordinate × 6-category synthetic benchmark (240 scenarios).
 
-Only the chosen coordinate, radius, language, and provider request are sent to
-the selected service. Results are held in memory and discarded when the result
-window closes. See [PRIVACY.md](../PRIVACY.md) and [TERMS.md](../TERMS.md).
+Live provider tests are opt-in and require user-owned keys; they are never run
+in ordinary CI and their raw responses are not committed.

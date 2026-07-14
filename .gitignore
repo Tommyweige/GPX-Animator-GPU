@@ -4,6 +4,8 @@
 /node_modules/
 /dist/*.exe
 !/dist/GPX-Animator-GPU-fixed.exe
+!/dist/GPX-Animator-GPU-20260713.exe
+!/dist/GPX-Animator-GPU-20260713-tomtom.exe
 /cache/
 *.part
 *.mp4

@@ -5,6 +5,9 @@
 //! testable without pretending that a plaintext fallback is secure.
 
 pub const GOOGLE_PLACES_TARGET: &str = "GPX Animator/Google Places API Key";
+pub const TOMTOM_API_TARGET: &str = "GPX Animator/TomTom Search API Key";
+pub const FOURSQUARE_API_TARGET: &str = "GPX Animator/Foursquare Places API Key";
+pub const GATEWAY_BEARER_TARGET: &str = "GPX Animator/POI Gateway Bearer Token";
 
 pub fn mask_secret(secret: Option<&str>) -> String {
     match secret.filter(|value| !value.trim().is_empty()) {
@@ -95,6 +98,181 @@ pub fn write_google_places_api_key(_value: &str) -> Result<(), String> {
     Err("Windows Credential Manager is only available on Windows".to_owned())
 }
 
+#[cfg(windows)]
+pub fn read_tomtom_api_key() -> Result<Option<String>, String> {
+    use windows::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+    use windows::core::PCWSTR;
+    let target = wide(TOMTOM_API_TARGET);
+    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+    // SAFETY: the target is a NUL-terminated UTF-16 string owned for the call;
+    // CredReadW allocates the returned struct which is released by CredFree.
+    let result = unsafe {
+        CredReadW(
+            PCWSTR(target.as_ptr()),
+            CRED_TYPE_GENERIC,
+            None,
+            &mut credential,
+        )
+    };
+    if let Err(error) = result {
+        if matches!(error.code().0 as u32, 1168 | 0x8007_0490) {
+            return Ok(None);
+        }
+        return Err(error.to_string());
+    }
+    if credential.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: Credential Manager owns this buffer until CredFree below.
+    let value = unsafe {
+        let value = std::slice::from_raw_parts(
+            (*credential).CredentialBlob,
+            (*credential).CredentialBlobSize as usize,
+        );
+        String::from_utf8(value.to_vec()).map_err(|error| error.to_string())
+    };
+    unsafe { CredFree(credential.cast()) };
+    value.map(|value| (!value.trim().is_empty()).then_some(value))
+}
+
+#[cfg(not(windows))]
+pub fn read_tomtom_api_key() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+pub fn write_tomtom_api_key(value: &str) -> Result<(), String> {
+    use windows::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredWriteW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+    let value = value.trim();
+    let target = wide(TOMTOM_API_TARGET);
+    if value.is_empty() {
+        // Removing a missing credential is intentionally idempotent.
+        let _ = unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) };
+        return Ok(());
+    }
+    let mut blob = value.as_bytes().to_vec();
+    let credential = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: PWSTR(target.as_ptr() as *mut _),
+        CredentialBlob: blob.as_mut_ptr(),
+        CredentialBlobSize: blob.len() as u32,
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        ..CREDENTIALW::default()
+    };
+    // SAFETY: all pointers refer to buffers held until CredWriteW returns.
+    unsafe { CredWriteW(&credential, 0).map_err(|error| error.to_string()) }
+}
+
+#[cfg(not(windows))]
+pub fn write_tomtom_api_key(_value: &str) -> Result<(), String> {
+    Err("Windows Credential Manager is only available on Windows".to_owned())
+}
+
+#[cfg(windows)]
+fn read_generic_credential(target_name: &str) -> Result<Option<String>, String> {
+    use windows::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+    use windows::core::PCWSTR;
+    let target = wide(target_name);
+    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+    let result = unsafe {
+        CredReadW(
+            PCWSTR(target.as_ptr()),
+            CRED_TYPE_GENERIC,
+            None,
+            &mut credential,
+        )
+    };
+    if let Err(error) = result {
+        if matches!(error.code().0 as u32, 1168 | 0x8007_0490) {
+            return Ok(None);
+        }
+        return Err(error.to_string());
+    }
+    if credential.is_null() {
+        return Ok(None);
+    }
+    let value = unsafe {
+        let value = std::slice::from_raw_parts(
+            (*credential).CredentialBlob,
+            (*credential).CredentialBlobSize as usize,
+        );
+        String::from_utf8(value.to_vec()).map_err(|error| error.to_string())
+    };
+    unsafe { CredFree(credential.cast()) };
+    value.map(|value| (!value.trim().is_empty()).then_some(value))
+}
+
+#[cfg(windows)]
+fn write_generic_credential(target_name: &str, value: &str) -> Result<(), String> {
+    use windows::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredWriteW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+    let target = wide(target_name);
+    let value = value.trim();
+    if value.is_empty() {
+        let _ = unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) };
+        return Ok(());
+    }
+    let mut blob = value.as_bytes().to_vec();
+    let credential = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: PWSTR(target.as_ptr() as *mut _),
+        CredentialBlob: blob.as_mut_ptr(),
+        CredentialBlobSize: blob.len() as u32,
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        ..CREDENTIALW::default()
+    };
+    unsafe { CredWriteW(&credential, 0).map_err(|error| error.to_string()) }
+}
+
+#[cfg(windows)]
+pub fn read_foursquare_api_key() -> Result<Option<String>, String> {
+    read_generic_credential(FOURSQUARE_API_TARGET)
+}
+
+#[cfg(not(windows))]
+pub fn read_foursquare_api_key() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+pub fn write_foursquare_api_key(value: &str) -> Result<(), String> {
+    write_generic_credential(FOURSQUARE_API_TARGET, value)
+}
+
+#[cfg(not(windows))]
+pub fn write_foursquare_api_key(_value: &str) -> Result<(), String> {
+    Err("Windows Credential Manager is only available on Windows".to_owned())
+}
+
+#[cfg(windows)]
+pub fn read_gateway_bearer_token() -> Result<Option<String>, String> {
+    read_generic_credential(GATEWAY_BEARER_TARGET)
+}
+
+#[cfg(not(windows))]
+pub fn read_gateway_bearer_token() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+pub fn write_gateway_bearer_token(value: &str) -> Result<(), String> {
+    write_generic_credential(GATEWAY_BEARER_TARGET, value)
+}
+
+#[cfg(not(windows))]
+pub fn write_gateway_bearer_token(_value: &str) -> Result<(), String> {
+    Err("Windows Credential Manager is only available on Windows".to_owned())
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -113,5 +291,14 @@ mod tests {
     #[test]
     fn target_is_stable_for_migrations() {
         assert_eq!(GOOGLE_PLACES_TARGET, "GPX Animator/Google Places API Key");
+        assert_eq!(TOMTOM_API_TARGET, "GPX Animator/TomTom Search API Key");
+        assert_eq!(
+            FOURSQUARE_API_TARGET,
+            "GPX Animator/Foursquare Places API Key"
+        );
+        assert_eq!(
+            GATEWAY_BEARER_TARGET,
+            "GPX Animator/POI Gateway Bearer Token"
+        );
     }
 }

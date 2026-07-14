@@ -47,22 +47,40 @@ pub struct AppPreferences {
     pub cache_limit_bytes: u64,
     #[serde(default = "default_nearby_radius_m")]
     pub nearby_radius_m: u32,
+    #[serde(default)]
+    pub nearby_provider: places_core::NearbyProviderPreference,
+    /// New profile selector. `nearby_provider` is retained for migration from
+    /// pre-profile settings files.
+    #[serde(default)]
+    pub poi_profile: places_core::PoiProfile,
+    #[serde(default = "default_nearby_online")]
+    pub nearby_online: bool,
+    #[serde(default)]
+    pub gateway_base_url: Option<String>,
 }
 
 pub const fn default_nearby_radius_m() -> u32 {
     places_core::DEFAULT_RADIUS_M
 }
 
+pub const fn default_nearby_online() -> bool {
+    true
+}
+
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 4,
             language: UiLanguage::default(),
             settings: ExportSettings::default(),
             last_input_directory: None,
             last_output_directory: None,
             cache_limit_bytes: default_cache_limit_bytes(),
             nearby_radius_m: default_nearby_radius_m(),
+            nearby_provider: places_core::NearbyProviderPreference::default(),
+            poi_profile: places_core::PoiProfile::default(),
+            nearby_online: default_nearby_online(),
+            gateway_base_url: None,
         }
     }
 }
@@ -83,7 +101,7 @@ impl AppPreferences {
         };
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(mut value) => {
-                value.schema_version = 2;
+                value.schema_version = 4;
                 if value.cache_limit_bytes == 0 {
                     value.cache_limit_bytes = default_cache_limit_bytes();
                 }
@@ -368,11 +386,16 @@ mod tests {
         value.settings.cache_limit_bytes = 512 * 1024 * 1024;
         value.cache_limit_bytes = value.settings.cache_limit_bytes;
         value.nearby_radius_m = 5_000;
+        value.nearby_provider = places_core::NearbyProviderPreference::GoogleFirst;
         let bytes = serde_json::to_vec(&value).unwrap();
         let decoded: AppPreferences = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.language, UiLanguage::English);
         assert_eq!(decoded.settings.cache_limit_bytes, 512 * 1024 * 1024);
         assert_eq!(decoded.nearby_radius_m, 5_000);
+        assert_eq!(
+            decoded.nearby_provider,
+            places_core::NearbyProviderPreference::GoogleFirst
+        );
         assert!(!String::from_utf8(bytes).unwrap().contains("api_key"));
     }
 
@@ -382,6 +405,10 @@ mod tests {
         json.as_object_mut().unwrap().remove("nearby_radius_m");
         let value: AppPreferences = serde_json::from_value(json).unwrap();
         assert_eq!(value.nearby_radius_m, places_core::DEFAULT_RADIUS_M);
-        assert_eq!(value.schema_version, 2);
+        assert_eq!(value.schema_version, 4);
+        assert_eq!(
+            value.nearby_provider,
+            places_core::NearbyProviderPreference::TomTomFirst
+        );
     }
 }

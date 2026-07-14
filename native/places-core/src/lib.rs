@@ -1,23 +1,52 @@
 //! Nearby-place lookup shared by the native desktop UI.
 //!
-//! The module deliberately keeps provider responses in memory only.  Google
-//! Places is the primary provider when a key is configured; Overpass/OpenStreetMap
-//! is a free fallback for offline or unconfigured installations.
+//! The module deliberately keeps provider responses in memory only.  TomTom is
+//! the default fresh POI provider when a key is configured; Google Places is an
+//! optional review-aware provider and Overpass/OpenStreetMap is the final free
+//! fallback for unconfigured or unavailable installations.
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use thiserror::Error;
 
+pub mod domain;
+pub mod pack;
+pub mod providers;
+pub mod service;
+pub mod store;
+pub use domain::{
+    CapabilityState, FallbackAttempt, FallbackOutcome, GatewayConfig, PoiProfile,
+    PoiSearchResponse, ProviderCapabilities, ProviderCredentials, ProviderStatus,
+};
+pub use pack::{DataPackManager, DataPackManifest, DataPackVerification};
+pub use providers::{FoursquarePlacesClient, TomTomV3PlacesClient};
+pub use service::{GatewayPlacesClient, PoiService};
+pub use store::{LocalDataset, LocalPoiCatalog, LocalPoiStore, StoreStats};
+
 pub const DEFAULT_RADIUS_M: u32 = 2_000;
 pub const ALLOWED_RADII_M: [u32; 4] = [500, 1_000, 2_000, 5_000];
 const DEFAULT_GOOGLE_BASE_URL: &str = "https://places.googleapis.com";
+const DEFAULT_TOMTOM_BASE_URL: &str = "https://api.tomtom.com";
 const DEFAULT_OVERPASS_BASE_URL: &str = "https://overpass-api.de/api/interpreter";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaceProvider {
     Google,
+    TomTom,
     OpenStreetMap,
+    Overture,
+    Foursquare,
+    Gateway,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NearbyProviderPreference {
+    /// Prefer the no-credit-card TomTom free allowance, then OSM.
+    #[default]
+    TomTomFirst,
+    /// Prefer Google review/rating fields, then TomTom, then OSM.
+    GoogleFirst,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,12 +104,30 @@ pub struct PlaceSummary {
     pub rating: Option<f32>,
     pub review_count: u32,
     pub open_now: Option<bool>,
+    /// Provider relevance score (TomTom only).  This is not a review score.
+    pub provider_score: Option<f32>,
+    pub phone: Option<String>,
+    pub website: Option<String>,
     pub external_url: String,
+    /// Rating scale used by the source (Google is 5, Foursquare is 10).
+    /// `None` means the source did not provide a rating.
+    #[serde(default)]
+    pub rating_scale: Option<u8>,
+    /// Normalised popularity when a provider supplies a real popularity
+    /// metric.  This is deliberately separate from `provider_score`, which is
+    /// a relevance score and must never be presented as popularity.
+    #[serde(default)]
+    pub popularity: Option<f32>,
+    #[serde(default)]
+    pub popularity_source: Option<PlaceProvider>,
+    /// Provider observation timestamp (RFC3339) when available.
+    #[serde(default)]
+    pub source_updated_at: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PlacesError {
-    #[error("Google Places API key is not configured")]
+    #[error("provider API key is not configured")]
     MissingApiKey,
     #[error("provider rate limit exceeded")]
     RateLimited,
@@ -92,6 +139,12 @@ pub enum PlacesError {
     Parse(String),
     #[error("no nearby places were returned")]
     Empty,
+    #[error("the selected profile has no local data pack installed")]
+    NoLocalData,
+    #[error("the selected provider is not configured: {0}")]
+    NotConfigured(String),
+    #[error("local POI store failed: {0}")]
+    Storage(String),
 }
 
 pub fn normalize_radius(radius_m: u32) -> u32 {
@@ -142,6 +195,33 @@ pub fn sort_places(places: &mut [PlaceSummary]) {
                     .partial_cmp(&b.distance_m)
                     .unwrap_or(Ordering::Equal)
             })
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// Sort a provider result that has no review fields by its own relevance score,
+/// then distance.  Keeping this separate from `sort_places` prevents TomTom's
+/// numerical relevance score from being mistaken for a consumer rating.
+pub fn sort_by_provider_relevance(places: &mut [PlaceSummary]) {
+    places.sort_by(|a, b| {
+        b.provider_score
+            .unwrap_or_default()
+            .partial_cmp(&a.provider_score.unwrap_or_default())
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                a.distance_m
+                    .partial_cmp(&b.distance_m)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+pub fn sort_by_distance(places: &mut [PlaceSummary]) {
+    places.sort_by(|a, b| {
+        a.distance_m
+            .partial_cmp(&b.distance_m)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| a.id.cmp(&b.id))
     });
 }
@@ -230,6 +310,79 @@ impl GooglePlacesClient {
     }
 }
 
+/// TomTom's proprietary POI index is used for the default free/fresh mode.
+/// The API key is supplied by the user and is never persisted by this crate.
+pub struct TomTomPlacesClient {
+    agent: ureq::Agent,
+    base_url: String,
+}
+
+impl Default for TomTomPlacesClient {
+    fn default() -> Self {
+        Self::new(DEFAULT_TOMTOM_BASE_URL)
+    }
+}
+
+impl TomTomPlacesClient {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(12)))
+            .http_status_as_error(false)
+            .build();
+        Self {
+            agent: config.new_agent(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+        }
+    }
+
+    pub fn search(
+        &self,
+        api_key: &str,
+        request: NearbySearchRequest,
+    ) -> Result<Vec<PlaceSummary>, PlacesError> {
+        if api_key.trim().is_empty() {
+            return Err(PlacesError::MissingApiKey);
+        }
+        let request = request.normalized();
+        let response = self
+            .agent
+            .get(format!("{}/search/2/nearbySearch/.json", self.base_url))
+            .query("key", api_key.trim())
+            .query("lat", request.coordinate.latitude.to_string())
+            .query("lon", request.coordinate.longitude.to_string())
+            .query("radius", request.radius_m.to_string())
+            .query("limit", request.limit.to_string())
+            .query("language", request.language.code())
+            // Taiwan is the product's primary market; this also avoids a
+            // region-dependent geopolitical default for Taiwanese coordinates.
+            .query("view", "TW")
+            .query("openingHours", "nextSevenDays")
+            .header("User-Agent", "GPXAnimatorNative/2.0")
+            .call()
+            .map_err(map_ureq_error)?;
+        let status = response.status().as_u16();
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|error| PlacesError::Http(error.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(provider_status(status, text));
+        }
+        let decoded: TomTomResponse =
+            serde_json::from_str(&text).map_err(|error| PlacesError::Parse(error.to_string()))?;
+        let mut places = decoded
+            .results
+            .into_iter()
+            .filter_map(|place| place.into_summary(request.coordinate))
+            .collect::<Vec<_>>();
+        sort_by_provider_relevance(&mut places);
+        if places.is_empty() {
+            return Err(PlacesError::Empty);
+        }
+        Ok(places.into_iter().take(request.limit as usize).collect())
+    }
+}
+
 pub struct OverpassClient {
     agent: ureq::Agent,
     base_url: String,
@@ -300,7 +453,7 @@ impl OverpassClient {
                 places.push(summary);
             }
         }
-        sort_places(&mut places);
+        sort_by_distance(&mut places);
         if places.is_empty() {
             return Err(PlacesError::Empty);
         }
@@ -392,11 +545,118 @@ impl GooglePlace {
             rating: self.rating,
             review_count: self.user_rating_count.unwrap_or_default(),
             open_now: self.current_opening_hours.and_then(|v| v.open_now),
+            provider_score: None,
+            phone: None,
+            website: None,
             external_url: self.google_maps_uri.unwrap_or_else(|| {
                 format!("https://www.google.com/maps/search/?api=1&query={latitude},{longitude}")
             }),
+            rating_scale: self.rating.map(|_| 5),
+            popularity: None,
+            popularity_source: None,
+            source_updated_at: None,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct TomTomResponse {
+    #[serde(default)]
+    results: Vec<TomTomResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomTomResult {
+    id: Option<String>,
+    score: Option<f32>,
+    dist: Option<f64>,
+    poi: Option<TomTomPoi>,
+    address: Option<TomTomAddress>,
+    position: Option<TomTomPosition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomTomPoi {
+    name: Option<String>,
+    phone: Option<String>,
+    url: Option<String>,
+    categories: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomTomAddress {
+    #[serde(rename = "freeformAddress")]
+    freeform_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomTomPosition {
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+impl TomTomResult {
+    fn into_summary(self, origin: SearchCoordinate) -> Option<PlaceSummary> {
+        let id = self.id?;
+        let poi = self.poi?;
+        let position = self.position?;
+        let latitude = position.lat?;
+        let longitude = position.lon?;
+        let name = poi.name?.trim().to_owned();
+        if name.is_empty() || !latitude.is_finite() || !longitude.is_finite() {
+            return None;
+        }
+        let external_url =
+            format!("https://www.google.com/maps/search/?api=1&query={latitude},{longitude}");
+        let website = poi.url.and_then(normalize_external_url);
+        Some(PlaceSummary {
+            provider: PlaceProvider::TomTom,
+            id,
+            name,
+            category: poi
+                .categories
+                .and_then(|mut values| values.drain(..).next()),
+            address: self.address.and_then(|value| value.freeform_address),
+            latitude,
+            longitude,
+            // Prefer the provider's distance when available, but calculate it
+            // ourselves so fixtures and providers stay deterministic.
+            distance_m: self.dist.unwrap_or_else(|| {
+                distance_m(
+                    origin,
+                    SearchCoordinate {
+                        latitude,
+                        longitude,
+                    },
+                )
+            }),
+            rating: None,
+            review_count: 0,
+            open_now: None,
+            provider_score: self.score,
+            phone: poi.phone,
+            website,
+            external_url,
+            rating_scale: None,
+            popularity: None,
+            popularity_source: None,
+            source_updated_at: None,
+        })
+    }
+}
+
+fn normalize_external_url(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(
+        if value.starts_with("http://") || value.starts_with("https://") {
+            value.to_owned()
+        } else {
+            format!("https://{value}")
+        },
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,9 +725,22 @@ impl OverpassElement {
             rating: None,
             review_count: 0,
             open_now: None,
+            provider_score: None,
+            phone: tags
+                .get("phone")
+                .or_else(|| tags.get("contact:phone"))
+                .cloned(),
+            website: tags
+                .get("website")
+                .or_else(|| tags.get("contact:website"))
+                .cloned(),
             external_url: format!(
                 "https://www.openstreetmap.org/?mlat={latitude}&mlon={longitude}#map=18/{latitude}/{longitude}"
             ),
+            rating_scale: None,
+            popularity: None,
+            popularity_source: None,
+            source_updated_at: None,
         })
     }
 }
@@ -476,7 +749,7 @@ impl OverpassElement {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use std::thread;
 
     fn place(id: &str, reviews: u32, rating: Option<f32>, distance_m: f64) -> PlaceSummary {
@@ -492,7 +765,14 @@ mod tests {
             rating,
             review_count: reviews,
             open_now: None,
+            provider_score: None,
+            phone: None,
+            website: None,
             external_url: String::new(),
+            rating_scale: rating.map(|_| 5),
+            popularity: None,
+            popularity_source: None,
+            source_updated_at: None,
         }
     }
 
@@ -501,13 +781,55 @@ mod tests {
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 8192];
-            let _ = stream.read(&mut request);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::with_capacity(8192);
+            let mut buffer = [0_u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let header_end = header_end + 4;
+                            let content_length = request[..header_end]
+                                .split(|byte| *byte == b'\n')
+                                .find_map(|line| {
+                                    let line = line.strip_suffix(b"\r")?;
+                                    let separator = line.iter().position(|byte| *byte == b':')?;
+                                    let (name, value) = line.split_at(separator);
+                                    let value = &value[1..];
+                                    name.eq_ignore_ascii_case(b"content-length")
+                                        .then(|| {
+                                            std::str::from_utf8(value)
+                                                .ok()?
+                                                .trim()
+                                                .parse::<usize>()
+                                                .ok()
+                                        })
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= header_end + content_length {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break,
+                    Err(_) => break,
+                }
+            }
             let response = format!(
                 "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
         });
         format!("http://{address}")
     }
@@ -652,6 +974,89 @@ mod tests {
             .unwrap();
         assert_eq!(places[0].id, "g-high");
         assert_eq!(places[1].id, "g-low");
+    }
+
+    #[test]
+    fn tomtom_fixture_maps_relevance_and_contact_fields() {
+        let json = r#"{"results":[{"id":"tt-1","score":0.92,"dist":123.4,"poi":{"name":"新鮮咖啡","phone":"02-1234-5678","url":"fresh.example.tw","categories":["cafe","restaurant"]},"address":{"freeformAddress":"台北市中正區 1 號"},"position":{"lat":25.041,"lon":121.532}}]}"#;
+        let decoded: TomTomResponse = serde_json::from_str(json).unwrap();
+        let summary = decoded
+            .results
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_summary(SearchCoordinate {
+                latitude: 25.0,
+                longitude: 121.0,
+            })
+            .unwrap();
+        assert_eq!(summary.provider, PlaceProvider::TomTom);
+        assert_eq!(summary.name, "新鮮咖啡");
+        assert_eq!(summary.category.as_deref(), Some("cafe"));
+        assert_eq!(summary.phone.as_deref(), Some("02-1234-5678"));
+        assert_eq!(summary.website.as_deref(), Some("https://fresh.example.tw"));
+        assert_eq!(summary.provider_score, Some(0.92));
+        assert_eq!(summary.distance_m, 123.4);
+    }
+
+    #[test]
+    fn tomtom_client_http_mock_parses_and_sorts_relevance() {
+        let body = r#"{"results":[{"id":"tt-low","score":0.4,"dist":10,"poi":{"name":"Low"},"position":{"lat":25.001,"lon":121.002}},{"id":"tt-high","score":0.9,"dist":1000,"poi":{"name":"High"},"position":{"lat":25.003,"lon":121.004}}]}"#;
+        let client = TomTomPlacesClient::new(mock_server(200, body));
+        let places = client
+            .search(
+                "test-key",
+                NearbySearchRequest {
+                    coordinate: SearchCoordinate {
+                        latitude: 25.0,
+                        longitude: 121.0,
+                    },
+                    radius_m: DEFAULT_RADIUS_M,
+                    limit: 20,
+                    language: PlaceLanguage::English,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            places.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(),
+            ["tt-high", "tt-low"]
+        );
+    }
+
+    #[test]
+    fn tomtom_client_rejects_empty_key_before_network() {
+        let client = TomTomPlacesClient::default();
+        let result = client.search(
+            " ",
+            NearbySearchRequest {
+                coordinate: SearchCoordinate {
+                    latitude: 25.0,
+                    longitude: 121.0,
+                },
+                radius_m: DEFAULT_RADIUS_M,
+                limit: 10,
+                language: PlaceLanguage::English,
+            },
+        );
+        assert_eq!(result, Err(PlacesError::MissingApiKey));
+    }
+
+    #[test]
+    fn tomtom_rate_limit_is_normalized() {
+        let client = TomTomPlacesClient::new(mock_server(429, "{\"error\":\"limit\"}"));
+        let result = client.search(
+            "test-key",
+            NearbySearchRequest {
+                coordinate: SearchCoordinate {
+                    latitude: 25.0,
+                    longitude: 121.0,
+                },
+                radius_m: DEFAULT_RADIUS_M,
+                limit: 10,
+                language: PlaceLanguage::English,
+            },
+        );
+        assert_eq!(result, Err(PlacesError::RateLimited));
     }
 
     #[test]

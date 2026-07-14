@@ -1,0 +1,24 @@
+[
+  {
+    "schema_version": 1,
+    "pack_id": "taiwan-overture-2026-07",
+    "version": "2026.07.1",
+    "dataset": "Overture",
+    "url": "https://github.com/example/gpx-animator-data/releases/download/2026.07.1/overture-taiwan.sqlite3.zst",
+    "sha256": "REPLACE_WITH_COMPRESSED_SHA256",
+    "uncompressed_sha256": "REPLACE_WITH_SQLITE_SHA256",
+    "bytes": 0,
+    "signature_hex": "REPLACE_WITH_ED25519_SIGNATURE_OVER_CANONICAL_PAYLOAD"
+  },
+  {
+    "schema_version": 1,
+    "pack_id": "taiwan-osm-2026-07",
+    "version": "2026.07.1",
+    "dataset": "OpenStreetMap",
+    "url": "https://github.com/example/gpx-animator-data/releases/download/2026.07.1/osm-taiwan.sqlite3.zst",
+    "sha256": "REPLACE_WITH_COMPRESSED_SHA256",
+    "uncompressed_sha256": "REPLACE_WITH_SQLITE_SHA256",
+    "bytes": 0,
+    "signature_hex": "REPLACE_WITH_ED25519_SIGNATURE_OVER_CANONICAL_PAYLOAD"
+  }
+]
