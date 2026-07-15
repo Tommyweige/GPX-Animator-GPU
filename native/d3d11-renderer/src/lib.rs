@@ -20,6 +20,25 @@ pub struct DecodedTile {
     pub bgra: Vec<u8>,
 }
 
+/// Apply the deterministic presentation transform used by both the native
+/// export renderer and the egui preview.  Disk caches always retain the raw
+/// provider pixels, so switching between Light/Dark/Transparent never causes
+/// another network download.
+pub fn apply_map_color_transform(tile: &mut DecodedTile, style: scene_core::MapStyle) {
+    if style != scene_core::MapStyle::Dark {
+        return;
+    }
+    for pixel in tile.bgra.chunks_exact_mut(4) {
+        let r = pixel[2] as f32 / 255.0;
+        let g = pixel[1] as f32 / 255.0;
+        let b = pixel[0] as f32 / 255.0;
+        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+        pixel[2] = ((0.08 + 0.22 * luma) * 255.0).round() as u8;
+        pixel[1] = ((0.10 + 0.25 * luma) * 255.0).round() as u8;
+        pixel[0] = ((0.13 + 0.28 * luma) * 255.0).round() as u8;
+    }
+}
+
 /// Immutable list of tiles required by one export. Keeping the manifest
 /// separate from the worker queue makes preflight deterministic and lets the
 /// UI report cached/missing work without treating it as video frames.
@@ -826,18 +845,21 @@ impl D2dSceneRenderer {
                 a: 1.0,
             },
             scene_core::MapStyle::Transparent => D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
+                r: 0.063,
+                g: 0.086,
+                b: 0.110,
+                a: 1.0,
             },
         };
         unsafe {
             self.context.Clear(Some(&background));
         }
-        if options.map_style != scene_core::MapStyle::Transparent
-            && let Some(tiles) = tiles
-        {
+        if let Some(tiles) = tiles {
+            let tile_opacity = if options.map_style == scene_core::MapStyle::Transparent {
+                0.35
+            } else {
+                1.0
+            };
             let available: HashSet<_> = tiles.tiles.keys().copied().collect();
             let selected_zoom = fallback_tile_zoom_rect(
                 &available,
@@ -870,7 +892,7 @@ impl D2dSceneRenderer {
                     self.context.DrawBitmap(
                         tile,
                         Some(&dest),
-                        1.0,
+                        tile_opacity,
                         D2D1_INTERPOLATION_MODE_LINEAR,
                         None,
                         None,
@@ -1182,14 +1204,8 @@ impl D2dSceneRenderer {
                 right: rect.right - 16.0,
                 bottom: rect.bottom - 8.0,
             };
-            let altitude = frame
-                .elevation_m
-                .map(|value| format!("{value:.0} m"))
-                .unwrap_or_else(|| "-- m".to_owned());
-            let label = format!(
-                "公里數 {:.2} km\n海拔 {altitude}",
-                frame.distance_m / 1000.0
-            );
+            let label =
+                scene_core::hud_text(options.render_language, frame.distance_m, frame.elevation_m);
             let text: Vec<u16> = label.encode_utf16().collect();
             unsafe {
                 let shadow_rect = D2D_RECT_F {
@@ -1562,6 +1578,41 @@ mod tests {
             TileDiskCache::new(std::env::temp_dir(), 1024)
                 .tile_url(key)
                 .contains("openstreetmap.org")
+        );
+    }
+
+    #[test]
+    fn dark_map_transform_preserves_alpha_and_is_deterministic() {
+        let mut tile = DecodedTile {
+            key: TileKey {
+                zoom: 1,
+                x: 0,
+                y: 0,
+            },
+            width: 1,
+            height: 1,
+            bgra: vec![255, 128, 0, 255],
+        };
+        apply_map_color_transform(&mut tile, scene_core::MapStyle::Dark);
+        assert_eq!(tile.bgra[3], 255);
+        assert_eq!(&tile.bgra[..3], &[64, 53, 45]);
+        let before = tile.bgra.clone();
+        apply_map_color_transform(&mut tile, scene_core::MapStyle::Light);
+        assert_eq!(tile.bgra, before);
+    }
+
+    #[test]
+    fn dark_and_transparent_use_real_osm_tile_source() {
+        let dark = TileDiskCache::for_map_style(scene_core::MapStyle::Dark);
+        let transparent = TileDiskCache::for_map_style(scene_core::MapStyle::Transparent);
+        assert_eq!(dark.root(), transparent.root());
+        assert!(
+            dark.tile_url(TileKey {
+                zoom: 2,
+                x: 1,
+                y: 1
+            })
+            .contains("openstreetmap.org")
         );
     }
     #[test]

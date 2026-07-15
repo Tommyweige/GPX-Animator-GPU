@@ -12,8 +12,9 @@ use places_core::{
     SearchCoordinate,
 };
 use scene_core::{
-    Aspect, CameraMode, Codec, LandmarkSource, LandmarkStyle, MapStyle, QualityPreset,
-    RouteLandmark, Scene, anchor_landmark_to_route, build_frame, screen_point_to_geo,
+    Aspect, CameraMode, Codec, FrameBuildContext, FramePurpose, LandmarkSource, LandmarkStyle,
+    MapStyle, QualityPreset, RenderLanguage, RouteLandmark, Scene, anchor_landmark_to_route,
+    build_frame_with_context, screen_point_to_geo,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -62,17 +63,25 @@ struct CustomLandmarkState {
     category: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsPage {
+    General,
+    Places,
+    ApiKeys,
+    Storage,
+    Advanced,
+}
+
 pub struct NativeApp {
     model: AppModel,
     track: Option<Track>,
     gpx_path: Option<PathBuf>,
     output_path: Option<PathBuf>,
     preview_progress: f64,
-    /// Temporary map inspection state. These values are copied into a cloned
-    /// SceneOptions for preview only and are never persisted or exported.
+    /// Temporary map inspection state. These values are never persisted or
+    /// exported; the Follow zoom remains owned by SceneOptions.
     preview_inspecting: bool,
     preview_center_mercator: Option<[f64; 2]>,
-    preview_zoom_level: Option<f64>,
     receiver: Option<Receiver<WorkerMessage>>,
     gpu_receiver: Option<Receiver<Result<nvenc_engine::GpuCapabilities, String>>>,
     active_token: Option<CancellationToken>,
@@ -85,11 +94,13 @@ pub struct NativeApp {
     preview_map_style: MapStyle,
     language: UiLanguage,
     show_settings: bool,
+    settings_page: SettingsPage,
     preferences: AppPreferences,
     layout: UiLayoutPreferences,
     context_menu: Option<ContextMenuState>,
     nearby_dialog: Option<NearbyDialogState>,
     candidate_place: Option<PlaceSummary>,
+    selected_landmark_id: Option<String>,
     landmarks: Vec<RouteLandmark>,
     project_path: Option<PathBuf>,
     project_warning: Option<String>,
@@ -125,9 +136,13 @@ fn poi_data_root() -> PathBuf {
         .join("poi")
 }
 
-fn offline_poi_pack_summary() -> String {
+fn offline_poi_pack_summary(language: UiLanguage) -> String {
     let Ok(catalog) = places_core::LocalPoiCatalog::from_app_data(poi_data_root()) else {
-        return "Offline POI data pack status unavailable.".into();
+        return if language == UiLanguage::English {
+            "Offline POI data pack status unavailable.".into()
+        } else {
+            "無法取得離線 POI 資料包狀態。".into()
+        };
     };
     let overture = catalog
         .overture
@@ -142,9 +157,15 @@ fn offline_poi_pack_summary() -> String {
         .map(|stats| stats.place_count)
         .unwrap_or_default();
     if overture == 0 && osm == 0 {
-        "Offline POI data pack is empty; download it before using Offline Free.".into()
-    } else {
+        if language == UiLanguage::English {
+            "Offline POI data pack is empty; download it before using Offline Free.".into()
+        } else {
+            "離線 POI 資料包是空的，使用 Offline Free 前請先下載。".into()
+        }
+    } else if language == UiLanguage::English {
         format!("Offline POI data: Overture {overture} places · OSM {osm} places")
+    } else {
+        format!("離線 POI 資料：Overture {overture} 筆 · OSM {osm} 筆")
     }
 }
 
@@ -207,6 +228,28 @@ fn resolution_label(long_edge: u32, language: UiLanguage) -> String {
     }
 }
 
+fn render_language(language: UiLanguage) -> RenderLanguage {
+    match language {
+        UiLanguage::TraditionalChinese => RenderLanguage::TraditionalChinese,
+        UiLanguage::English => RenderLanguage::English,
+    }
+}
+
+fn poi_profile_label(profile: PoiProfile, language: UiLanguage) -> &'static str {
+    match (profile, language) {
+        (PoiProfile::OfflineFree, UiLanguage::English) => "Offline Free",
+        (PoiProfile::OfflineFree, UiLanguage::TraditionalChinese) => "Offline Free（離線免費）",
+        (PoiProfile::TomTomLive, UiLanguage::English) => "TomTom Live",
+        (PoiProfile::TomTomLive, UiLanguage::TraditionalChinese) => "TomTom 線上",
+        (PoiProfile::FoursquareEnhanced, UiLanguage::English) => "Foursquare Enhanced",
+        (PoiProfile::FoursquareEnhanced, UiLanguage::TraditionalChinese) => "Foursquare 強化",
+        (PoiProfile::GatewayPro, UiLanguage::English) => "Gateway Pro",
+        (PoiProfile::GatewayPro, UiLanguage::TraditionalChinese) => "Gateway Pro",
+        (PoiProfile::GoogleByok, UiLanguage::English) => "Google Places (BYOK)",
+        (PoiProfile::GoogleByok, UiLanguage::TraditionalChinese) => "Google Places（自備金鑰）",
+    }
+}
+
 fn localized_error(language: UiLanguage, message: &str) -> String {
     if language == UiLanguage::TraditionalChinese {
         return message.to_owned();
@@ -238,7 +281,7 @@ impl NativeApp {
         settings.cache_limit_bytes = preferences
             .cache_limit_bytes
             .max(crate::default_cache_limit_bytes() / 8);
-        let model = AppModel {
+        let mut model = AppModel {
             settings,
             ..AppModel::default()
         };
@@ -267,6 +310,8 @@ impl NativeApp {
             .unwrap_or_default();
         let gateway_url_input = preferences.gateway_base_url.clone().unwrap_or_default();
         let preview_map_style = model.settings.scene.map_style;
+        let language = preferences.language;
+        model.settings.scene.render_language = render_language(language);
         Self {
             model,
             track: None,
@@ -275,7 +320,6 @@ impl NativeApp {
             preview_progress: 0.0,
             preview_inspecting: false,
             preview_center_mercator: None,
-            preview_zoom_level: None,
             receiver: None,
             gpu_receiver: Some(gpu_receiver),
             active_token: None,
@@ -286,13 +330,15 @@ impl NativeApp {
             preview_tiles: HashMap::new(),
             pending_tiles: HashSet::new(),
             preview_map_style,
-            language: preferences.language,
+            language,
             show_settings: false,
+            settings_page: SettingsPage::General,
             layout: preferences.ui_layout.clone(),
             preferences,
             context_menu: None,
             nearby_dialog: None,
             candidate_place: None,
+            selected_landmark_id: None,
             landmarks: Vec::new(),
             project_path: None,
             project_warning: None,
@@ -310,7 +356,7 @@ impl NativeApp {
             gateway_token_status: None,
             gateway_url_input,
             poi_pack_loading: false,
-            poi_pack_status: Some(offline_poi_pack_summary()),
+            poi_pack_status: Some(offline_poi_pack_summary(language)),
         }
     }
 
@@ -332,7 +378,8 @@ impl NativeApp {
                 reset_camera_for_new_track(&mut self.model.settings.scene);
                 self.preview_inspecting = false;
                 self.preview_center_mercator = None;
-                self.preview_zoom_level = None;
+                self.candidate_place = None;
+                self.selected_landmark_id = None;
                 self.output_path = Some(path.with_extension("mp4"));
                 self.gpx_path = Some(path);
                 self.track = Some(track);
@@ -440,7 +487,7 @@ impl NativeApp {
         })
     }
 
-    fn add_landmark(&mut self, mut landmark: RouteLandmark) {
+    fn add_landmark(&mut self, mut landmark: RouteLandmark) -> String {
         if let Some(existing) = self.landmarks.iter_mut().find(|value| {
             value.id == landmark.id
                 || ((value.latitude - landmark.latitude).abs() < 0.0003
@@ -448,8 +495,11 @@ impl NativeApp {
                     && value.name.eq_ignore_ascii_case(&landmark.name))
         }) {
             existing.enabled = true;
-            return;
+            let id = existing.id.clone();
+            self.selected_landmark_id = Some(id.clone());
+            return id;
         }
+        let id = landmark.id.clone();
         landmark.anchor_progress = landmark.anchor_progress.clamp(0.0, 1.0);
         self.landmarks.push(landmark);
         self.landmarks.sort_by(|a, b| {
@@ -458,6 +508,8 @@ impl NativeApp {
                 .then_with(|| a.id.cmp(&b.id))
         });
         self.save_landmarks();
+        self.selected_landmark_id = Some(id.clone());
+        id
     }
 
     fn add_place_from_dialog(&mut self, index: usize) {
@@ -470,6 +522,9 @@ impl NativeApp {
         if let Some(landmark) = self.route_landmark_from_place(&place) {
             self.add_landmark(landmark);
             self.candidate_place = None;
+            self.preview_inspecting = true;
+            self.preview_center_mercator =
+                Some(scene_core::geo_to_mercator(place.latitude, place.longitude));
         } else {
             self.last_error = Some(if self.language == UiLanguage::English {
                 "This provider result has no matching open-data place; use Add custom route marker from the map."
@@ -498,6 +553,7 @@ impl NativeApp {
             state.coordinate.longitude,
             self.landmarks.len()
         );
+        let coordinate = state.coordinate;
         self.add_landmark(RouteLandmark {
             id,
             source: LandmarkSource::Manual,
@@ -516,6 +572,11 @@ impl NativeApp {
             enabled: true,
             style: LandmarkStyle::default(),
         });
+        self.preview_inspecting = true;
+        self.preview_center_mercator = Some(scene_core::geo_to_mercator(
+            coordinate.latitude,
+            coordinate.longitude,
+        ));
     }
 
     fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
@@ -628,6 +689,8 @@ impl NativeApp {
                         self.pending_tiles.remove(&key);
                         continue;
                     }
+                    let mut tile = tile;
+                    d3d11_renderer::apply_map_color_transform(&mut tile, style);
                     let mut rgba = tile.bgra;
                     for pixel in rgba.chunks_exact_mut(4) {
                         pixel.swap(0, 2)
@@ -639,7 +702,7 @@ impl NativeApp {
                     self.preview_tiles.insert(
                         key,
                         ctx.load_texture(
-                            format!("osm-{}-{}-{}", key.zoom, key.x, key.y),
+                            format!("map-{style:?}-{}-{}-{}", key.zoom, key.x, key.y),
                             image,
                             egui::TextureOptions::LINEAR,
                         ),
@@ -679,6 +742,7 @@ impl NativeApp {
 
     fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate) {
         self.candidate_place = None;
+        self.selected_landmark_id = None;
         self.next_places_request_id = self.next_places_request_id.wrapping_add(1);
         let request_id = self.next_places_request_id;
         self.nearby_dialog = Some(NearbyDialogState {
@@ -792,7 +856,7 @@ impl NativeApp {
                     self.poi_pack_loading = false;
                     self.poi_pack_status = Some(match result {
                         Ok(message) => {
-                            format!("{message} {}", offline_poi_pack_summary())
+                            format!("{message} {}", offline_poi_pack_summary(self.language))
                         }
                         Err(error) => format!("Data pack: {error}"),
                     });
@@ -1362,8 +1426,17 @@ impl NativeApp {
         if let Some(index) = add_index {
             self.add_place_from_dialog(index);
         }
-        if let Some(place) = candidate {
+        if add_index.is_none()
+            && let Some(place) = candidate
+        {
             self.candidate_place = Some(place);
+            self.preview_inspecting = true;
+            if let Some(candidate) = &self.candidate_place {
+                self.preview_center_mercator = Some(scene_core::geo_to_mercator(
+                    candidate.latitude,
+                    candidate.longitude,
+                ));
+            }
         }
         if open_settings {
             self.show_settings = true;
@@ -1376,6 +1449,7 @@ impl NativeApp {
             return;
         };
         self.model.settings = self.validated_settings();
+        self.model.settings.scene.render_language = render_language(self.language);
         let token = match self.model.begin_export() {
             Ok(value) => value,
             Err(error) => {
@@ -1414,6 +1488,7 @@ impl NativeApp {
         };
         value.duration_seconds = value.duration_seconds.clamp(1, 3600);
         value.scene.line_width_px = value.scene.line_width_px.clamp(1.0, 32.0);
+        value.scene.render_language = render_language(self.language);
         value
     }
 
@@ -1963,9 +2038,9 @@ impl NativeApp {
                         }
                         MapStyle::Transparent => {
                             if english {
-                                "Transparent"
+                                "Transparent · 35%"
                             } else {
-                                "透明"
+                                "淡化地圖 · 35%"
                             }
                         }
                     })
@@ -1988,7 +2063,11 @@ impl NativeApp {
                         ui.selectable_value(
                             &mut self.model.settings.scene.map_style,
                             MapStyle::Transparent,
-                            if english { "Transparent" } else { "透明" },
+                            if english {
+                                "Transparent · 35%"
+                            } else {
+                                "淡化地圖 · 35%"
+                            },
                         );
                     });
                 ui.end_row();
@@ -2534,10 +2613,17 @@ impl NativeApp {
                     ui.label("拖曳平移 · 滾輪縮放");
                 });
             }
-            if self.preview_inspecting && ui.button("Return to export view").clicked() {
+            if self.preview_inspecting
+                && ui
+                    .button(if self.language == UiLanguage::English {
+                        "Return to export view"
+                    } else {
+                        "返回輸出視角"
+                    })
+                    .clicked()
+            {
                 self.preview_inspecting = false;
                 self.preview_center_mercator = None;
-                self.preview_zoom_level = None;
             }
             let available = ui.available_size();
             let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
@@ -2555,7 +2641,7 @@ impl NativeApp {
                 MapStyle::Light => egui::Color32::from_rgb(232, 236, 232),
                 MapStyle::Dark => egui::Color32::from_rgb(26, 35, 42),
                 MapStyle::Satellite => egui::Color32::from_rgb(24, 28, 32),
-                MapStyle::Transparent => egui::Color32::from_gray(45),
+                MapStyle::Transparent => egui::Color32::from_rgb(16, 22, 28),
             };
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(28, 34, 40));
             painter.rect_filled(frame_rect, 8.0, background);
@@ -2572,59 +2658,64 @@ impl NativeApp {
                 );
                 return;
             };
-            let mut preview_options = self.model.settings.scene.clone();
+            let preview_options = self.model.settings.scene.clone();
             // Camera composition uses scene_core's logical canvas.  The
             // widget size only controls how the already-computed frame is
             // letterboxed on screen.
-            preview_options.preview_center_mercator = self.preview_center_mercator;
-            preview_options.preview_zoom_level = self.preview_zoom_level;
             let initial_scene = Scene {
                 track: track.clone(),
                 options: preview_options.clone(),
                 landmarks: self.landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
-            let initial_frame = build_frame(&initial_scene, self.preview_progress);
+            let initial_frame = build_frame_with_context(
+                &initial_scene,
+                self.preview_progress,
+                FrameBuildContext {
+                    purpose: FramePurpose::EditorPreview,
+                    center_override_mercator: self.preview_center_mercator,
+                },
+            );
             if response.dragged() {
                 let delta = ctx.input(|input| input.pointer.delta());
                 if !self.preview_inspecting {
                     self.preview_inspecting = true;
                     self.preview_center_mercator = Some(initial_frame.view_center_mercator);
-                    self.preview_zoom_level = Some(self.model.settings.scene.follow_zoom_level);
                 }
                 if let Some(center) = &mut self.preview_center_mercator {
-                    center[0] -= delta.x as f64 / frame_rect.width().max(1.0) as f64
-                        * initial_frame.view_span;
-                    center[1] += delta.y as f64 / frame_rect.height().max(1.0) as f64
-                        * initial_frame.view_span_y;
+                    *center = pan_camera_center(
+                        *center,
+                        delta,
+                        frame_rect.size(),
+                        [initial_frame.view_span, initial_frame.view_span_y],
+                    );
                 }
             }
             if response.hovered() {
                 let scroll = ctx.input(|input| input.smooth_scroll_delta.y);
                 if scroll.abs() > 0.0 {
-                    let factor = (scroll as f64 * 0.002).exp();
-                    if self.preview_inspecting {
-                        let zoom = self
-                            .preview_zoom_level
-                            .unwrap_or(self.model.settings.scene.follow_zoom_level);
-                        self.preview_zoom_level =
-                            Some((zoom + factor.ln() / 0.12).clamp(10.0, 20.0));
-                    } else if self.model.settings.scene.camera_mode == CameraMode::Follow {
-                        self.model.settings.scene.follow_zoom_level =
-                            (self.model.settings.scene.follow_zoom_level + factor.ln() / 0.12)
-                                .clamp(10.0, 20.0);
+                    if self.model.settings.scene.camera_mode == CameraMode::Follow {
+                        self.model.settings.scene.follow_zoom_level = apply_follow_zoom_scroll(
+                            self.model.settings.scene.follow_zoom_level,
+                            scroll,
+                        );
                     }
                 }
             }
-            preview_options.preview_center_mercator = self.preview_center_mercator;
-            preview_options.preview_zoom_level = self.preview_zoom_level;
             let scene = Scene {
                 track: track.clone(),
                 options: preview_options,
                 landmarks: self.landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
-            let frame = build_frame(&scene, self.preview_progress);
+            let frame = build_frame_with_context(
+                &scene,
+                self.preview_progress,
+                FrameBuildContext {
+                    purpose: FramePurpose::EditorPreview,
+                    center_override_mercator: self.preview_center_mercator,
+                },
+            );
             let preview_scale = preview_content_scale(
                 frame_rect.width(),
                 frame_rect.height(),
@@ -2684,7 +2775,11 @@ impl NativeApp {
                         texture.id(),
                         egui::Rect::from_min_max(min, max),
                         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        if self.model.settings.scene.map_style == MapStyle::Transparent {
+                            egui::Color32::from_white_alpha(89)
+                        } else {
+                            egui::Color32::WHITE
+                        },
                     );
                 }
             }
@@ -2742,7 +2837,9 @@ impl NativeApp {
                     landmark.color[2],
                     alpha,
                 );
-                let radius = 18.0 * landmark_scale * landmark.pin_scale.max(0.2);
+                let selected = self.selected_landmark_id.as_deref() == Some(landmark.id.as_str());
+                let selection_scale = if selected { 1.35 } else { 1.0 };
+                let radius = 18.0 * landmark_scale * landmark.pin_scale.max(0.2) * selection_scale;
                 let body = point + egui::vec2(0.0, -radius * 0.78);
                 painter.circle_filled(
                     body + egui::vec2(6.0 * landmark_scale, 9.0 * landmark_scale),
@@ -2781,7 +2878,7 @@ impl NativeApp {
                         ),
                     );
                 }
-                if landmark.label_opacity > 0.0 && landmark.show_label {
+                if selected && landmark.label_opacity > 0.0 && landmark.show_label {
                     let label_alpha = (landmark.label_opacity.clamp(0.0, 1.0) * 255.0) as u8;
                     let label_width = 260.0 * landmark_scale;
                     let label_height = if landmark.category.is_some() {
@@ -3067,6 +3164,280 @@ impl NativeApp {
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let english = self.language == UiLanguage::English;
+        let mut open = true;
+        let mut download_pack = false;
+        let mut clear_cache = false;
+        let language_before = self.language;
+        egui::Window::new(if english { "Settings" } else { "設定" })
+            .id(egui::Id::new("settings-window-stable"))
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(egui::vec2(760.0, 620.0))
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_width(150.0);
+                    ui.vertical(|ui| {
+                        ui.heading(if english { "Settings" } else { "設定" });
+                        ui.add_space(8.0);
+                        for (page, label) in [
+                            (
+                                SettingsPage::General,
+                                if english { "General" } else { "一般" },
+                            ),
+                            (
+                                SettingsPage::Places,
+                                if english { "Places" } else { "附近地點" },
+                            ),
+                            (
+                                SettingsPage::ApiKeys,
+                                if english { "API keys" } else { "API 金鑰" },
+                            ),
+                            (
+                                SettingsPage::Storage,
+                                if english { "Storage" } else { "儲存空間" },
+                            ),
+                            (
+                                SettingsPage::Advanced,
+                                if english { "Advanced" } else { "進階" },
+                            ),
+                        ] {
+                            if ui
+                                .selectable_label(self.settings_page == page, label)
+                                .clicked()
+                            {
+                                self.settings_page = page;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("settings-content-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match self.settings_page {
+                                SettingsPage::General => {
+                                    ui.heading(if english { "General" } else { "一般" });
+                                    ui.separator();
+                                    ui.label(if english { "Language" } else { "語言" });
+                                    egui::ComboBox::from_id_salt("settings-language")
+                                        .selected_text(if english { "English" } else { "繁體中文" })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.language,
+                                                UiLanguage::TraditionalChinese,
+                                                "繁體中文",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.language,
+                                                UiLanguage::English,
+                                                "English",
+                                            );
+                                        });
+                                    ui.small(if english {
+                                        "The selected language is also used for static text in exported videos."
+                                    } else {
+                                        "目前語言也會套用到輸出影片的固定文字。"
+                                    });
+                                    ui.separator();
+                                    ui.label(if english { "Current output" } else { "目前輸出" });
+                                    ui.label(format!(
+                                        "{} · {} FPS · H.265",
+                                        resolution_label(current_long_edge(&self.model.settings), self.language),
+                                        self.model.settings.fps
+                                    ));
+                                    if ui
+                                        .button(if english { "Reset panel layout" } else { "重設面板版面" })
+                                        .clicked()
+                                    {
+                                        self.layout = UiLayoutPreferences::default();
+                                    }
+                                }
+                                SettingsPage::Places => {
+                                    ui.heading(if english { "Nearby places" } else { "附近地點" });
+                                    ui.separator();
+                                    ui.label(if english { "POI profile" } else { "POI 模式" });
+                                    egui::ComboBox::from_id_salt("settings-poi-profile")
+                                        .selected_text(poi_profile_label(self.preferences.poi_profile, self.language))
+                                        .show_ui(ui, |ui| {
+                                            for profile in [
+                                                PoiProfile::OfflineFree,
+                                                PoiProfile::TomTomLive,
+                                                PoiProfile::FoursquareEnhanced,
+                                                PoiProfile::GatewayPro,
+                                                PoiProfile::GoogleByok,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.preferences.poi_profile,
+                                                    profile,
+                                                    poi_profile_label(profile, self.language),
+                                                );
+                                            }
+                                        });
+                                    ui.checkbox(
+                                        &mut self.preferences.nearby_online,
+                                        if english { "Allow online refresh" } else { "允許線上更新" },
+                                    );
+                                    ui.separator();
+                                    ui.label(if english { "Offline data pack" } else { "離線資料包" });
+                                    ui.small(offline_poi_pack_summary(self.language));
+                                    if ui
+                                        .add_enabled(
+                                            !self.poi_pack_loading,
+                                            egui::Button::new(if self.poi_pack_loading {
+                                                "Downloading…"
+                                            } else if english {
+                                                "Download / update data pack"
+                                            } else {
+                                                "下載／更新資料包"
+                                            }),
+                                        )
+                                        .clicked()
+                                    {
+                                        download_pack = true;
+                                    }
+                                    if let Some(status) = &self.poi_pack_status {
+                                        ui.small(status);
+                                    }
+                                }
+                                SettingsPage::ApiKeys => {
+                                    ui.heading(if english { "Provider API keys" } else { "供應商 API 金鑰" });
+                                    ui.small(if english {
+                                        "Keys are stored in Windows Credential Manager and are never written to settings.json."
+                                    } else {
+                                        "金鑰會儲存在 Windows Credential Manager，不會寫入 settings.json。"
+                                    });
+                                    ui.separator();
+                                    ui.group(|ui| {
+                                        ui.label(if english { "TomTom Search API key" } else { "TomTom Search API 金鑰" });
+                                        ui.add(egui::TextEdit::singleline(&mut self.tomtom_key_input).password(true).hint_text("TomTom key"));
+                                        ui.horizontal(|ui| {
+                                            if ui.button(if english { "Save" } else { "儲存" }).clicked() {
+                                                self.tomtom_key_status = Some(match crate::secrets::write_tomtom_api_key(&self.tomtom_key_input) {
+                                                    Ok(()) => if english { "TomTom key saved.".into() } else { "TomTom 金鑰已儲存。".into() },
+                                                    Err(error) => error,
+                                                });
+                                            }
+                                            if ui.button(if english { "Remove" } else { "移除" }).clicked() {
+                                                self.tomtom_key_input.clear();
+                                                self.tomtom_key_status = crate::secrets::write_tomtom_api_key("").err().or_else(|| Some(if english { "TomTom key removed.".into() } else { "TomTom 金鑰已移除。".into() }));
+                                            }
+                                        });
+                                        if let Some(status) = &self.tomtom_key_status { ui.small(status); }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.group(|ui| {
+                                        ui.label(if english { "Google Places API key" } else { "Google Places API 金鑰" });
+                                        ui.add(egui::TextEdit::singleline(&mut self.google_key_input).password(true).hint_text("AIza…"));
+                                        ui.horizontal(|ui| {
+                                            if ui.button(if english { "Save" } else { "儲存" }).clicked() {
+                                                self.google_key_status = Some(match crate::secrets::write_google_places_api_key(&self.google_key_input) {
+                                                    Ok(()) => if english { "Google key saved.".into() } else { "Google 金鑰已儲存。".into() },
+                                                    Err(error) => error,
+                                                });
+                                            }
+                                            if ui.button(if english { "Remove" } else { "移除" }).clicked() {
+                                                self.google_key_input.clear();
+                                                self.google_key_status = crate::secrets::write_google_places_api_key("").err().or_else(|| Some(if english { "Google key removed.".into() } else { "Google 金鑰已移除。".into() }));
+                                            }
+                                        });
+                                        if let Some(status) = &self.google_key_status { ui.small(status); }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.group(|ui| {
+                                        ui.label(if english { "Foursquare Places API key" } else { "Foursquare Places API 金鑰" });
+                                        ui.add(egui::TextEdit::singleline(&mut self.foursquare_key_input).password(true).hint_text("Foursquare key"));
+                                        ui.horizontal(|ui| {
+                                            if ui.button(if english { "Save" } else { "儲存" }).clicked() {
+                                                self.foursquare_key_status = Some(match crate::secrets::write_foursquare_api_key(&self.foursquare_key_input) {
+                                                    Ok(()) => "Foursquare key saved.".into(),
+                                                    Err(error) => error,
+                                                });
+                                            }
+                                            if ui.button(if english { "Remove" } else { "移除" }).clicked() {
+                                                self.foursquare_key_input.clear();
+                                                self.foursquare_key_status = crate::secrets::write_foursquare_api_key("").err().or_else(|| Some("Foursquare key removed.".into()));
+                                            }
+                                        });
+                                        if let Some(status) = &self.foursquare_key_status { ui.small(status); }
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.group(|ui| {
+                                        ui.label(if english { "Gateway (optional)" } else { "Gateway（選配）" });
+                                        ui.add(egui::TextEdit::singleline(&mut self.gateway_url_input).hint_text("https://gateway.example"));
+                                        ui.add(egui::TextEdit::singleline(&mut self.gateway_token_input).password(true).hint_text("Bearer token"));
+                                        if ui.button(if english { "Save gateway token" } else { "儲存 Gateway token" }).clicked() {
+                                            self.gateway_token_status = Some(match crate::secrets::write_gateway_bearer_token(&self.gateway_token_input) {
+                                                Ok(()) => "Gateway token saved.".into(),
+                                                Err(error) => error,
+                                            });
+                                        }
+                                        if let Some(status) = &self.gateway_token_status { ui.small(status); }
+                                    });
+                                }
+                                SettingsPage::Storage => {
+                                    ui.heading(if english { "Storage and cache" } else { "儲存空間與快取" });
+                                    ui.separator();
+                                    let mut cache_gb = self.model.settings.cache_limit_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+                                    ui.add(egui::Slider::new(&mut cache_gb, 0.25..=8.0).text(if english { "Map cache (GB)" } else { "地圖快取（GB）" }).step_by(0.25));
+                                    self.model.settings.cache_limit_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+                                    ui.small(if english { "Light, Dark and Transparent share the OSM cache. Satellite uses a separate cache." } else { "淺色、深色與淡化地圖共用 OSM 快取；衛星圖使用獨立快取。" });
+                                    if ui.button(if english { "Clear current map cache" } else { "清除目前地圖快取" }).clicked() { clear_cache = true; }
+                                    if let Some(status) = &self.poi_pack_status { ui.separator(); ui.label(if english { "POI pack" } else { "POI 資料包" }); ui.small(status); }
+                                }
+                                SettingsPage::Advanced => {
+                                    ui.heading(if english { "Advanced diagnostics" } else { "進階診斷" });
+                                    ui.separator();
+                                    if let Some(gpu) = &self.model.capabilities {
+                                        ui.label(format!("Adapter: {}", gpu.adapter_name));
+                                        ui.label(format!("NVENC HEVC: {} · H.264: {} · Async: {}", gpu.hevc, gpu.h264, gpu.async_encode));
+                                    } else if self.gpu_receiver.is_some() {
+                                        ui.spinner();
+                                        ui.label(if english { "Detecting GPU capabilities…" } else { "正在偵測 GPU 能力…" });
+                                    } else {
+                                        ui.colored_label(egui::Color32::LIGHT_RED, if english { "GPU capability detection failed." } else { "GPU 能力偵測失敗。" });
+                                    }
+                                    let d = &self.model.diagnostics;
+                                    ui.separator();
+                                    ui.label(format!("CPU readbacks: {} · encoded: {} · dropped: {}", d.cpu_frame_readbacks, d.encoded_frames, d.dropped_frames));
+                                    ui.label(format!("Render p50/p95: {:.2}/{:.2} ms · Encode p95: {:.2} ms", d.render_p50_ms, d.render_p95_ms, d.encode_p95_ms));
+                                    if ui.button(if english { "Open detailed diagnostics" } else { "開啟詳細診斷" }).clicked() { self.show_diagnostics = true; }
+                                }
+                            });
+                    });
+                });
+            });
+        self.show_settings = open;
+        if self.language != language_before {
+            self.model.settings.scene.render_language = render_language(self.language);
+            ctx.request_repaint();
+        }
+        if clear_cache {
+            let style = self.model.settings.scene.map_style;
+            if let Err(error) = d3d11_renderer::TileDiskCache::for_map_style_with_limit(
+                style,
+                Some(self.model.settings.cache_limit_bytes),
+            )
+            .clear()
+            {
+                self.last_error = Some(error.to_string());
+            } else {
+                self.preview_tiles.clear();
+                self.pending_tiles.clear();
+            }
+        }
+        if download_pack {
+            self.start_poi_pack_download();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn settings_window_legacy(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
         }
@@ -3479,8 +3850,7 @@ impl NativeApp {
         let mut current = self.preferences.clone();
         current.language = self.language;
         current.settings = self.model.settings.clone();
-        current.settings.scene.preview_center_mercator = None;
-        current.settings.scene.preview_zoom_level = None;
+        current.settings.scene.render_language = render_language(self.language);
         current.cache_limit_bytes = current.settings.cache_limit_bytes;
         current.ui_layout = self.layout.clone();
         current.gateway_base_url = (!self.gateway_url_input.trim().is_empty())
@@ -3527,52 +3897,28 @@ impl eframe::App for NativeApp {
     }
 }
 
-#[allow(dead_code)]
-fn apply_pan(
-    options: &mut scene_core::SceneOptions,
-    track: &Track,
-    delta: egui::Vec2,
-    size: egui::Vec2,
-) {
-    if size.x <= 1.0 || size.y <= 1.0 {
-        return;
+fn apply_follow_zoom_scroll(current: f64, scroll_y: f32) -> f64 {
+    (current + f64::from(scroll_y) / 60.0).clamp(10.0, 20.0)
+}
+
+fn pan_camera_center(
+    center: [f64; 2],
+    pointer_delta: egui::Vec2,
+    viewport: egui::Vec2,
+    span: [f64; 2],
+) -> [f64; 2] {
+    if viewport.x <= 1.0 || viewport.y <= 1.0 {
+        return center;
     }
-    let min_lon = track
-        .points
-        .iter()
-        .map(|point| point.lon)
-        .fold(f64::INFINITY, f64::min);
-    let max_lon = track
-        .points
-        .iter()
-        .map(|point| point.lon)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let min_lat = track
-        .points
-        .iter()
-        .map(|point| point.lat)
-        .fold(f64::INFINITY, f64::min);
-    let max_lat = track
-        .points
-        .iter()
-        .map(|point| point.lat)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let mut center = options
-        .free_camera_center
-        .unwrap_or([(min_lon + max_lon) * 0.5, (min_lat + max_lat) * 0.5]);
-    center[0] -=
-        delta.x as f64 / size.x as f64 * (max_lon - min_lon) / options.camera_zoom.max(0.25);
-    center[1] +=
-        delta.y as f64 / size.y as f64 * (max_lat - min_lat) / options.camera_zoom.max(0.25);
-    options.free_camera_center = Some(center);
-    options.camera_mode = CameraMode::Free;
+    [
+        center[0] - pointer_delta.x as f64 / viewport.x as f64 * span[0],
+        center[1] - pointer_delta.y as f64 / viewport.y as f64 * span[1],
+    ]
 }
 
 fn reset_camera_for_new_track(options: &mut scene_core::SceneOptions) {
     options.camera_mode = CameraMode::Follow;
     options.free_camera_center = None;
-    options.preview_center_mercator = None;
-    options.preview_zoom_level = None;
     options.follow_zoom_level = scene_core::default_follow_zoom_level();
     options.camera_zoom = 1.0;
 }
@@ -3619,19 +3965,18 @@ fn install_chinese_font(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpx_core::parse_gpx;
     #[test]
-    fn pan_switches_to_free_camera() {
-        let track=parse_gpx(r#"<gpx><trk><trkseg><trkpt lat="25" lon="121"/><trkpt lat="26" lon="122"/></trkseg></trk></gpx>"#,ParseOptions::default()).unwrap();
-        let mut options = scene_core::SceneOptions::default();
-        apply_pan(
-            &mut options,
-            &track,
+    fn pan_follows_pointer_and_preserves_export_zoom() {
+        let center = pan_camera_center(
+            [0.5, 0.5],
             egui::vec2(100.0, 50.0),
             egui::vec2(1000.0, 500.0),
+            [0.1, 0.05],
         );
-        assert_eq!(options.camera_mode, CameraMode::Free);
-        assert!(options.free_camera_center.is_some());
+        assert!(center[0] < 0.5);
+        assert!(center[1] < 0.5);
+        assert_eq!(apply_follow_zoom_scroll(15.0, 60.0), 16.0);
+        assert_eq!(apply_follow_zoom_scroll(10.0, -600.0), 10.0);
     }
     #[test]
     fn loading_a_track_resets_saved_free_camera() {

@@ -14,6 +14,16 @@ pub enum MapStyle {
     Satellite,
     Transparent,
 }
+
+/// Language used for static text rendered into the exported video.  Provider
+/// supplied place names remain in their source language; this enum controls
+/// labels owned by GPX Animator itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderLanguage {
+    #[default]
+    TraditionalChinese,
+    English,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CameraMode {
     Fit,
@@ -123,12 +133,10 @@ pub struct SceneOptions {
     pub camera_viewport_width_px: u32,
     #[serde(default = "default_camera_viewport_height")]
     pub camera_viewport_height_px: u32,
-    /// Temporary preview-only camera overrides.  Export code always leaves
-    /// these as `None`, so desktop inspection cannot leak into the MP4.
+    /// Static text language for the exported video.  Preview text is sourced
+    /// from the same value so the canvas and MP4 cannot drift apart.
     #[serde(default)]
-    pub preview_center_mercator: Option<[f64; 2]>,
-    #[serde(default)]
-    pub preview_zoom_level: Option<f64>,
+    pub render_language: RenderLanguage,
     /// Legacy relative zoom retained only for migration of old project files.
     /// New Follow/preview code does not use it.
     pub camera_zoom: f64,
@@ -188,8 +196,7 @@ impl Default for SceneOptions {
             follow_zoom_level: default_follow_zoom_level(),
             camera_viewport_width_px: default_camera_viewport_width(),
             camera_viewport_height_px: default_camera_viewport_height(),
-            preview_center_mercator: None,
-            preview_zoom_level: None,
+            render_language: RenderLanguage::default(),
             camera_zoom: 1.0,
         }
     }
@@ -218,6 +225,30 @@ pub struct FramePlan {
     pub distance_m: f64,
     pub elevation_m: Option<f64>,
     pub landmarks: Vec<LandmarkFrame>,
+}
+
+/// Controls camera and landmark visibility for a frame.  The preview may
+/// temporarily override the center and show all saved pins, while export
+/// always uses the timeline-driven camera and reveal animation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FramePurpose {
+    Export,
+    EditorPreview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameBuildContext {
+    pub purpose: FramePurpose,
+    pub center_override_mercator: Option<[f64; 2]>,
+}
+
+impl Default for FrameBuildContext {
+    fn default() -> Self {
+        Self {
+            purpose: FramePurpose::Export,
+            center_override_mercator: None,
+        }
+    }
 }
 
 fn wrapped_longitude_delta(from: f64, to: f64) -> f64 {
@@ -322,6 +353,23 @@ fn friendly_category(value: &str) -> String {
     label.to_owned()
 }
 
+pub fn hud_text(language: RenderLanguage, distance_m: f64, elevation_m: Option<f64>) -> String {
+    let altitude = elevation_m
+        .map(|value| format!("{value:.0} m"))
+        .unwrap_or_else(|| "-- m".to_owned());
+    match language {
+        RenderLanguage::TraditionalChinese => {
+            format!("公里數 {:.2} km\n海拔 {altitude}", distance_m / 1000.0)
+        }
+        RenderLanguage::English => {
+            format!(
+                "Distance {:.2} km\nElevation {altitude}",
+                distance_m / 1000.0
+            )
+        }
+    }
+}
+
 fn landmark_frame(
     landmark: &RouteLandmark,
     ndc: [f32; 2],
@@ -350,6 +398,22 @@ fn landmark_frame(
         } else {
             0.0
         },
+        label_side: 1,
+        name: landmark.name.clone(),
+        category: landmark.category.as_deref().map(friendly_category),
+        color: landmark.style.pin_color,
+        show_label: landmark.style.show_label,
+    }
+}
+
+fn editor_landmark_frame(landmark: &RouteLandmark, ndc: [f32; 2]) -> LandmarkFrame {
+    LandmarkFrame {
+        id: landmark.id.clone(),
+        ndc,
+        pin_opacity: 1.0,
+        pin_scale: 1.0,
+        pulse_progress: 0.0,
+        label_opacity: if landmark.style.show_label { 1.0 } else { 0.0 },
         label_side: 1,
         name: landmark.name.clone(),
         category: landmark.category.as_deref().map(friendly_category),
@@ -419,6 +483,14 @@ pub fn screen_point_to_geo(
 }
 
 pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
+    build_frame_with_context(scene, progress, FrameBuildContext::default())
+}
+
+pub fn build_frame_with_context(
+    scene: &Scene,
+    progress: f64,
+    context: FrameBuildContext,
+) -> FramePlan {
     let progress = progress.clamp(0.0, 1.0);
     let projected: Vec<_> = scene
         .track
@@ -461,34 +533,25 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
     let follow_span_y = follow_span * aspect_height_over_width;
     let sample = sample_distance(&scene.track, progress);
     let (center, span, span_y) = match scene.options.camera_mode {
-        CameraMode::Fit => (fit_center, fit_span, fit_span_y),
-        CameraMode::Follow => (
-            scene
-                .options
-                .preview_center_mercator
-                .unwrap_or_else(|| mercator(sample.lon, sample.lat)),
-            scene
-                .options
-                .preview_zoom_level
-                .map_or(follow_span, |zoom| {
-                    (viewport_width / (256.0 * 2.0_f64.powf(zoom.clamp(2.0, 20.0))))
-                        .clamp(1e-9, 1.0)
-                }),
-            scene
-                .options
-                .preview_zoom_level
-                .map_or(follow_span_y, |zoom| {
-                    (viewport_width / (256.0 * 2.0_f64.powf(zoom.clamp(2.0, 20.0))))
-                        .clamp(1e-9, 1.0)
-                        * aspect_height_over_width
-                }),
+        CameraMode::Fit => (
+            context.center_override_mercator.unwrap_or(fit_center),
+            fit_span,
+            fit_span_y,
         ),
+        CameraMode::Follow => {
+            let center = context
+                .center_override_mercator
+                .unwrap_or_else(|| mercator(sample.lon, sample.lat));
+            (center, follow_span, follow_span_y)
+        }
         CameraMode::Free => {
-            let center = scene
-                .options
-                .free_camera_center
-                .map(|value| mercator(value[0], value[1]))
-                .unwrap_or(fit_center);
+            let center = context.center_override_mercator.unwrap_or_else(|| {
+                scene
+                    .options
+                    .free_camera_center
+                    .map(|value| mercator(value[0], value[1]))
+                    .unwrap_or(fit_center)
+            });
             (
                 center,
                 fit_span / scene.options.camera_zoom.clamp(0.25, 64.0),
@@ -537,12 +600,13 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
         .iter()
         .filter(|landmark| landmark.enabled)
         .map(|landmark| {
-            landmark_frame(
-                landmark,
-                to_ndc(mercator(landmark.longitude, landmark.latitude)),
-                progress,
-                scene.route_duration_seconds,
-            )
+            let ndc = to_ndc(mercator(landmark.longitude, landmark.latitude));
+            match context.purpose {
+                FramePurpose::Export => {
+                    landmark_frame(landmark, ndc, progress, scene.route_duration_seconds)
+                }
+                FramePurpose::EditorPreview => editor_landmark_frame(landmark, ndc),
+            }
         })
         .collect();
     FramePlan {
@@ -704,6 +768,18 @@ mod tests {
             (3840, 2160)
         );
     }
+
+    #[test]
+    fn hud_text_follows_render_language() {
+        assert_eq!(
+            hud_text(RenderLanguage::English, 12_340.0, Some(148.0)),
+            "Distance 12.34 km\nElevation 148 m"
+        );
+        assert_eq!(
+            hud_text(RenderLanguage::TraditionalChinese, 12_340.0, None),
+            "公里數 12.34 km\n海拔 -- m"
+        );
+    }
     #[test]
     fn web_mercator_matches_known_taiwan_coordinate() {
         let point = mercator(121.0, 25.0);
@@ -808,11 +884,45 @@ mod tests {
         let landscape = build_frame(&value, 0.5);
         assert!((landscape.view_span_y / landscape.view_span - 2160.0 / 3840.0).abs() < 1e-9);
         let center = landscape.view_center_mercator;
-        value.options.preview_center_mercator = Some([center[0] + 0.01, center[1] + 0.01]);
-        value.options.preview_zoom_level = Some(14.0);
-        let preview = build_frame(&value, 0.5);
+        let preview = build_frame_with_context(
+            &value,
+            0.5,
+            FrameBuildContext {
+                purpose: FramePurpose::EditorPreview,
+                center_override_mercator: Some([center[0] + 0.01, center[1] + 0.01]),
+            },
+        );
         assert_ne!(preview.view_center_mercator, landscape.view_center_mercator);
-        assert!(preview.view_span > landscape.view_span);
+        assert_eq!(preview.view_span, landscape.view_span);
+    }
+
+    #[test]
+    fn editor_preview_keeps_landmarks_visible_before_route_reveal() {
+        let mut value = scene();
+        let anchor = anchor_landmark_to_route(&value.track, 25.01, 121.01).unwrap();
+        value.landmarks.push(RouteLandmark {
+            id: "manual:editor".into(),
+            source: LandmarkSource::Manual,
+            source_id: None,
+            name: "Editor pin".into(),
+            category: None,
+            latitude: 25.01,
+            longitude: 121.01,
+            anchor_distance_m: anchor.anchor_distance_m,
+            anchor_progress: anchor.anchor_progress,
+            distance_from_route_m: anchor.distance_from_route_m,
+            enabled: true,
+            style: LandmarkStyle::default(),
+        });
+        let frame = build_frame_with_context(
+            &value,
+            0.0,
+            FrameBuildContext {
+                purpose: FramePurpose::EditorPreview,
+                center_override_mercator: None,
+            },
+        );
+        assert_eq!(frame.landmarks[0].pin_opacity, 1.0);
     }
 
     #[test]

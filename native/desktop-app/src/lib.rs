@@ -98,7 +98,7 @@ pub const fn default_nearby_online() -> bool {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            schema_version: 5,
+            schema_version: 6,
             language: UiLanguage::default(),
             settings: ExportSettings::default(),
             last_input_directory: None,
@@ -130,7 +130,7 @@ impl AppPreferences {
         };
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(mut value) => {
-                value.schema_version = 5;
+                value.schema_version = 6;
                 if value.cache_limit_bytes == 0 {
                     value.cache_limit_bytes = default_cache_limit_bytes();
                 }
@@ -451,7 +451,7 @@ mod tests {
         json.as_object_mut().unwrap().remove("nearby_radius_m");
         let value: AppPreferences = serde_json::from_value(json).unwrap();
         assert_eq!(value.nearby_radius_m, places_core::DEFAULT_RADIUS_M);
-        assert_eq!(value.schema_version, 5);
+        assert_eq!(value.schema_version, 6);
         assert_eq!(
             value.nearby_provider,
             places_core::NearbyProviderPreference::TomTomFirst

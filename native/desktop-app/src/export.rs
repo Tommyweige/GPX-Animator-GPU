@@ -139,9 +139,7 @@ where
     let textures =
         device.create_export_textures(request.settings.width, request.settings.height)?;
     let renderer = d3d11_renderer::D2dSceneRenderer::new(&device)?;
-    let gpu_tiles = if scene.options.map_style == scene_core::MapStyle::Transparent {
-        None
-    } else {
+    let gpu_tiles = {
         let mut keys = HashSet::new();
         let samples = request.settings.duration_seconds.clamp(1, 300);
         for i in 0..=samples {
@@ -262,6 +260,10 @@ where
             }
             Ok(decoded)
         })?;
+        let mut decoded = decoded;
+        for tile in &mut decoded {
+            d3d11_renderer::apply_map_color_transform(tile, scene.options.map_style);
+        }
         Some(renderer.prepare_tiles(decoded)?)
     };
     let mut config = EncoderConfig::four_k_60(request.settings.codec, request.settings.quality);
