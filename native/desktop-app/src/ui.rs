@@ -68,6 +68,11 @@ pub struct NativeApp {
     gpx_path: Option<PathBuf>,
     output_path: Option<PathBuf>,
     preview_progress: f64,
+    /// Temporary map inspection state. These values are copied into a cloned
+    /// SceneOptions for preview only and are never persisted or exported.
+    preview_inspecting: bool,
+    preview_center_mercator: Option<[f64; 2]>,
+    preview_zoom_level: Option<f64>,
     receiver: Option<Receiver<WorkerMessage>>,
     gpu_receiver: Option<Receiver<Result<nvenc_engine::GpuCapabilities, String>>>,
     active_token: Option<CancellationToken>,
@@ -83,6 +88,7 @@ pub struct NativeApp {
     preferences: AppPreferences,
     context_menu: Option<ContextMenuState>,
     nearby_dialog: Option<NearbyDialogState>,
+    candidate_place: Option<PlaceSummary>,
     landmarks: Vec<RouteLandmark>,
     project_path: Option<PathBuf>,
     project_warning: Option<String>,
@@ -266,6 +272,9 @@ impl NativeApp {
             gpx_path: None,
             output_path: None,
             preview_progress: 0.0,
+            preview_inspecting: false,
+            preview_center_mercator: None,
+            preview_zoom_level: None,
             receiver: None,
             gpu_receiver: Some(gpu_receiver),
             active_token: None,
@@ -281,6 +290,7 @@ impl NativeApp {
             preferences,
             context_menu: None,
             nearby_dialog: None,
+            candidate_place: None,
             landmarks: Vec::new(),
             project_path: None,
             project_warning: None,
@@ -318,6 +328,9 @@ impl NativeApp {
                 // Start every track at a deterministic visible camera; users
                 // can still choose Fit or Free after the route is displayed.
                 reset_camera_for_new_track(&mut self.model.settings.scene);
+                self.preview_inspecting = false;
+                self.preview_center_mercator = None;
+                self.preview_zoom_level = None;
                 self.output_path = Some(path.with_extension("mp4"));
                 self.gpx_path = Some(path);
                 self.track = Some(track);
@@ -453,9 +466,8 @@ impl NativeApp {
             return;
         };
         if let Some(landmark) = self.route_landmark_from_place(&place) {
-            let progress = landmark.anchor_progress;
             self.add_landmark(landmark);
-            self.preview_progress = progress;
+            self.candidate_place = None;
         } else {
             self.last_error = Some(if self.language == UiLanguage::English {
                 "This provider result has no matching open-data place; use Add custom route marker from the map."
@@ -502,7 +514,6 @@ impl NativeApp {
             enabled: true,
             style: LandmarkStyle::default(),
         });
-        self.preview_progress = anchor.anchor_progress;
     }
 
     fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
@@ -671,6 +682,7 @@ impl NativeApp {
     }
 
     fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate) {
+        self.candidate_place = None;
         self.next_places_request_id = self.next_places_request_id.wrapping_add(1);
         let request_id = self.next_places_request_id;
         self.nearby_dialog = Some(NearbyDialogState {
@@ -857,7 +869,7 @@ impl NativeApp {
         }
     }
 
-    #[allow(clippy::collapsible_else_if)]
+    #[allow(dead_code, clippy::collapsible_else_if)]
     fn draw_nearby_dialog(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.nearby_dialog.as_mut() else {
             return;
@@ -872,17 +884,12 @@ impl NativeApp {
             .iter()
             .map(|value| value.id.clone())
             .collect();
-        let screen = ctx.content_rect();
-        let position = egui::pos2(
-            (screen.right() - 440.0).max(8.0),
-            (screen.top() + 84.0).max(8.0),
-        );
         egui::Window::new(match language {
             UiLanguage::TraditionalChinese => "附近地點",
             UiLanguage::English => "Nearby places",
         })
         .id(egui::Id::new("nearby-places-window"))
-        .fixed_pos(position)
+        .fixed_pos(egui::pos2(0.0, 0.0))
         .default_size(egui::vec2(420.0, 520.0))
         .resizable(true)
         .collapsible(false)
@@ -1156,6 +1163,219 @@ impl NativeApp {
         }
     }
 
+    /// Render nearby search results in a real right-hand inspector.  The old
+    /// floating window is kept only as a compatibility shim for saved UI
+    /// state; this panel is the sole active entry point.
+    fn draw_nearby_panel(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.nearby_dialog.as_mut() else {
+            return;
+        };
+        let language = self.language;
+        let english = language == UiLanguage::English;
+        let landmark_ids: HashSet<String> = self
+            .landmarks
+            .iter()
+            .map(|value| value.id.clone())
+            .collect();
+        let mut close = false;
+        let mut retry = false;
+        let mut open_settings = false;
+        let mut add_index = None;
+        let mut preview_index: Option<usize> = None;
+        egui::SidePanel::right("nearby-places-inspector")
+            .resizable(true)
+            .default_width(400.0)
+            .min_width(340.0)
+            .max_width(560.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(if english {
+                        "Nearby places"
+                    } else {
+                        "附近地點"
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.small(if english {
+                    "Select a place to preview a pin, then add it to the route."
+                } else {
+                    "選取地點可預覽圖針；按加入後才會寫入路線。"
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(if english { "Coordinate" } else { "座標" });
+                    ui.monospace(format!(
+                        "{:.5}, {:.5}",
+                        dialog.coordinate.latitude, dialog.coordinate.longitude
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(if english { "Radius" } else { "半徑" });
+                    egui::ComboBox::from_id_salt("nearby-radius-docked")
+                        .selected_text(format!("{} m", self.preferences.nearby_radius_m))
+                        .show_ui(ui, |ui| {
+                            for radius in places_core::ALLOWED_RADII_M {
+                                ui.selectable_value(
+                                    &mut self.preferences.nearby_radius_m,
+                                    radius,
+                                    format!("{} m", radius),
+                                );
+                            }
+                        });
+                    if ui
+                        .button(if english { "Retry" } else { "重新搜尋" })
+                        .clicked()
+                    {
+                        retry = true;
+                    }
+                });
+                ui.separator();
+                if dialog.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(if english {
+                            "Searching providers…"
+                        } else {
+                            "正在搜尋地點…"
+                        });
+                    });
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                if !dialog.places.is_empty() {
+                    ui.small(match dialog.places.first().map(|place| place.provider) {
+                        Some(PlaceProvider::Google) => "Google · sorted by review count",
+                        Some(PlaceProvider::TomTom) => "TomTom · sorted by relevance/distance",
+                        Some(PlaceProvider::Foursquare) => "Foursquare · sorted by popularity",
+                        Some(PlaceProvider::OpenStreetMap) => "OpenStreetMap · sorted by distance",
+                        Some(PlaceProvider::Overture) => "Offline Overture · sorted by distance",
+                        Some(PlaceProvider::Gateway) => "Gateway provider",
+                        None => "",
+                    });
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, place) in dialog.places.iter().enumerate() {
+                            let source_tag = match place.provider {
+                                PlaceProvider::Overture => "overture",
+                                PlaceProvider::OpenStreetMap => "osm",
+                                _ => "provider",
+                            };
+                            let place_id = format!("{source_tag}:{}", place.id);
+                            let added = landmark_ids.contains(&place_id);
+                            ui.group(|ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.strong(format!("{}  {}", index + 1, place.name));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .button(if english { "Preview" } else { "預覽" })
+                                                .clicked()
+                                            {
+                                                preview_index = Some(index);
+                                            }
+                                            if added {
+                                                ui.label(if english {
+                                                    "Added"
+                                                } else {
+                                                    "已加入"
+                                                });
+                                            } else if ui
+                                                .button(if english {
+                                                    "Add pin"
+                                                } else {
+                                                    "加入圖針"
+                                                })
+                                                .clicked()
+                                            {
+                                                add_index = Some(index);
+                                            }
+                                        },
+                                    );
+                                });
+                                if let Some(category) = &place.category {
+                                    ui.small(category.replace('_', " "));
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(rating) = place.rating {
+                                        ui.label(format!("★ {rating:.1}"));
+                                    }
+                                    if place.review_count > 0 {
+                                        ui.label(format!("{} reviews", place.review_count));
+                                    }
+                                    if let Some(popularity) = place.popularity {
+                                        ui.label(format!("Popularity {:.0}%", popularity * 100.0));
+                                    }
+                                    ui.label(format!("{:.0} m", place.distance_m));
+                                });
+                                if let Some(address) = &place.address {
+                                    ui.small(address);
+                                }
+                                ui.hyperlink_to(
+                                    if english { "Open map" } else { "開啟地圖" },
+                                    &place.external_url,
+                                );
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+                if !dialog.loading && dialog.places.is_empty() && dialog.error.is_none() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(210, 150, 40),
+                        if english {
+                            "No local POI data. Download the offline pack from Settings."
+                        } else {
+                            "找不到離線 POI；請先到設定下載資料包。"
+                        },
+                    );
+                    if ui
+                        .button(if english {
+                            "Open Settings"
+                        } else {
+                            "開啟設定"
+                        })
+                        .clicked()
+                    {
+                        open_settings = true;
+                    }
+                }
+                if dialog.degraded {
+                    ui.small(if english {
+                        "Some providers were unavailable; fallback results are shown."
+                    } else {
+                        "部分資料來源無法使用，目前顯示 fallback 結果。"
+                    });
+                }
+                for attribution in &dialog.attribution {
+                    ui.small(attribution);
+                }
+            });
+        let coordinate = dialog.coordinate;
+        let candidate = preview_index.and_then(|index| dialog.places.get(index).cloned());
+        if close {
+            self.nearby_dialog = None;
+        } else if retry {
+            self.start_nearby_lookup(coordinate);
+        }
+        if let Some(index) = add_index {
+            self.add_place_from_dialog(index);
+        }
+        if let Some(place) = candidate {
+            self.candidate_place = Some(place);
+        }
+        if open_settings {
+            self.show_settings = true;
+        }
+    }
+
     fn start_export(&mut self) {
         let (Some(track), Some(output)) = (self.track.clone(), self.output_path.clone()) else {
             self.last_error = Some("請先載入 GPX 並選擇輸出檔案".into());
@@ -1285,6 +1505,13 @@ impl NativeApp {
     }
 
     fn draw_controls(&mut self, ctx: &egui::Context) {
+        // Free camera remains readable for old preference files, but it is no
+        // longer a valid export mode. Migrate it immediately to Follow.
+        if self.model.settings.scene.camera_mode == CameraMode::Free {
+            self.model.settings.scene.camera_mode = CameraMode::Follow;
+            self.model.settings.scene.free_camera_center = None;
+            self.model.settings.scene.camera_zoom = 1.0;
+        }
         if self.language == UiLanguage::English {
             self.draw_controls_english(ctx);
             return;
@@ -1411,12 +1638,21 @@ impl NativeApp {
                                 CameraMode::Follow,
                                 "跟隨標記",
                             );
-                            ui.selectable_value(
-                                &mut self.model.settings.scene.camera_mode,
-                                CameraMode::Free,
-                                "自由拖曳／縮放",
-                            );
                         });
+                    if self.model.settings.scene.camera_mode == CameraMode::Follow {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.model.settings.scene.follow_zoom_level,
+                                10.0..=20.0,
+                            )
+                            .step_by(0.25)
+                            .text("跟隨地圖縮放"),
+                        );
+                        ui.small(format!(
+                            "Zoom {:.2} · 滾輪保持跟隨模式",
+                            self.model.settings.scene.follow_zoom_level
+                        ));
+                    }
                     ui.add(
                         egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
                             .text("路線寬度 px"),
@@ -1660,7 +1896,7 @@ impl NativeApp {
                         .selected_text(match self.model.settings.scene.camera_mode {
                             CameraMode::Fit => "Fit route",
                             CameraMode::Follow => "Follow route",
-                            CameraMode::Free => "Free pan / zoom",
+                            CameraMode::Free => "Follow route",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
@@ -1673,12 +1909,21 @@ impl NativeApp {
                                 CameraMode::Follow,
                                 "Follow route",
                             );
-                            ui.selectable_value(
-                                &mut self.model.settings.scene.camera_mode,
-                                CameraMode::Free,
-                                "Free pan / zoom",
-                            );
                         });
+                    if self.model.settings.scene.camera_mode == CameraMode::Follow {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.model.settings.scene.follow_zoom_level,
+                                10.0..=20.0,
+                            )
+                            .step_by(0.25)
+                            .text("Follow map zoom"),
+                        );
+                        ui.small(format!(
+                            "Zoom {:.2} · wheel keeps Follow mode",
+                            self.model.settings.scene.follow_zoom_level
+                        ));
+                    }
                     ui.add(
                         egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
                             .text("Route width (px)"),
@@ -1848,6 +2093,11 @@ impl NativeApp {
                     ui.label("拖曳平移 · 滾輪縮放");
                 });
             }
+            if self.preview_inspecting && ui.button("Return to export view").clicked() {
+                self.preview_inspecting = false;
+                self.preview_center_mercator = None;
+                self.preview_zoom_level = None;
+            }
             let available = ui.available_size();
             let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
             let rect = response.rect;
@@ -1866,7 +2116,7 @@ impl NativeApp {
                 MapStyle::Satellite => egui::Color32::from_rgb(24, 28, 32),
                 MapStyle::Transparent => egui::Color32::from_gray(45),
             };
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 16, 20));
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(28, 34, 40));
             painter.rect_filled(frame_rect, 8.0, background);
             let Some(track) = &self.track else {
                 painter.text(
@@ -1881,27 +2131,54 @@ impl NativeApp {
                 );
                 return;
             };
+            let mut preview_options = self.model.settings.scene.clone();
+            preview_options.camera_viewport_width_px = frame_rect.width().max(1.0) as u32;
+            preview_options.camera_viewport_height_px = frame_rect.height().max(1.0) as u32;
+            preview_options.preview_center_mercator = self.preview_center_mercator;
+            preview_options.preview_zoom_level = self.preview_zoom_level;
+            let initial_scene = Scene {
+                track: track.clone(),
+                options: preview_options.clone(),
+                landmarks: self.landmarks.clone(),
+                route_duration_seconds: self.model.settings.duration_seconds as f64,
+            };
+            let initial_frame = build_frame(&initial_scene, self.preview_progress);
             if response.dragged() {
                 let delta = ctx.input(|input| input.pointer.delta());
-                apply_pan(
-                    &mut self.model.settings.scene,
-                    track,
-                    delta,
-                    frame_rect.size(),
-                );
+                if !self.preview_inspecting {
+                    self.preview_inspecting = true;
+                    self.preview_center_mercator = Some(initial_frame.view_center_mercator);
+                    self.preview_zoom_level = Some(self.model.settings.scene.follow_zoom_level);
+                }
+                if let Some(center) = &mut self.preview_center_mercator {
+                    center[0] -= delta.x as f64 / frame_rect.width().max(1.0) as f64
+                        * initial_frame.view_span;
+                    center[1] += delta.y as f64 / frame_rect.height().max(1.0) as f64
+                        * initial_frame.view_span_y;
+                }
             }
             if response.hovered() {
                 let scroll = ctx.input(|input| input.smooth_scroll_delta.y);
                 if scroll.abs() > 0.0 {
-                    self.model.settings.scene.camera_mode = CameraMode::Free;
-                    self.model.settings.scene.camera_zoom = (self.model.settings.scene.camera_zoom
-                        * (scroll as f64 * 0.002).exp())
-                    .clamp(0.25, 64.0);
+                    let factor = (scroll as f64 * 0.002).exp();
+                    if self.preview_inspecting {
+                        let zoom = self
+                            .preview_zoom_level
+                            .unwrap_or(self.model.settings.scene.follow_zoom_level);
+                        self.preview_zoom_level =
+                            Some((zoom + factor.ln() / 0.12).clamp(10.0, 20.0));
+                    } else if self.model.settings.scene.camera_mode == CameraMode::Follow {
+                        self.model.settings.scene.follow_zoom_level =
+                            (self.model.settings.scene.follow_zoom_level + factor.ln() / 0.12)
+                                .clamp(10.0, 20.0);
+                    }
                 }
             }
+            preview_options.preview_center_mercator = self.preview_center_mercator;
+            preview_options.preview_zoom_level = self.preview_zoom_level;
             let scene = Scene {
                 track: track.clone(),
-                options: self.model.settings.scene.clone(),
+                options: preview_options,
                 landmarks: self.landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
@@ -1923,10 +2200,15 @@ impl NativeApp {
                     },
                 });
             }
-            let zoom = d3d11_renderer::tile_zoom(frame.view_span, frame_rect.width() as u32);
-            let keys = d3d11_renderer::required_view_tiles(
+            let zoom = d3d11_renderer::tile_zoom_rect(
+                frame.view_span,
+                frame.view_span_y,
+                frame_rect.width() as u32,
+            );
+            let keys = d3d11_renderer::required_view_tiles_rect(
                 frame.view_center_mercator,
                 frame.view_span,
+                frame.view_span_y,
                 zoom,
             );
             self.request_tiles(ctx, &keys);
@@ -1942,7 +2224,7 @@ impl NativeApp {
                                     * frame_rect.width()
                                     * 0.5,
                             frame_rect.center().y
-                                - (-(y - frame.view_center_mercator[1]) * 2.0 / frame.view_span)
+                                - (-(y - frame.view_center_mercator[1]) * 2.0 / frame.view_span_y)
                                     as f32
                                     * frame_rect.height()
                                     * 0.5,
@@ -2013,27 +2295,32 @@ impl NativeApp {
                     alpha,
                 );
                 let radius = 18.0 * landmark_scale * landmark.pin_scale.max(0.2);
+                let body = point + egui::vec2(0.0, -radius * 0.78);
                 painter.circle_filled(
-                    point + egui::vec2(6.0 * landmark_scale, 9.0 * landmark_scale),
+                    body + egui::vec2(6.0 * landmark_scale, 9.0 * landmark_scale),
                     radius * 1.08,
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, (alpha as f32 * 0.45) as u8),
                 );
                 painter.line_segment(
-                    [
-                        point + egui::vec2(0.0, radius * 0.55),
-                        point + egui::vec2(0.0, 27.0 * landmark_scale),
-                    ],
-                    egui::Stroke::new(5.0 * landmark_scale, color),
+                    [body + egui::vec2(0.0, radius * 0.65), point],
+                    egui::Stroke::new(
+                        radius * 1.15,
+                        egui::Color32::from_rgba_unmultiplied(255, 246, 218, alpha),
+                    ),
                 );
                 painter.circle_filled(
-                    point,
+                    body,
                     radius,
                     egui::Color32::from_rgba_unmultiplied(255, 246, 218, alpha),
                 );
-                painter.circle_filled(point, radius * 0.66, color);
+                painter.line_segment(
+                    [body + egui::vec2(0.0, radius * 0.65), point],
+                    egui::Stroke::new(radius * 0.82, color),
+                );
+                painter.circle_filled(body, radius * 0.66, color);
                 if landmark.pulse_progress > 0.0 {
                     painter.circle_stroke(
-                        point,
+                        body,
                         radius * (1.25 + landmark.pulse_progress * 0.7),
                         egui::Stroke::new(
                             2.0 * landmark_scale,
@@ -2060,7 +2347,7 @@ impl NativeApp {
                     } else {
                         point.x - 28.0 * landmark_scale - label_width
                     };
-                    let top = point.y - label_height - 18.0 * landmark_scale;
+                    let top = body.y - label_height - 18.0 * landmark_scale;
                     let rect = egui::Rect::from_min_size(
                         egui::pos2(left, top),
                         egui::vec2(label_width, label_height),
@@ -2088,6 +2375,34 @@ impl NativeApp {
                         label,
                         egui::FontId::proportional(28.0 * landmark_scale),
                         egui::Color32::from_rgba_unmultiplied(255, 248, 230, label_alpha),
+                    );
+                }
+            }
+            if let Some(candidate) = &self.candidate_place {
+                let projected =
+                    scene_core::geo_to_mercator(candidate.latitude, candidate.longitude);
+                let ndc = [
+                    ((projected[0] - frame.view_center_mercator[0]) * 2.0 / frame.view_span) as f32,
+                    (-(projected[1] - frame.view_center_mercator[1]) * 2.0 / frame.view_span_y)
+                        as f32,
+                ];
+                if ndc[0].abs() <= 1.15 && ndc[1].abs() <= 1.15 {
+                    let point = to_screen(ndc);
+                    let radius = (16.0 * landmark_scale).max(8.0);
+                    let blue = egui::Color32::from_rgb(92, 190, 255);
+                    painter.line_segment(
+                        [point + egui::vec2(0.0, -radius * 0.25), point],
+                        egui::Stroke::new(radius * 0.65, blue),
+                    );
+                    painter.circle_stroke(
+                        point + egui::vec2(0.0, -radius * 0.75),
+                        radius,
+                        egui::Stroke::new(3.0 * landmark_scale, blue),
+                    );
+                    painter.circle_filled(
+                        point + egui::vec2(0.0, -radius * 0.75),
+                        radius * 0.30,
+                        egui::Color32::from_rgba_unmultiplied(92, 190, 255, 170),
                     );
                 }
             }
@@ -2667,6 +2982,8 @@ impl NativeApp {
         let mut current = self.preferences.clone();
         current.language = self.language;
         current.settings = self.model.settings.clone();
+        current.settings.scene.preview_center_mercator = None;
+        current.settings.scene.preview_zoom_level = None;
         current.cache_limit_bytes = current.settings.cache_limit_bytes;
         current.gateway_base_url = (!self.gateway_url_input.trim().is_empty())
             .then(|| self.gateway_url_input.trim().to_owned());
@@ -2699,9 +3016,9 @@ impl eframe::App for NativeApp {
         self.poll_tiles(ctx);
         self.draw_header(ctx);
         self.draw_controls(ctx);
+        self.draw_nearby_panel(ctx);
         self.draw_preview(ctx);
         self.draw_context_menu(ctx);
-        self.draw_nearby_dialog(ctx);
         self.draw_custom_landmark_dialog(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
@@ -2712,6 +3029,7 @@ impl eframe::App for NativeApp {
     }
 }
 
+#[allow(dead_code)]
 fn apply_pan(
     options: &mut scene_core::SceneOptions,
     track: &Track,
@@ -2755,6 +3073,9 @@ fn apply_pan(
 fn reset_camera_for_new_track(options: &mut scene_core::SceneOptions) {
     options.camera_mode = CameraMode::Follow;
     options.free_camera_center = None;
+    options.preview_center_mercator = None;
+    options.preview_zoom_level = None;
+    options.follow_zoom_level = scene_core::default_follow_zoom_level();
     options.camera_zoom = 1.0;
 }
 

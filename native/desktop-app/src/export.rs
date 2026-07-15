@@ -126,9 +126,12 @@ where
     };
     progress(update(ExportStage::Preflight, 0, 0.0, 0.0));
     token.check().map_err(|_| ExportError::Cancelled)?;
+    let mut scene_options = request.settings.scene.clone();
+    scene_options.camera_viewport_width_px = request.settings.width;
+    scene_options.camera_viewport_height_px = request.settings.height;
     let scene = Scene {
         track: request.track,
-        options: request.settings.scene.clone(),
+        options: scene_options,
         landmarks: request.landmarks,
         route_duration_seconds: request.settings.duration_seconds as f64,
     };
@@ -144,10 +147,15 @@ where
         for i in 0..=samples {
             token.check().map_err(|_| ExportError::Cancelled)?;
             let frame = build_frame(&scene, i as f64 / samples as f64);
-            let zoom = d3d11_renderer::tile_zoom(frame.view_span, request.settings.width);
-            keys.extend(d3d11_renderer::required_view_tiles(
+            let zoom = d3d11_renderer::tile_zoom_rect(
+                frame.view_span,
+                frame.view_span_y,
+                request.settings.width,
+            );
+            keys.extend(d3d11_renderer::required_view_tiles_rect(
                 frame.view_center_mercator,
                 frame.view_span,
+                frame.view_span_y,
                 zoom,
             ));
         }
@@ -164,10 +172,15 @@ where
                 let linear = index as f64 / transition_frames.max(1) as f64;
                 let smooth = linear * linear * linear * (linear * (linear * 6.0 - 15.0) + 10.0);
                 let frame = blend_frames(&follow, &fit, smooth);
-                let zoom = d3d11_renderer::tile_zoom(frame.view_span, request.settings.width);
-                keys.extend(d3d11_renderer::required_view_tiles(
+                let zoom = d3d11_renderer::tile_zoom_rect(
+                    frame.view_span,
+                    frame.view_span_y,
+                    request.settings.width,
+                );
+                keys.extend(d3d11_renderer::required_view_tiles_rect(
                     frame.view_center_mercator,
                     frame.view_span,
+                    frame.view_span_y,
                     zoom,
                 ));
             }

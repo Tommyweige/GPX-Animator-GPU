@@ -55,23 +55,40 @@ pub fn tile_zoom(view_span: f64, output_width: u32) -> u8 {
 }
 
 pub fn required_view_tiles(center: [f64; 2], span: f64, zoom: u8) -> Vec<TileKey> {
+    required_view_tiles_rect(center, span, span, zoom)
+}
+
+/// Return the tiles covering an aspect-correct view.  `span_x` and `span_y`
+/// are normalized Web Mercator world widths; keeping them separate avoids
+/// missing the top/bottom rows in portrait exports.
+pub fn required_view_tiles_rect(
+    center: [f64; 2],
+    span_x: f64,
+    span_y: f64,
+    zoom: u8,
+) -> Vec<TileKey> {
     let n = 1u32 << zoom;
-    let half = span * 0.5;
-    let x0 = ((center[0] - half) * n as f64)
+    let half_x = span_x.max(1e-9) * 0.5;
+    let half_y = span_y.max(1e-9) * 0.5;
+    let x0 = ((center[0] - half_x) * n as f64)
         .floor()
         .clamp(0.0, (n - 1) as f64) as u32;
-    let x1 = ((center[0] + half) * n as f64)
+    let x1 = ((center[0] + half_x) * n as f64)
         .floor()
         .clamp(0.0, (n - 1) as f64) as u32;
-    let y0 = ((center[1] - half) * n as f64)
+    let y0 = ((center[1] - half_y) * n as f64)
         .floor()
         .clamp(0.0, (n - 1) as f64) as u32;
-    let y1 = ((center[1] + half) * n as f64)
+    let y1 = ((center[1] + half_y) * n as f64)
         .floor()
         .clamp(0.0, (n - 1) as f64) as u32;
     (y0..=y1)
         .flat_map(|y| (x0..=x1).map(move |x| TileKey { zoom, x, y }))
         .collect()
+}
+
+pub fn tile_zoom_rect(span_x: f64, span_y: f64, output_width: u32) -> u8 {
+    tile_zoom(span_x.max(span_y), output_width)
 }
 
 /// Select one complete tile level for a frame. Mixing parent and child tiles
@@ -91,23 +108,28 @@ pub fn complete_tile_zoom(
     })
 }
 
-/// Return a usable single zoom even when a network/cache failure leaves a
-/// level incomplete. The caller still draws one level only, so it cannot
-/// create the colour seams caused by mixing satellite generations.
-fn fallback_tile_zoom(
+fn fallback_tile_zoom_rect(
     available: &HashSet<TileKey>,
     center: [f64; 2],
-    span: f64,
+    span_x: f64,
+    span_y: f64,
     output_width: u32,
 ) -> Option<u8> {
-    let preferred = tile_zoom(span, output_width);
-    complete_tile_zoom(available, center, span, output_width).or_else(|| {
-        (2..=preferred).rev().find(|&zoom| {
-            required_view_tiles(center, span, zoom)
+    let preferred = tile_zoom_rect(span_x, span_y, output_width);
+    (2..=preferred)
+        .rev()
+        .find(|&zoom| {
+            required_view_tiles_rect(center, span_x, span_y, zoom)
                 .iter()
-                .any(|key| available.contains(key))
+                .all(|key| available.contains(key))
         })
-    })
+        .or_else(|| {
+            (2..=preferred).rev().find(|&zoom| {
+                required_view_tiles_rect(center, span_x, span_y, zoom)
+                    .iter()
+                    .any(|key| available.contains(key))
+            })
+        })
 }
 
 pub struct TileDiskCache {
@@ -817,10 +839,11 @@ impl D2dSceneRenderer {
             && let Some(tiles) = tiles
         {
             let available: HashSet<_> = tiles.tiles.keys().copied().collect();
-            let selected_zoom = fallback_tile_zoom(
+            let selected_zoom = fallback_tile_zoom_rect(
                 &available,
                 frame.view_center_mercator,
                 frame.view_span,
+                frame.view_span_y,
                 width,
             );
             for (key, tile) in tiles
@@ -832,7 +855,7 @@ impl D2dSceneRenderer {
                 let map = |x: f64, y: f64| {
                     (
                         (x - frame.view_center_mercator[0]) * 2.0 / frame.view_span,
-                        -(y - frame.view_center_mercator[1]) * 2.0 / frame.view_span,
+                        -(y - frame.view_center_mercator[1]) * 2.0 / frame.view_span_y,
                     )
                 };
                 let (a, b) = map(key.x as f64 / n, key.y as f64 / n);
@@ -977,30 +1000,31 @@ impl D2dSceneRenderer {
                 let point = to_pixel(landmark.ndc);
                 let scale = reference_scale * landmark.pin_scale.max(0.2);
                 let radius = 18.0 * scale;
+                let body = Vector2 {
+                    X: point.X,
+                    Y: point.Y - radius * 0.78,
+                };
                 let opacity = landmark.pin_opacity.clamp(0.0, 1.0);
                 let shadow = D2D1_ELLIPSE {
                     point: Vector2 {
-                        X: point.X + 6.0 * reference_scale,
-                        Y: point.Y + 9.0 * reference_scale,
+                        X: body.X + 6.0 * reference_scale,
+                        Y: body.Y + 9.0 * reference_scale,
                     },
                     radiusX: radius * 1.10,
                     radiusY: radius * 0.78,
                 };
                 let stem_start = Vector2 {
-                    X: point.X,
-                    Y: point.Y + radius * 0.55,
+                    X: body.X,
+                    Y: body.Y + radius * 0.65,
                 };
-                let stem_end = Vector2 {
-                    X: point.X,
-                    Y: point.Y + 27.0 * reference_scale,
-                };
+                let stem_end = point;
                 let outer = D2D1_ELLIPSE {
-                    point,
+                    point: body,
                     radiusX: radius,
                     radiusY: radius,
                 };
                 let inner = D2D1_ELLIPSE {
-                    point,
+                    point: body,
                     radiusX: radius * 0.66,
                     radiusY: radius * 0.66,
                 };
@@ -1044,27 +1068,17 @@ impl D2dSceneRenderer {
                 unsafe {
                     if landmark.pulse_progress > 0.0 {
                         let pulse = D2D1_ELLIPSE {
-                            point,
+                            point: body,
                             radiusX: radius * (1.25 + landmark.pulse_progress * 0.7),
                             radiusY: radius * (1.25 + landmark.pulse_progress * 0.7),
                         };
                         self.context.FillEllipse(&pulse, &pulse_brush);
                     }
                     self.context.FillEllipse(&shadow, &shadow_brush);
-                    self.context.DrawLine(
-                        stem_start,
-                        stem_end,
-                        &shadow_brush,
-                        8.0 * reference_scale,
-                        None,
-                    );
-                    self.context.DrawLine(
-                        stem_start,
-                        stem_end,
-                        &pin_brush,
-                        4.0 * reference_scale,
-                        None,
-                    );
+                    self.context
+                        .DrawLine(stem_start, stem_end, &outer_brush, radius * 1.15, None);
+                    self.context
+                        .DrawLine(stem_start, stem_end, &pin_brush, radius * 0.82, None);
                     self.context.FillEllipse(&outer, &outer_brush);
                     self.context.FillEllipse(&inner, &pin_brush);
                 }
@@ -1082,7 +1096,7 @@ impl D2dSceneRenderer {
                     } else {
                         point.X - 28.0 * label_scale - label_width
                     };
-                    let top = point.Y - label_height - 18.0 * label_scale;
+                    let top = body.Y - label_height - 18.0 * label_scale;
                     let rect = D2D_RECT_F {
                         left,
                         top,
@@ -1490,6 +1504,15 @@ mod tests {
         let mut unique = std::collections::HashSet::new();
         assert!(tiles.iter().all(|tile| unique.insert(*tile)));
         assert!(tiles.iter().all(|tile| tile.zoom == 10));
+    }
+
+    #[test]
+    fn aspect_correct_tile_query_covers_taller_view() {
+        let center = [0.5, 0.5];
+        let tiles = required_view_tiles_rect(center, 0.01, 0.02, 10);
+        assert!(tiles.iter().any(|tile| tile.y < (0.5 * 1024.0) as u32));
+        assert!(tiles.iter().any(|tile| tile.y > (0.5 * 1024.0) as u32));
+        assert!(tile_zoom_rect(0.01, 0.02, 3840) <= tile_zoom(0.01, 3840));
     }
     #[test]
     fn frame_uses_one_complete_zoom_instead_of_mixing_tile_levels() {

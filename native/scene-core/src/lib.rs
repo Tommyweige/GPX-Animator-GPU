@@ -101,6 +101,7 @@ pub struct LandmarkFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SceneOptions {
     pub aspect: Aspect,
     pub map_style: MapStyle,
@@ -111,7 +112,38 @@ pub struct SceneOptions {
     pub show_hud: bool,
     pub show_elevation: bool,
     pub free_camera_center: Option<[f64; 2]>,
+    /// Web Mercator zoom level used by the Follow export camera.  This is a
+    /// tile zoom, not the old relative fit multiplier.
+    #[serde(default = "default_follow_zoom_level")]
+    pub follow_zoom_level: f64,
+    /// Pixel dimensions used to turn a Web Mercator zoom into a visible world
+    /// span.  Export sets these to the output dimensions; the preview sets
+    /// them to its aspect-correct frame dimensions.
+    #[serde(default = "default_camera_viewport_width")]
+    pub camera_viewport_width_px: u32,
+    #[serde(default = "default_camera_viewport_height")]
+    pub camera_viewport_height_px: u32,
+    /// Temporary preview-only camera overrides.  Export code always leaves
+    /// these as `None`, so desktop inspection cannot leak into the MP4.
+    #[serde(default)]
+    pub preview_center_mercator: Option<[f64; 2]>,
+    #[serde(default)]
+    pub preview_zoom_level: Option<f64>,
+    /// Legacy relative zoom retained only for migration of old project files.
+    /// New Follow/preview code does not use it.
     pub camera_zoom: f64,
+}
+
+pub const fn default_follow_zoom_level() -> f64 {
+    15.0
+}
+
+pub const fn default_camera_viewport_width() -> u32 {
+    3840
+}
+
+pub const fn default_camera_viewport_height() -> u32 {
+    2160
 }
 
 impl Default for SceneOptions {
@@ -126,6 +158,11 @@ impl Default for SceneOptions {
             show_hud: true,
             show_elevation: true,
             free_camera_center: None,
+            follow_zoom_level: default_follow_zoom_level(),
+            camera_viewport_width_px: default_camera_viewport_width(),
+            camera_viewport_height_px: default_camera_viewport_height(),
+            preview_center_mercator: None,
+            preview_zoom_level: None,
             camera_zoom: 1.0,
         }
     }
@@ -142,7 +179,10 @@ pub struct Scene {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FramePlan {
     pub view_center_mercator: [f64; 2],
+    /// Horizontal and vertical world spans.  Keeping them separate prevents
+    /// the route from stretching when the output is not square.
     pub view_span: f64,
+    pub view_span_y: f64,
     pub route_ndc: Vec<[f32; 2]>,
     pub completed_points: usize,
     pub marker_ndc: [f32; 2],
@@ -236,6 +276,25 @@ fn ease_out_back(value: f64) -> f32 {
     (1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)) as f32
 }
 
+fn friendly_category(value: &str) -> String {
+    let normalized = value.trim().replace('_', " ").to_ascii_lowercase();
+    let label = match normalized.as_str() {
+        "travel services" => "Travel services",
+        "sporting goods" => "Sporting goods",
+        "restaurant" => "Restaurant",
+        "cafe" | "coffee shop" => "Cafe",
+        "accommodation" | "hotel" => "Accommodation",
+        "park" => "Park",
+        "religious organization" => "Religious place",
+        "fuel" | "gas station" => "Fuel station",
+        "supermarket" | "grocery" => "Grocery",
+        "museum" => "Museum",
+        "viewpoint" => "Viewpoint",
+        _ => value.trim(),
+    };
+    label.to_owned()
+}
+
 fn landmark_frame(
     landmark: &RouteLandmark,
     ndc: [f32; 2],
@@ -266,7 +325,7 @@ fn landmark_frame(
         },
         label_side: 1,
         name: landmark.name.clone(),
-        category: landmark.category.clone(),
+        category: landmark.category.as_deref().map(friendly_category),
         color: landmark.style.pin_color,
         show_label: landmark.style.show_label,
     }
@@ -277,6 +336,22 @@ fn mercator(lon: f64, lat: f64) -> [f64; 2] {
     let sin = lat.clamp(-85.051_128_78, 85.051_128_78).to_radians().sin();
     let y = 0.5 - ((1.0 + sin) / (1.0 - sin)).ln() / (4.0 * std::f64::consts::PI);
     [x, y]
+}
+
+pub fn geo_to_mercator(latitude: f64, longitude: f64) -> [f64; 2] {
+    mercator(longitude, latitude)
+}
+
+/// Convert normalized Web Mercator coordinates back to WGS84.  This is
+/// public so the desktop preview can keep temporary pan state without
+/// changing the persisted export camera.
+pub fn mercator_to_geo(point: [f64; 2]) -> [f64; 2] {
+    let longitude = point[0] * 360.0 - 180.0;
+    let latitude = ((std::f64::consts::PI * (1.0 - 2.0 * point[1])).sinh())
+        .atan()
+        .to_degrees()
+        .clamp(-85.051_128_78, 85.051_128_78);
+    [latitude, longitude]
 }
 
 /// Convert a pixel in the preview frame back to a WGS84 coordinate.  The
@@ -296,13 +371,15 @@ pub fn screen_point_to_geo(
         || !point_px.iter().all(|value| value.is_finite())
         || !frame.view_span.is_finite()
         || frame.view_span <= 0.0
+        || !frame.view_span_y.is_finite()
+        || frame.view_span_y <= 0.0
     {
         return None;
     }
     let ndc_x = point_px[0] as f64 / width as f64 * 2.0 - 1.0;
     let ndc_y = 1.0 - point_px[1] as f64 / height as f64 * 2.0;
     let x = frame.view_center_mercator[0] + ndc_x * frame.view_span * 0.5;
-    let y = frame.view_center_mercator[1] - ndc_y * frame.view_span * 0.5;
+    let y = frame.view_center_mercator[1] - ndc_y * frame.view_span_y * 0.5;
     if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
         return None;
     }
@@ -342,13 +419,41 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
         },
     );
     let fit_center = [(min_x + max_x) * 0.5, (min_y + max_y) * 0.5];
-    let fit_span = (max_x - min_x).max(max_y - min_y).max(1e-12) * 1.20;
+    let viewport_width = scene.options.camera_viewport_width_px.max(1) as f64;
+    let viewport_height = scene.options.camera_viewport_height_px.max(1) as f64;
+    let aspect_height_over_width = viewport_height / viewport_width;
+    let fit_span = (max_x - min_x)
+        .max((max_y - min_y) / aspect_height_over_width.max(1e-9))
+        .max(1e-12)
+        * 1.20;
+    let fit_span_y = fit_span * aspect_height_over_width;
+    let follow_span =
+        viewport_width / (256.0 * 2.0_f64.powf(scene.options.follow_zoom_level.clamp(2.0, 20.0)));
+    let follow_span = follow_span.clamp(1e-9, 1.0);
+    let follow_span_y = follow_span * aspect_height_over_width;
     let sample = sample_distance(&scene.track, progress);
-    let (center, span) = match scene.options.camera_mode {
-        CameraMode::Fit => (fit_center, fit_span),
+    let (center, span, span_y) = match scene.options.camera_mode {
+        CameraMode::Fit => (fit_center, fit_span, fit_span_y),
         CameraMode::Follow => (
-            mercator(sample.lon, sample.lat),
-            fit_span / scene.options.camera_zoom.max(2.5),
+            scene
+                .options
+                .preview_center_mercator
+                .unwrap_or_else(|| mercator(sample.lon, sample.lat)),
+            scene
+                .options
+                .preview_zoom_level
+                .map_or(follow_span, |zoom| {
+                    (viewport_width / (256.0 * 2.0_f64.powf(zoom.clamp(2.0, 20.0))))
+                        .clamp(1e-9, 1.0)
+                }),
+            scene
+                .options
+                .preview_zoom_level
+                .map_or(follow_span_y, |zoom| {
+                    (viewport_width / (256.0 * 2.0_f64.powf(zoom.clamp(2.0, 20.0))))
+                        .clamp(1e-9, 1.0)
+                        * aspect_height_over_width
+                }),
         ),
         CameraMode::Free => {
             let center = scene
@@ -359,13 +464,14 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
             (
                 center,
                 fit_span / scene.options.camera_zoom.clamp(0.25, 64.0),
+                fit_span_y / scene.options.camera_zoom.clamp(0.25, 64.0),
             )
         }
     };
     let to_ndc = |value: [f64; 2]| {
         [
             ((value[0] - center[0]) * 2.0 / span) as f32,
-            (-(value[1] - center[1]) * 2.0 / span) as f32,
+            (-(value[1] - center[1]) * 2.0 / span_y) as f32,
         ]
     };
     let route_ndc: Vec<_> = projected.into_iter().map(to_ndc).collect();
@@ -414,6 +520,7 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
     FramePlan {
         view_center_mercator: center,
         view_span: span,
+        view_span_y: span_y,
         route_ndc,
         completed_points,
         marker_ndc,
@@ -433,19 +540,21 @@ pub fn blend_frames(from: &FramePlan, to: &FramePlan, amount: f64) -> FramePlan 
         lerp(from.view_center_mercator[1], to.view_center_mercator[1]),
     ];
     let span = lerp(from.view_span, to.view_span);
+    let span_y = lerp(from.view_span_y, to.view_span_y);
     let convert = |point: [f32; 2], source: &FramePlan| {
         let world = [
             source.view_center_mercator[0] + point[0] as f64 * source.view_span * 0.5,
-            source.view_center_mercator[1] - point[1] as f64 * source.view_span * 0.5,
+            source.view_center_mercator[1] - point[1] as f64 * source.view_span_y * 0.5,
         ];
         [
             ((world[0] - center[0]) * 2.0 / span) as f32,
-            (-(world[1] - center[1]) * 2.0 / span) as f32,
+            (-(world[1] - center[1]) * 2.0 / span_y) as f32,
         ]
     };
     FramePlan {
         view_center_mercator: center,
         view_span: span,
+        view_span_y: span_y,
         route_ndc: from.route_ndc.iter().map(|&p| convert(p, from)).collect(),
         completed_points: to.completed_points,
         marker_ndc: convert(from.marker_ndc, from),
@@ -558,6 +667,14 @@ mod tests {
         assert_eq!(value.map_style, MapStyle::Satellite);
         assert_eq!(value.camera_mode, CameraMode::Follow);
         assert_eq!(value.line_width_px, 8.0);
+        assert_eq!(value.follow_zoom_level, 15.0);
+        assert_eq!(
+            (
+                value.camera_viewport_width_px,
+                value.camera_viewport_height_px
+            ),
+            (3840, 2160)
+        );
     }
     #[test]
     fn web_mercator_matches_known_taiwan_coordinate() {
@@ -654,6 +771,23 @@ mod tests {
     }
 
     #[test]
+    fn follow_zoom_is_aspect_correct_and_preview_center_is_temporary() {
+        let mut value = scene();
+        value.options.camera_mode = CameraMode::Follow;
+        value.options.follow_zoom_level = 15.0;
+        value.options.camera_viewport_width_px = 3840;
+        value.options.camera_viewport_height_px = 2160;
+        let landscape = build_frame(&value, 0.5);
+        assert!((landscape.view_span_y / landscape.view_span - 2160.0 / 3840.0).abs() < 1e-9);
+        let center = landscape.view_center_mercator;
+        value.options.preview_center_mercator = Some([center[0] + 0.01, center[1] + 0.01]);
+        value.options.preview_zoom_level = Some(14.0);
+        let preview = build_frame(&value, 0.5);
+        assert_ne!(preview.view_center_mercator, landscape.view_center_mercator);
+        assert!(preview.view_span > landscape.view_span);
+    }
+
+    #[test]
     fn landmark_anchor_keeps_real_coordinate_and_finds_route_progress() {
         let value = scene();
         let anchor = anchor_landmark_to_route(&value.track, 25.005, 121.005).unwrap();
@@ -684,6 +818,7 @@ mod tests {
         assert_eq!(before.landmarks[0].pin_opacity, 0.0);
         let visible = build_frame(&value, anchor.anchor_progress + 0.02);
         assert!(visible.landmarks[0].pin_opacity > 0.0);
+        assert_eq!(visible.landmarks[0].category.as_deref(), Some("Park"));
         let final_frame = build_frame(&value, 1.0);
         assert_eq!(final_frame.landmarks[0].pin_opacity, 1.0);
         assert_eq!(final_frame.landmarks[0].label_opacity, 0.0);
