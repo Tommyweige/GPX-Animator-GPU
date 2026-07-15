@@ -1,7 +1,7 @@
 use crate::{
     AppModel, AppPreferences, Diagnostics, ExportOutcome, ExportProgress, ExportRequest,
-    ExportSettings, JobState, UiLanguage, detect_gpu_capabilities, load_gpx_file,
-    run_native_export,
+    ExportSettings, JobState, UiLanguage, UiLayoutPreferences, detect_gpu_capabilities,
+    load_gpx_file, run_native_export,
 };
 use eframe::egui;
 use gpx_core::{ParseOptions, Track};
@@ -86,6 +86,7 @@ pub struct NativeApp {
     language: UiLanguage,
     show_settings: bool,
     preferences: AppPreferences,
+    layout: UiLayoutPreferences,
     context_menu: Option<ContextMenuState>,
     nearby_dialog: Option<NearbyDialogState>,
     candidate_place: Option<PlaceSummary>,
@@ -287,6 +288,7 @@ impl NativeApp {
             preview_map_style,
             language: preferences.language,
             show_settings: false,
+            layout: preferences.ui_layout.clone(),
             preferences,
             context_menu: None,
             nearby_dialog: None,
@@ -521,12 +523,6 @@ impl NativeApp {
             return;
         }
         let english = self.language == UiLanguage::English;
-        ui.separator();
-        ui.heading(if english {
-            "03  Route places"
-        } else {
-            "03  沿途地點"
-        });
         ui.small(if english {
             "Markers appear when the route reaches them and remain on the final fit view."
         } else {
@@ -1182,12 +1178,16 @@ impl NativeApp {
         let mut open_settings = false;
         let mut add_index = None;
         let mut preview_index: Option<usize> = None;
-        egui::SidePanel::right("nearby-places-inspector")
+        let available_width = ctx.available_rect().width().max(0.0);
+        let min_width = 300.0_f32;
+        let (preferred_width, max_width) =
+            nearby_panel_widths(available_width, self.layout.nearby_panel_width);
+        let panel_response = egui::SidePanel::right("nearby-places-inspector")
             .resizable(true)
-            .default_width(400.0)
-            .min_width(340.0)
-            .max_width(560.0)
+            .default_width(preferred_width)
+            .width_range(min_width..=max_width)
             .show(ctx, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.heading(if english {
                         "Nearby places"
@@ -1271,35 +1271,25 @@ impl NativeApp {
                             let added = landmark_ids.contains(&place_id);
                             ui.group(|ui| {
                                 ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.strong(format!("{}  {}", index + 1, place.name));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .button(if english { "Preview" } else { "預覽" })
-                                                .clicked()
-                                            {
-                                                preview_index = Some(index);
-                                            }
-                                            if added {
-                                                ui.label(if english {
-                                                    "Added"
-                                                } else {
-                                                    "已加入"
-                                                });
-                                            } else if ui
-                                                .button(if english {
-                                                    "Add pin"
-                                                } else {
-                                                    "加入圖針"
-                                                })
-                                                .clicked()
-                                            {
-                                                add_index = Some(index);
-                                            }
-                                        },
-                                    );
+                                ui.add(
+                                    egui::Label::new(format!("{}  {}", index + 1, place.name))
+                                        .truncate(),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .button(if english { "Preview" } else { "預覽" })
+                                        .clicked()
+                                    {
+                                        preview_index = Some(index);
+                                    }
+                                    if added {
+                                        ui.label(if english { "Added" } else { "已加入" });
+                                    } else if ui
+                                        .button(if english { "Add pin" } else { "加入圖針" })
+                                        .clicked()
+                                    {
+                                        add_index = Some(index);
+                                    }
                                 });
                                 if let Some(category) = &place.category {
                                     ui.small(category.replace('_', " "));
@@ -1358,6 +1348,10 @@ impl NativeApp {
                     ui.small(attribution);
                 }
             });
+        let measured_width = panel_response.response.rect.width();
+        if measured_width.is_finite() && measured_width >= min_width {
+            self.layout.nearby_panel_width = measured_width.clamp(min_width, max_width);
+        }
         let coordinate = dialog.coordinate;
         let candidate = preview_index.and_then(|index| dialog.places.get(index).cloned());
         if close {
@@ -1482,24 +1476,6 @@ impl NativeApp {
                 if ui.button(settings_label).clicked() {
                     self.show_settings = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let diagnostics_label = match self.language {
-                        UiLanguage::TraditionalChinese => "GPU 診斷",
-                        UiLanguage::English => "GPU Diagnostics",
-                    };
-                    if ui.button(diagnostics_label).clicked() {
-                        self.show_diagnostics = !self.show_diagnostics
-                    }
-                    if let Some(gpu) = &self.model.capabilities {
-                        ui.label(format!("NVENC · {}", gpu.adapter_name));
-                    } else if self.gpu_receiver.is_some() {
-                        ui.spinner();
-                        ui.label(match self.language {
-                            UiLanguage::TraditionalChinese => "正在偵測 RTX / NVENC…",
-                            UiLanguage::English => "Detecting RTX / NVENC…",
-                        });
-                    }
-                });
             });
         });
     }
@@ -1512,10 +1488,11 @@ impl NativeApp {
             self.model.settings.scene.free_camera_center = None;
             self.model.settings.scene.camera_zoom = 1.0;
         }
-        if self.language == UiLanguage::English {
-            self.draw_controls_english(ctx);
-            return;
-        }
+        self.draw_controls_workflow(ctx);
+    }
+
+    #[allow(dead_code)]
+    fn draw_controls_legacy_chinese(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("controls")
             .resizable(true)
             .default_width(340.0)
@@ -1789,6 +1766,470 @@ impl NativeApp {
             });
     }
 
+    /// Compact workflow-oriented controls shared by both languages.  Keeping
+    /// one layout prevents the English and Traditional Chinese UIs from
+    /// drifting apart as new export options are added.
+    fn draw_controls_workflow(&mut self, ctx: &egui::Context) {
+        let english = self.language == UiLanguage::English;
+        let min_width = 292.0_f32;
+        let max_width = 420.0_f32;
+        let preferred_width = self.layout.left_panel_width.clamp(min_width, max_width);
+        let panel_response = egui::SidePanel::left("controls")
+            .resizable(true)
+            .default_width(preferred_width)
+            .width_range(min_width..=max_width)
+            .show(ctx, |ui| {
+                ui.set_max_width(ui.available_width());
+                egui::TopBottomPanel::bottom("controls-export-footer")
+                    .resizable(false)
+                    .show_inside(ui, |ui| self.draw_export_footer(ui, english));
+                egui::ScrollArea::vertical()
+                    .id_salt("controls-workflow-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let Some(track) = self.track.clone() else {
+                            ui.heading(if english { "Track" } else { "軌跡" });
+                            ui.label(if english {
+                                "Load a GPX track to start."
+                            } else {
+                                "請先載入 GPX 軌跡。"
+                            });
+                            if ui
+                                .button(if english {
+                                    "Choose GPX file"
+                                } else {
+                                    "選擇 GPX 檔案"
+                                })
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("GPX", &["gpx"])
+                                    .pick_file()
+                            {
+                                self.load_gpx(path);
+                            }
+                            return;
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.heading(if english { "Track" } else { "軌跡" });
+                            if ui
+                                .small_button(if english { "Change" } else { "更換" })
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("GPX", &["gpx"])
+                                    .pick_file()
+                            {
+                                self.load_gpx(path);
+                            }
+                        });
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(egui::Label::new(track.name.clone()).truncate());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("{:.2} km", track.distance_m / 1000.0));
+                                ui.label(format!(
+                                    "{} {:.0} m",
+                                    if english { "Gain" } else { "爬升" },
+                                    track.elevation_gain_m
+                                ));
+                                ui.label(format!(
+                                    "{} {}",
+                                    if english { "GPS" } else { "GPS 點" },
+                                    track.source_point_count
+                                ));
+                            });
+                            ui.small(format!(
+                                "{} {}",
+                                if english {
+                                    "Filtered stops:"
+                                } else {
+                                    "已移除停留點："
+                                },
+                                track.removed_stop_points
+                            ));
+                        });
+
+                        let preview_state =
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                egui::Id::new("controls-preview-section"),
+                                self.layout.preview_section_open,
+                            );
+                        let preview_header = preview_state.show_header(ui, |ui| {
+                            ui.strong(if english { "Preview" } else { "預覽" });
+                        });
+                        let preview_open = preview_header.is_open();
+                        preview_header.body(|ui| self.draw_preview_settings(ui, english));
+                        self.layout.preview_section_open = preview_open;
+
+                        let places_state =
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                egui::Id::new("controls-landmarks-section"),
+                                self.layout.landmarks_section_open,
+                            );
+                        let count = self.landmarks.len();
+                        let places_header = places_state.show_header(ui, |ui| {
+                            ui.strong(if english {
+                                format!("Route places · {count}")
+                            } else {
+                                format!("沿途地點 · {count}")
+                            });
+                        });
+                        let places_open = places_header.is_open();
+                        places_header.body(|ui| self.draw_landmark_manager(ui));
+                        self.layout.landmarks_section_open = places_open;
+                    });
+            });
+        let measured_width = panel_response.response.rect.width();
+        if measured_width.is_finite() {
+            self.layout.left_panel_width = measured_width.clamp(min_width, max_width);
+        }
+    }
+
+    fn draw_preview_settings(&mut self, ui: &mut egui::Ui, english: bool) {
+        let mut long_edge = current_long_edge(&self.model.settings);
+        egui::Grid::new("preview-settings-grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(if english { "Aspect" } else { "比例" });
+                egui::ComboBox::from_id_salt("preview-aspect")
+                    .selected_text(match self.model.settings.scene.aspect {
+                        Aspect::Landscape => "16:9",
+                        Aspect::Square => "1:1",
+                        Aspect::Portrait => "9:16",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.aspect,
+                            Aspect::Landscape,
+                            "16:9",
+                        );
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.aspect,
+                            Aspect::Square,
+                            "1:1",
+                        );
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.aspect,
+                            Aspect::Portrait,
+                            "9:16",
+                        );
+                    });
+                ui.end_row();
+
+                ui.label(if english { "Resolution" } else { "解析度" });
+                egui::ComboBox::from_id_salt("preview-resolution")
+                    .selected_text(resolution_label(long_edge, self.language))
+                    .show_ui(ui, |ui| {
+                        for edge in [3840, 2560, 1920, 1280] {
+                            if ui
+                                .selectable_label(
+                                    long_edge == edge,
+                                    resolution_label(edge, self.language),
+                                )
+                                .clicked()
+                            {
+                                long_edge = edge;
+                            }
+                        }
+                    });
+                ui.end_row();
+
+                ui.label(if english { "Map" } else { "地圖" });
+                egui::ComboBox::from_id_salt("preview-map-style")
+                    .selected_text(match self.model.settings.scene.map_style {
+                        MapStyle::Light => {
+                            if english {
+                                "Light"
+                            } else {
+                                "淺色"
+                            }
+                        }
+                        MapStyle::Dark => {
+                            if english {
+                                "Dark"
+                            } else {
+                                "深色"
+                            }
+                        }
+                        MapStyle::Satellite => {
+                            if english {
+                                "Satellite"
+                            } else {
+                                "衛星圖"
+                            }
+                        }
+                        MapStyle::Transparent => {
+                            if english {
+                                "Transparent"
+                            } else {
+                                "透明"
+                            }
+                        }
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.map_style,
+                            MapStyle::Light,
+                            if english { "Light" } else { "淺色" },
+                        );
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.map_style,
+                            MapStyle::Dark,
+                            if english { "Dark" } else { "深色" },
+                        );
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.map_style,
+                            MapStyle::Satellite,
+                            if english { "Satellite" } else { "衛星圖" },
+                        );
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.map_style,
+                            MapStyle::Transparent,
+                            if english { "Transparent" } else { "透明" },
+                        );
+                    });
+                ui.end_row();
+
+                ui.label(if english { "Camera" } else { "攝影機" });
+                egui::ComboBox::from_id_salt("preview-camera")
+                    .selected_text(match self.model.settings.scene.camera_mode {
+                        CameraMode::Fit => {
+                            if english {
+                                "Fit route"
+                            } else {
+                                "完整路線"
+                            }
+                        }
+                        CameraMode::Follow | CameraMode::Free => {
+                            if english {
+                                "Follow route"
+                            } else {
+                                "跟隨路線"
+                            }
+                        }
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.camera_mode,
+                            CameraMode::Fit,
+                            if english { "Fit route" } else { "完整路線" },
+                        );
+                        ui.selectable_value(
+                            &mut self.model.settings.scene.camera_mode,
+                            CameraMode::Follow,
+                            if english {
+                                "Follow route"
+                            } else {
+                                "跟隨路線"
+                            },
+                        );
+                    });
+                ui.end_row();
+
+                if self.model.settings.scene.camera_mode == CameraMode::Follow {
+                    ui.label(if english {
+                        "Follow zoom"
+                    } else {
+                        "跟隨縮放"
+                    });
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.model.settings.scene.follow_zoom_level,
+                            10.0..=20.0,
+                        )
+                        .step_by(0.25),
+                    );
+                    ui.end_row();
+                }
+                ui.label(if english {
+                    "Route width"
+                } else {
+                    "路線寬度"
+                });
+                ui.add(
+                    egui::Slider::new(&mut self.model.settings.scene.line_width_px, 1.0..=16.0)
+                        .suffix(" px"),
+                );
+                ui.end_row();
+                ui.label(if english { "Overlays" } else { "資訊圖層" });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.model.settings.scene.show_hud, "HUD");
+                    ui.checkbox(
+                        &mut self.model.settings.scene.show_elevation,
+                        if english { "Elevation" } else { "海拔" },
+                    );
+                });
+                ui.end_row();
+            });
+        apply_long_edge(&mut self.model.settings, long_edge);
+    }
+
+    fn draw_export_footer(&mut self, ui: &mut egui::Ui, english: bool) {
+        ui.separator();
+        ui.strong(if english { "Export" } else { "輸出" });
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("export-codec")
+                .selected_text(match self.model.settings.codec {
+                    Codec::Hevc => "H.265 / HEVC",
+                    Codec::H264 => "H.264 / AVC",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.model.settings.codec,
+                        Codec::Hevc,
+                        "H.265 / HEVC",
+                    );
+                    ui.selectable_value(&mut self.model.settings.codec, Codec::H264, "H.264 / AVC");
+                });
+            egui::ComboBox::from_id_salt("export-quality")
+                .selected_text(match self.model.settings.quality {
+                    QualityPreset::Balanced => {
+                        if english {
+                            "Balanced"
+                        } else {
+                            "平衡"
+                        }
+                    }
+                    QualityPreset::Quality => {
+                        if english {
+                            "High"
+                        } else {
+                            "高畫質"
+                        }
+                    }
+                    QualityPreset::Speed => {
+                        if english {
+                            "Speed"
+                        } else {
+                            "速度"
+                        }
+                    }
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.model.settings.quality,
+                        QualityPreset::Balanced,
+                        if english { "Balanced" } else { "平衡" },
+                    );
+                    ui.selectable_value(
+                        &mut self.model.settings.quality,
+                        QualityPreset::Quality,
+                        if english { "High" } else { "高畫質" },
+                    );
+                    ui.selectable_value(
+                        &mut self.model.settings.quality,
+                        QualityPreset::Speed,
+                        if english { "Speed" } else { "速度" },
+                    );
+                });
+        });
+
+        let advanced_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            egui::Id::new("controls-export-advanced"),
+            self.layout.export_advanced_open,
+        );
+        let header = advanced_state.show_header(ui, |ui| {
+            ui.small(if english {
+                "Advanced output"
+            } else {
+                "進階輸出"
+            });
+        });
+        let advanced_open = header.is_open();
+        header.body(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(if english { "Seconds" } else { "秒數" });
+                ui.add(
+                    egui::DragValue::new(&mut self.model.settings.duration_seconds).range(1..=3600),
+                );
+                ui.label("FPS");
+                egui::ComboBox::from_id_salt("export-fps")
+                    .selected_text(format!("{} FPS", self.model.settings.fps))
+                    .show_ui(ui, |ui| {
+                        for fps in [24, 30, 60, 120] {
+                            ui.selectable_value(
+                                &mut self.model.settings.fps,
+                                fps,
+                                format!("{fps} FPS"),
+                            );
+                        }
+                    });
+            });
+        });
+        self.layout.export_advanced_open = advanced_open;
+
+        if ui
+            .button(if english {
+                "Choose output MP4"
+            } else {
+                "選擇輸出 MP4"
+            })
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("MP4", &["mp4"])
+                .set_file_name("gpx-animation.mp4")
+                .save_file()
+        {
+            self.preferences.last_output_directory = path.parent().map(PathBuf::from);
+            self.output_path = Some(path);
+        }
+        if let Some(path) = &self.output_path {
+            ui.add(egui::Label::new(path.display().to_string()).truncate());
+        }
+        match &self.model.state {
+            JobState::Running(value) => {
+                let ratio = if value.stage_total == 0 {
+                    0.0
+                } else {
+                    value.stage_completed as f32 / value.stage_total as f32
+                };
+                ui.add(
+                    egui::ProgressBar::new(ratio)
+                        .show_percentage()
+                        .text(format!("{:?} · {:.1} FPS", value.stage, value.fps)),
+                );
+                if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
+                    if let Some(token) = &self.active_token {
+                        token.cancel();
+                    }
+                    self.model.cancel();
+                }
+            }
+            _ => {
+                let long_edge = current_long_edge(&self.model.settings);
+                if ui
+                    .add_enabled(
+                        self.track.is_some() && self.model.can_export(),
+                        egui::Button::new(if english {
+                            format!("Export {} FPS MP4", self.model.settings.fps)
+                        } else {
+                            format!("輸出 {} FPS MP4", self.model.settings.fps)
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.start_export();
+                }
+                ui.small(format!(
+                    "{} · {}",
+                    resolution_label(long_edge, self.language),
+                    if english { "Ready" } else { "準備完成" }
+                ));
+            }
+        }
+        if let Some(error) = &self.last_error {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                localized_error(self.language, error),
+            );
+        }
+    }
+
+    #[allow(dead_code, unreachable_code)]
     fn draw_controls_english(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("controls")
             .resizable(true)
@@ -2132,8 +2573,9 @@ impl NativeApp {
                 return;
             };
             let mut preview_options = self.model.settings.scene.clone();
-            preview_options.camera_viewport_width_px = frame_rect.width().max(1.0) as u32;
-            preview_options.camera_viewport_height_px = frame_rect.height().max(1.0) as u32;
+            // Camera composition uses scene_core's logical canvas.  The
+            // widget size only controls how the already-computed frame is
+            // letterboxed on screen.
             preview_options.preview_center_mercator = self.preview_center_mercator;
             preview_options.preview_zoom_level = self.preview_zoom_level;
             let initial_scene = Scene {
@@ -2183,6 +2625,12 @@ impl NativeApp {
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
             let frame = build_frame(&scene, self.preview_progress);
+            let preview_scale = preview_content_scale(
+                frame_rect.width(),
+                frame_rect.height(),
+                self.model.settings.width,
+                self.model.settings.height,
+            );
             if response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
                 && frame_rect.contains(pointer)
@@ -2255,14 +2703,14 @@ impl NativeApp {
             painter.add(egui::Shape::line(
                 route,
                 egui::Stroke::new(
-                    self.model.settings.scene.line_width_px,
+                    self.model.settings.scene.line_width_px * preview_scale,
                     egui::Color32::from_gray(135),
                 ),
             ));
             painter.add(egui::Shape::line(
                 completed,
                 egui::Stroke::new(
-                    self.model.settings.scene.line_width_px,
+                    self.model.settings.scene.line_width_px * preview_scale,
                     egui::Color32::from_rgba_unmultiplied(
                         self.model.settings.scene.route_color[0],
                         self.model.settings.scene.route_color[1],
@@ -2273,10 +2721,10 @@ impl NativeApp {
             ));
             painter.circle_filled(
                 to_screen(frame.marker_ndc),
-                9.0,
+                12.0 * preview_scale,
                 egui::Color32::from_rgb(255, 93, 59),
             );
-            let landmark_scale = frame_rect.height() / 2160.0;
+            let landmark_scale = preview_scale;
             for landmark in &frame.landmarks {
                 if landmark.pin_opacity <= 0.0
                     || landmark.ndc[0] < -1.25
@@ -2465,7 +2913,7 @@ impl NativeApp {
                 painter.add(egui::Shape::line(
                     profile,
                     egui::Stroke::new(
-                        2.0,
+                        2.0 * preview_scale,
                         egui::Color32::from_rgba_unmultiplied(
                             self.model.settings.scene.route_color[0],
                             self.model.settings.scene.route_color[1],
@@ -2476,7 +2924,7 @@ impl NativeApp {
                 ));
             }
             painter.text(
-                frame_rect.right_bottom() - egui::vec2(12.0, 10.0),
+                frame_rect.right_bottom() - egui::vec2(12.0, 10.0) * preview_scale,
                 egui::Align2::RIGHT_BOTTOM,
                 match self.model.settings.scene.map_style {
                     MapStyle::Satellite => {
@@ -2484,20 +2932,20 @@ impl NativeApp {
                     }
                     _ => "© OpenStreetMap contributors",
                 },
-                egui::FontId::proportional(12.0),
+                egui::FontId::proportional(12.0 * preview_scale),
                 egui::Color32::from_gray(90),
             );
             if self.model.settings.scene.show_hud && self.language == UiLanguage::TraditionalChinese
             {
                 painter.text(
-                    frame_rect.min + egui::vec2(24.0, 22.0),
+                    frame_rect.min + egui::vec2(24.0, 22.0) * preview_scale,
                     egui::Align2::LEFT_TOP,
                     format!("公里數 {:.2} km", frame.distance_m / 1000.0),
-                    egui::FontId::proportional(24.0),
+                    egui::FontId::proportional(36.0 * preview_scale),
                     egui::Color32::WHITE,
                 );
                 painter.text(
-                    frame_rect.min + egui::vec2(24.0, 54.0),
+                    frame_rect.min + egui::vec2(24.0, 54.0) * preview_scale,
                     egui::Align2::LEFT_TOP,
                     format!(
                         "海拔 {}",
@@ -2506,20 +2954,20 @@ impl NativeApp {
                             .map(|value| format!("{value:.0} m"))
                             .unwrap_or_else(|| "-- m".to_owned())
                     ),
-                    egui::FontId::proportional(24.0),
+                    egui::FontId::proportional(36.0 * preview_scale),
                     egui::Color32::WHITE,
                 );
             }
             if self.model.settings.scene.show_hud && self.language == UiLanguage::English {
                 painter.text(
-                    frame_rect.min + egui::vec2(24.0, 22.0),
+                    frame_rect.min + egui::vec2(24.0, 22.0) * preview_scale,
                     egui::Align2::LEFT_TOP,
                     format!("Distance {:.2} km", frame.distance_m / 1000.0),
-                    egui::FontId::proportional(24.0),
+                    egui::FontId::proportional(36.0 * preview_scale),
                     egui::Color32::WHITE,
                 );
                 painter.text(
-                    frame_rect.min + egui::vec2(24.0, 54.0),
+                    frame_rect.min + egui::vec2(24.0, 54.0) * preview_scale,
                     egui::Align2::LEFT_TOP,
                     format!(
                         "Elevation {}",
@@ -2528,7 +2976,7 @@ impl NativeApp {
                             .map(|value| format!("{value:.0} m"))
                             .unwrap_or_else(|| "-- m".to_owned())
                     ),
-                    egui::FontId::proportional(24.0),
+                    egui::FontId::proportional(36.0 * preview_scale),
                     egui::Color32::WHITE,
                 );
             }
@@ -2648,6 +3096,55 @@ impl NativeApp {
                             "繁體中文",
                         );
                         ui.selectable_value(&mut self.language, UiLanguage::English, "English");
+                });
+                egui::CollapsingHeader::new(match self.language {
+                    UiLanguage::TraditionalChinese => "進階 · GPU 與輸出診斷",
+                    UiLanguage::English => "Advanced · GPU and export diagnostics",
+                })
+                .id_salt("settings-advanced-gpu")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Some(gpu) = &self.model.capabilities {
+                        ui.label(format!("Adapter: {}", gpu.adapter_name));
+                        ui.label(format!(
+                            "NVENC HEVC: {} · H.264: {} · Async: {}",
+                            gpu.hevc, gpu.h264, gpu.async_encode
+                        ));
+                    } else if self.gpu_receiver.is_some() {
+                        ui.spinner();
+                        ui.label(if self.language == UiLanguage::English {
+                            "Detecting GPU capabilities…"
+                        } else {
+                            "正在偵測 GPU 能力…"
+                        });
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            if self.language == UiLanguage::English {
+                                "GPU capability detection failed."
+                            } else {
+                                "GPU 能力偵測失敗。"
+                            },
+                        );
+                    }
+                    let diagnostics = &self.model.diagnostics;
+                    ui.separator();
+                    ui.label(format!(
+                        "CPU readbacks: {} · encoded: {} · dropped: {}",
+                        diagnostics.cpu_frame_readbacks,
+                        diagnostics.encoded_frames,
+                        diagnostics.dropped_frames
+                    ));
+                    if ui
+                        .button(if self.language == UiLanguage::English {
+                            "Open detailed diagnostics"
+                        } else {
+                            "開啟詳細診斷"
+                        })
+                        .clicked()
+                    {
+                        self.show_diagnostics = true;
+                    }
                 });
                 ui.separator();
                 ui.label(match self.language {
@@ -2985,6 +3482,7 @@ impl NativeApp {
         current.settings.scene.preview_center_mercator = None;
         current.settings.scene.preview_zoom_level = None;
         current.cache_limit_bytes = current.settings.cache_limit_bytes;
+        current.ui_layout = self.layout.clone();
         current.gateway_base_url = (!self.gateway_url_input.trim().is_empty())
             .then(|| self.gateway_url_input.trim().to_owned());
         if current != self.preferences {
@@ -3079,6 +3577,26 @@ fn reset_camera_for_new_track(options: &mut scene_core::SceneOptions) {
     options.camera_zoom = 1.0;
 }
 
+fn nearby_panel_widths(available_width: f32, preferred_width: f32) -> (f32, f32) {
+    let min_width = 300.0_f32;
+    let max_width = (available_width - 640.0).max(min_width).min(720.0);
+    (preferred_width.clamp(min_width, max_width), max_width)
+}
+
+fn preview_content_scale(
+    display_width: f32,
+    display_height: f32,
+    output_width: u32,
+    output_height: u32,
+) -> f32 {
+    if display_width <= 0.0 || display_height <= 0.0 || output_width == 0 || output_height == 0 {
+        return 1.0;
+    }
+    (display_width / output_width as f32)
+        .min(display_height / output_height as f32)
+        .max(0.01)
+}
+
 fn install_chinese_font(ctx: &egui::Context) {
     let path = PathBuf::from(r"C:\Windows\Fonts\msjh.ttc");
     if let Ok(bytes) = std::fs::read(path) {
@@ -3138,5 +3656,19 @@ mod tests {
             localized_error(UiLanguage::TraditionalChinese, "錯誤"),
             "錯誤"
         );
+    }
+
+    #[test]
+    fn nearby_panel_width_is_clamped_without_content_growth() {
+        assert_eq!(nearby_panel_widths(1800.0, 900.0), (720.0, 720.0));
+        assert_eq!(nearby_panel_widths(1200.0, 410.0), (410.0, 560.0));
+        assert_eq!(nearby_panel_widths(800.0, 600.0), (300.0, 300.0));
+    }
+
+    #[test]
+    fn preview_scale_matches_selected_output_density() {
+        assert!((preview_content_scale(960.0, 540.0, 3840, 2160) - 0.25).abs() < 1e-6);
+        assert!((preview_content_scale(960.0, 540.0, 1920, 1080) - 0.5).abs() < 1e-6);
+        assert_eq!(preview_content_scale(0.0, 540.0, 3840, 2160), 1.0);
     }
 }

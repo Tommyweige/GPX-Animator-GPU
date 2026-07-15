@@ -58,6 +58,33 @@ pub struct AppPreferences {
     pub nearby_online: bool,
     #[serde(default)]
     pub gateway_base_url: Option<String>,
+    #[serde(default)]
+    pub ui_layout: UiLayoutPreferences,
+}
+
+/// Persisted desktop layout state.  The values are user preferences rather
+/// than egui's transient panel memory so they survive closing and reopening a
+/// nearby-places inspector or the application itself.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiLayoutPreferences {
+    pub left_panel_width: f32,
+    pub nearby_panel_width: f32,
+    pub preview_section_open: bool,
+    pub landmarks_section_open: bool,
+    pub export_advanced_open: bool,
+}
+
+impl Default for UiLayoutPreferences {
+    fn default() -> Self {
+        Self {
+            left_panel_width: 320.0,
+            nearby_panel_width: 420.0,
+            preview_section_open: true,
+            landmarks_section_open: false,
+            export_advanced_open: false,
+        }
+    }
 }
 
 pub const fn default_nearby_radius_m() -> u32 {
@@ -71,7 +98,7 @@ pub const fn default_nearby_online() -> bool {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
-            schema_version: 4,
+            schema_version: 5,
             language: UiLanguage::default(),
             settings: ExportSettings::default(),
             last_input_directory: None,
@@ -82,6 +109,7 @@ impl Default for AppPreferences {
             poi_profile: places_core::PoiProfile::default(),
             nearby_online: default_nearby_online(),
             gateway_base_url: None,
+            ui_layout: UiLayoutPreferences::default(),
         }
     }
 }
@@ -102,7 +130,7 @@ impl AppPreferences {
         };
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(mut value) => {
-                value.schema_version = 4;
+                value.schema_version = 5;
                 if value.cache_limit_bytes == 0 {
                     value.cache_limit_bytes = default_cache_limit_bytes();
                 }
@@ -388,6 +416,8 @@ mod tests {
         value.cache_limit_bytes = value.settings.cache_limit_bytes;
         value.nearby_radius_m = 5_000;
         value.nearby_provider = places_core::NearbyProviderPreference::GoogleFirst;
+        value.ui_layout.nearby_panel_width = 512.0;
+        value.ui_layout.preview_section_open = false;
         let bytes = serde_json::to_vec(&value).unwrap();
         let decoded: AppPreferences = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.language, UiLanguage::English);
@@ -397,7 +427,22 @@ mod tests {
             decoded.nearby_provider,
             places_core::NearbyProviderPreference::GoogleFirst
         );
+        assert_eq!(decoded.ui_layout.nearby_panel_width, 512.0);
+        assert!(!decoded.ui_layout.preview_section_open);
         assert!(!String::from_utf8(bytes).unwrap().contains("api_key"));
+    }
+
+    #[test]
+    fn layout_defaults_are_compact_and_persistable() {
+        let value = UiLayoutPreferences::default();
+        assert_eq!(value.left_panel_width, 320.0);
+        assert_eq!(value.nearby_panel_width, 420.0);
+        assert!(value.preview_section_open);
+        assert!(!value.landmarks_section_open);
+        assert!(!value.export_advanced_open);
+        let json = serde_json::to_string(&value).unwrap();
+        let decoded: UiLayoutPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, value);
     }
 
     #[test]
@@ -406,7 +451,7 @@ mod tests {
         json.as_object_mut().unwrap().remove("nearby_radius_m");
         let value: AppPreferences = serde_json::from_value(json).unwrap();
         assert_eq!(value.nearby_radius_m, places_core::DEFAULT_RADIUS_M);
-        assert_eq!(value.schema_version, 4);
+        assert_eq!(value.schema_version, 5);
         assert_eq!(
             value.nearby_provider,
             places_core::NearbyProviderPreference::TomTomFirst

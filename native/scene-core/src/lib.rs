@@ -146,6 +146,33 @@ pub const fn default_camera_viewport_height() -> u32 {
     2160
 }
 
+/// The composition canvas is intentionally independent from the physical
+/// output resolution and the size of the egui preview widget.  This keeps a
+/// Follow camera at the same map scale when a user switches between 1080p and
+/// 4K, or when the side panels are resized.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogicalCanvas {
+    pub width: f64,
+    pub height: f64,
+}
+
+pub const fn logical_canvas(aspect: Aspect) -> LogicalCanvas {
+    match aspect {
+        Aspect::Landscape => LogicalCanvas {
+            width: 1920.0,
+            height: 1080.0,
+        },
+        Aspect::Square => LogicalCanvas {
+            width: 1080.0,
+            height: 1080.0,
+        },
+        Aspect::Portrait => LogicalCanvas {
+            width: 1080.0,
+            height: 1920.0,
+        },
+    }
+}
+
 impl Default for SceneOptions {
     fn default() -> Self {
         Self {
@@ -419,8 +446,9 @@ pub fn build_frame(scene: &Scene, progress: f64) -> FramePlan {
         },
     );
     let fit_center = [(min_x + max_x) * 0.5, (min_y + max_y) * 0.5];
-    let viewport_width = scene.options.camera_viewport_width_px.max(1) as f64;
-    let viewport_height = scene.options.camera_viewport_height_px.max(1) as f64;
+    let canvas = logical_canvas(scene.options.aspect);
+    let viewport_width = canvas.width;
+    let viewport_height = canvas.height;
     let aspect_height_over_width = viewport_height / viewport_width;
     let fit_span = (max_x - min_x)
         .max((max_y - min_y) / aspect_height_over_width.max(1e-9))
@@ -785,6 +813,47 @@ mod tests {
         let preview = build_frame(&value, 0.5);
         assert_ne!(preview.view_center_mercator, landscape.view_center_mercator);
         assert!(preview.view_span > landscape.view_span);
+    }
+
+    #[test]
+    fn camera_composition_is_independent_of_physical_preview_or_export_size() {
+        let mut value = scene();
+        value.options.camera_mode = CameraMode::Follow;
+        value.options.camera_viewport_width_px = 640;
+        value.options.camera_viewport_height_px = 360;
+        let preview = build_frame(&value, 0.42);
+        value.options.camera_viewport_width_px = 3840;
+        value.options.camera_viewport_height_px = 2160;
+        let export = build_frame(&value, 0.42);
+        assert_eq!(preview.view_center_mercator, export.view_center_mercator);
+        assert_eq!(preview.view_span, export.view_span);
+        assert_eq!(preview.view_span_y, export.view_span_y);
+        assert_eq!(preview.route_ndc, export.route_ndc);
+    }
+
+    #[test]
+    fn logical_canvas_has_expected_orientation_and_dimensions() {
+        assert_eq!(
+            logical_canvas(Aspect::Landscape),
+            LogicalCanvas {
+                width: 1920.0,
+                height: 1080.0
+            }
+        );
+        assert_eq!(
+            logical_canvas(Aspect::Square),
+            LogicalCanvas {
+                width: 1080.0,
+                height: 1080.0
+            }
+        );
+        assert_eq!(
+            logical_canvas(Aspect::Portrait),
+            LogicalCanvas {
+                width: 1080.0,
+                height: 1920.0
+            }
+        );
     }
 
     #[test]
