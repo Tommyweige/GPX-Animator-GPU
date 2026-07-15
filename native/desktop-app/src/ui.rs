@@ -3180,6 +3180,7 @@ impl NativeApp {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
+                ui.set_min_size(egui::vec2(730.0, 570.0));
                 ui.horizontal(|ui| {
                     ui.set_min_width(150.0);
                     ui.vertical(|ui| {
