@@ -1204,13 +1204,12 @@ impl NativeApp {
         // nearby search first so draw_nearby_panel renders the custom form on
         // the very next frame, even when the nearby inspector was already open.
         self.context_menu = None;
-        self.nearby_dialog = None;
-        self.candidate_place = None;
-        self.custom_landmark = Some(CustomLandmarkState {
+        switch_to_custom_landmark(
+            &mut self.nearby_dialog,
+            &mut self.candidate_place,
+            &mut self.custom_landmark,
             coordinate,
-            name: String::new(),
-            category: String::new(),
-        });
+        );
         ctx.request_repaint();
     }
 
@@ -4493,6 +4492,21 @@ fn nearby_panel_widths(available_width: f32, preferred_width: f32) -> (f32, f32)
     (preferred_width.clamp(min_width, max_width), max_width)
 }
 
+fn switch_to_custom_landmark(
+    nearby_dialog: &mut Option<NearbyDialogState>,
+    candidate_place: &mut Option<PlaceSummary>,
+    custom_landmark: &mut Option<CustomLandmarkState>,
+    coordinate: SearchCoordinate,
+) {
+    *nearby_dialog = None;
+    *candidate_place = None;
+    *custom_landmark = Some(CustomLandmarkState {
+        coordinate,
+        name: String::new(),
+        category: String::new(),
+    });
+}
+
 fn preview_content_scale(
     display_width: f32,
     display_height: f32,
@@ -4626,5 +4640,39 @@ mod tests {
         assert!(details.contains("距圖針"));
         assert!(!details.contains("行進方向"));
         assert!(!details.contains('°'));
+    }
+
+    #[test]
+    fn custom_pin_action_replaces_an_open_nearby_panel() {
+        let coordinate = SearchCoordinate {
+            latitude: 23.92854,
+            longitude: 121.50508,
+        };
+        let mut nearby_dialog = Some(NearbyDialogState {
+            coordinate,
+            request_id: 7,
+            purpose: NearbySearchPurpose::Browse,
+            loading: false,
+            places: Vec::new(),
+            error: None,
+            attempts: Vec::new(),
+            attribution: Vec::new(),
+            degraded: false,
+        });
+        let mut candidate_place = None;
+        let mut custom_landmark = None;
+
+        switch_to_custom_landmark(
+            &mut nearby_dialog,
+            &mut candidate_place,
+            &mut custom_landmark,
+            coordinate,
+        );
+
+        assert!(nearby_dialog.is_none());
+        assert!(candidate_place.is_none());
+        let custom_landmark = custom_landmark.expect("custom form should be opened");
+        assert_eq!(custom_landmark.coordinate, coordinate);
+        assert!(custom_landmark.name.is_empty());
     }
 }
