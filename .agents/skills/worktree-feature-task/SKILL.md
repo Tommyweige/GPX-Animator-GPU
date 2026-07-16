@@ -197,7 +197,90 @@ Pop-Location
 
 若 package.json 沒有 lint 或 formatter script，不得自行宣稱存在 npm run lint 等指令；應回報「專案未定義該驗證」。若 task 影響跨模組行為，除 targeted tests 外也執行專案完整測試。硬體、SDK、GPU 或外部服務限制必須明確記錄。
 
-### 12. 驗證無法執行時
+### 12. Release build 後的手動測試產物交付
+
+若 task 會產生桌面應用程式、EXE 或其他可執行產物，Release build 成功後必須完成手動測試產物交付；只回報 Release build 成功而沒有可供測試的完整版本是不完整的任務結果。若 task 不產生可執行產物，明確回報本流程不適用及原因。
+
+#### 找出原始 Local checkout 與絕對路徑
+
+使用 git worktree list --porcelain 找出原始 Local checkout，不能把目前 Worktree 路徑當成原始專案，也不能硬編碼使用者目錄。確認原始 Local checkout 路徑與目前功能 Worktree 不同，並將所有交付路徑解析為絕對路徑：
+
+~~~powershell
+git worktree list --porcelain
+$original_checkout = "<從 git worktree list 判定的原始 Local checkout 絕對路徑>"
+$original_parent = Split-Path -Parent $original_checkout
+$handoff_root = Join-Path $original_parent "GPX-Animator-Test-Builds"
+$branch_name = git branch --show-current
+$short_commit = git rev-parse --short=12 HEAD
+$handoff_dir = Join-Path (Join-Path $handoff_root $branch_name) $short_commit
+~~~
+
+固定使用原始專案上一層的 GPX-Animator-Test-Builds，並依 branch 與 short commit 建立隔離路徑：
+
+~~~text
+GPX-Animator-Test-Builds/<branch-name>/<short-commit>/
+~~~
+
+若 branch 名稱包含斜線，保留 branch 名稱造成的子目錄層級，不將不同 branch 合併到同一個資料夾。建立前確認 handoff_dir 的絕對路徑確實位於 handoff_root 之下；不得使用包含 ..、Git repository 內路徑或其他不明路徑的輸入。若相同 branch／commit 資料夾已存在，不刪除或覆蓋它；先驗證其 BUILD-INFO 與檔案清單相符，若不相符則停止並回報。
+
+#### 找出並複製完整執行內容
+
+從成功的 Release build、AGENTS.md、README、package 設定、packaging 設定與實際輸出檔案找出真正的可執行檔，使用 Resolve-Path 取得原始 Release EXE 的絕對路徑。不得只回報 repository 內的相對路徑。本 repository 的已驗證 Release build 指令與預期輸出為：
+
+~~~powershell
+cargo build --release -p gpx-animator-native
+Resolve-Path "target\release\gpx-animator-native.exe"
+~~~
+
+只有在該檔案確實存在且屬於本次成功 Release build 時，才能將它記錄為原始 Release EXE；若實際專案輸出不同，依實際 build 結果調整，不猜測。
+
+建立 handoff_dir 後，複製完整執行所需內容，不要只複製 EXE：
+
+- EXE。
+- 必要 DLL；使用專案設定、Windows dependency inspection 工具或實際啟動錯誤確認，不任意複製整台機器的 DLL。
+- assets、resources、shader、資料檔或其他 runtime content。
+- 必要但不含機密的執行設定。
+
+先建立將複製的檔案清單，使用 Copy-Item 或等價的非破壞性複製方式，並在 BUILD-INFO.txt 記錄每個來源與目的檔案。若依賴不明、無法取得必要 DLL/assets、或無法確認版本完整，不能宣稱已建立可供手動測試的版本。
+
+絕不複製 API Keys、credentials、token、私鑰、Cookie、個人設定、秘密環境檔、Credential Manager 匯出內容或其他機密。不要複製整個使用者 profile；只納入專案文件明確標示為安全的 runtime 設定。若無法判斷設定是否含機密，排除該檔案並在回報中說明。
+
+#### 建立 BUILD-INFO.txt
+
+在每個 branch／commit 隔離的 handoff_dir 建立 BUILD-INFO.txt，至少包含：
+
+~~~text
+branch:
+commit:
+build_time:
+original_worktree:
+original_release_exe:
+manual_test_directory:
+manual_test_exe:
+copied_runtime_files:
+validation_results:
+launch_result:
+~~~
+
+其中 build_time 使用含時區的時間；validation_results 必須列出實際執行的格式化、lint／靜態檢查、測試、建置與結果，不能使用未執行的通用宣稱。BUILD-INFO.txt 與測試檔案都必須位於 repository 外部。
+
+#### 開啟並嘗試啟動手動測試版本
+
+完成複製與 BUILD-INFO.txt 後，使用 explorer.exe /select 開啟並選取測試 EXE：
+
+~~~powershell
+explorer.exe /select,"<手動測試 EXE 的絕對路徑>"
+~~~
+
+依 README、專案設定或使用者提供的安全參數嘗試啟動 handoff 版本；沒有必要輸入或安全啟動方式時，不猜測參數，回報未啟動原因。若可安全啟動，使用等價的 Start-Process 並確認 process 建立或程式沒有立即退出；「成功啟動」只代表程序成功開始，不代表手動功能測試已通過。將啟動結果寫入 BUILD-INFO.txt 與最後回報。
+
+#### 外部產物隔離與失敗處理
+
+GPX-Animator-Test-Builds 位於 repository 外部，不得加入 Git、不得 stage、不得寫入 main 或功能 branch，也不得因建立 handoff 產物污染任何 Worktree。建立前後確認目前功能 Worktree 與原始 Local checkout 的 git status 沒有因 handoff 產生變更；不要用 git clean 或其他破壞性命令清理。
+
+若無法建立可供手動測試的版本，必須明確回報阻礙，例如缺少 Release EXE、必要 DLL/assets、非機密設定、有效啟動參數、權限或 dependency inspection 能力。即使 Release build 成功，也不得只宣稱 Release build 成功；必須標示手動測試產物交付未完成及其原因。
+
+### 13. 驗證無法執行時
 
 若某項驗證無法執行：
 
@@ -207,7 +290,7 @@ Pop-Location
 - 若提交仍安全，commit message 與最後回報必須標示未完成或未執行的驗證。
 - 若無法判斷修改是否安全，停止提交並回報，不用破壞性命令排除問題。
 
-### 13. 任務完成收尾
+### 14. 任務完成收尾
 
 任務完成後：
 
@@ -247,6 +330,14 @@ Pop-Location
 - 測試：
 - 建置：
 - 無法執行的驗證及原因：
+
+## 手動測試產物
+
+- Worktree 絕對路徑：
+- 原始 Release EXE 路徑：
+- 手動測試版本的完整路徑：
+- 是否已成功啟動：
+- 是否需要額外 DLL/assets：
 
 ## 整合注意事項
 
