@@ -1,0 +1,7 @@
+interface:
+  display_name: "整合已完成 Branches"
+  short_description: "在原始 Local checkout 安全整合使用者指定的已完成分支"
+  default_prompt: "Use $integrate-completed-branches to safely integrate explicitly selected completed branches into main."
+
+policy:
+  allow_implicit_invocation: false
