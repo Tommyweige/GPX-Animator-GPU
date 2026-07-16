@@ -258,7 +258,10 @@ pub struct FramePlan {
     pub view_span: f64,
     pub view_span_y: f64,
     pub route_ndc: Vec<[f32; 2]>,
-    pub completed_points: usize,
+    /// The route already travelled at this progress. The final point is the
+    /// exact interpolated marker position, so renderers do not stop at the
+    /// previous raw GPX sample.
+    pub completed_route_ndc: Vec<[f32; 2]>,
     pub marker_ndc: [f32; 2],
     pub elevation_line: Vec<[f32; 2]>,
     pub progress: f32,
@@ -498,7 +501,8 @@ pub fn find_landmark_passes(
                 distance_from_route_m: anchor.distance_from_route_m,
                 nearest_latitude: anchor.nearest_latitude,
                 nearest_longitude: anchor.nearest_longitude,
-                heading_deg: bearing_at_distance(track, anchor.anchor_distance_m),
+                heading_deg: bearing_at_distance(track, anchor.anchor_distance_m)
+                    .or_else(|| segment_bearing_deg(track, projection.segment_index)),
             })
         })
         .collect();
@@ -785,11 +789,20 @@ pub fn build_frame_with_context(
     };
     let route_ndc: Vec<_> = projected.into_iter().map(to_ndc).collect();
     let marker_ndc = to_ndc(mercator(sample.lon, sample.lat));
-    let completed_points = scene
+    let completed_count = scene
         .track
         .points
         .partition_point(|point| point.distance_m <= sample.distance_m)
-        .max(1);
+        .max(1)
+        .min(route_ndc.len());
+    let mut completed_route_ndc = route_ndc[..completed_count].to_vec();
+    let marker_matches_last = completed_route_ndc.last().is_some_and(|point| {
+        (point[0] - marker_ndc[0]).abs() <= f32::EPSILON
+            && (point[1] - marker_ndc[1]).abs() <= f32::EPSILON
+    });
+    if !marker_matches_last {
+        completed_route_ndc.push(marker_ndc);
+    }
     let elevations: Vec<_> = scene
         .track
         .points
@@ -832,7 +845,7 @@ pub fn build_frame_with_context(
         view_span: span,
         view_span_y: span_y,
         route_ndc,
-        completed_points,
+        completed_route_ndc,
         marker_ndc,
         elevation_line,
         progress: progress as f32,
@@ -866,7 +879,11 @@ pub fn blend_frames(from: &FramePlan, to: &FramePlan, amount: f64) -> FramePlan 
         view_span: span,
         view_span_y: span_y,
         route_ndc: from.route_ndc.iter().map(|&p| convert(p, from)).collect(),
-        completed_points: to.completed_points,
+        completed_route_ndc: from
+            .completed_route_ndc
+            .iter()
+            .map(|&p| convert(p, from))
+            .collect(),
         marker_ndc: convert(from.marker_ndc, from),
         elevation_line: to.elevation_line.clone(),
         progress: to.progress,
@@ -1082,7 +1099,24 @@ mod tests {
         let scene = scene();
         let frame = build_frame(&scene, 0.5);
         assert!((frame.distance_m - scene.track.distance_m * 0.5).abs() < 0.01);
-        assert!(frame.completed_points >= 1);
+        assert!(!frame.completed_route_ndc.is_empty());
+    }
+    #[test]
+    fn completed_route_ends_at_interpolated_marker_without_duplicate_at_vertex() {
+        let scene = scene();
+        let mid_frame = build_frame(&scene, 0.35);
+        assert_eq!(mid_frame.completed_route_ndc.len(), 2);
+        assert_eq!(
+            mid_frame.completed_route_ndc.last(),
+            Some(&mid_frame.marker_ndc)
+        );
+
+        let start_frame = build_frame(&scene, 0.0);
+        assert_eq!(start_frame.completed_route_ndc.len(), 1);
+        assert_eq!(
+            start_frame.completed_route_ndc.last(),
+            Some(&start_frame.marker_ndc)
+        );
     }
     #[test]
     fn follow_camera_centers_marker() {

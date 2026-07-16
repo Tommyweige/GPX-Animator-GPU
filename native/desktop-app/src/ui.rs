@@ -67,6 +67,7 @@ struct PendingLandmarkState {
     landmark: RouteLandmark,
     candidates: Vec<RouteAnchorCandidate>,
     selected_index: usize,
+    original_preview_progress: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,9 +515,27 @@ impl NativeApp {
             landmark,
             candidates,
             selected_index,
+            original_preview_progress: self.preview_progress,
         });
     }
 
+    fn preview_landmarks(&self) -> Vec<RouteLandmark> {
+        let mut landmarks = self.landmarks.clone();
+        let Some(pending) = &self.pending_landmark else {
+            return landmarks;
+        };
+        let Some(candidate) = pending.candidates.get(pending.selected_index).copied() else {
+            return landmarks;
+        };
+        let mut landmark = pending.landmark.clone();
+        Self::apply_candidate(&mut landmark, candidate);
+        if let Some(existing) = landmarks.iter_mut().find(|value| value.id == landmark.id) {
+            *existing = landmark;
+        } else {
+            landmarks.push(landmark);
+        }
+        landmarks
+    }
     fn apply_candidate(landmark: &mut RouteLandmark, candidate: RouteAnchorCandidate) {
         landmark.anchor_distance_m = candidate.anchor_distance_m;
         landmark.anchor_progress = candidate.anchor_progress;
@@ -629,43 +648,103 @@ impl NativeApp {
             return;
         };
         let english = self.language == UiLanguage::English;
+        let original_preview_progress = pending.original_preview_progress;
         let mut confirm = false;
         let mut cancel = false;
         let mut preview_progress = None;
         let title = if english {
-            "Choose route pass"
+            "Choose when the pin appears"
         } else {
-            "選擇經過路段"
+            "選擇圖針出現時機"
         };
         egui::Window::new(title)
             .id(egui::Id::new("choose-route-pass-window"))
             .collapsible(false)
             .resizable(false)
-            .default_width(430.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+            .default_width(500.0)
             .show(ctx, |ui| {
+                let place_name = pending.landmark.name.clone();
                 ui.label(if english {
-                    "This place is reached more than once. Choose which pass should trigger the marker."
+                    format!(
+                        "The route passes \"{place_name}\" {} times. Choose when the pin should appear.",
+                        pending.candidates.len()
+                    )
                 } else {
-                    "這個地點在路線上會經過多次，請選擇要觸發圖針的那一次。"
+                    format!(
+                        "路線會經過「{place_name}」{} 次，請選擇圖針要在哪一次經過時出現。",
+                        pending.candidates.len()
+                    )
                 });
-                ui.add_space(6.0);
-                for index in 0..pending.candidates.len() {
-                    let label = pass_label(&pending.candidates, index, english);
-                    if ui
-                        .selectable_label(index == pending.selected_index, label)
-                        .clicked()
-                    {
-                        pending.selected_index = index;
-                        preview_progress = Some(pending.candidates[index].anchor_progress);
-                    }
-                }
+                ui.small(if english {
+                    "Selecting an option previews the route position. The coloured route ends at the closest point on the road."
+                } else {
+                    "點選選項會立即預覽該次經過；橘色路線終點是道路上距離圖針最近的位置。"
+                });
                 ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for index in 0..pending.candidates.len() {
+                            let selected = index == pending.selected_index;
+                            let mut clicked = false;
+                            egui::Frame::group(ui.style())
+                                .fill(if selected {
+                                    egui::Color32::from_rgba_unmultiplied(92, 190, 255, 38)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.radio(selected, "").clicked() {
+                                            clicked = true;
+                                        }
+                                        ui.vertical(|ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    false,
+                                                    egui::RichText::new(pass_title(
+                                                        &pending.candidates,
+                                                        index,
+                                                        english,
+                                                    ))
+                                                    .strong(),
+                                                )
+                                                .clicked()
+                                            {
+                                                clicked = true;
+                                            }
+                                            if ui
+                                                .selectable_label(
+                                                    false,
+                                                    egui::RichText::new(pass_details(
+                                                        &pending.candidates[index],
+                                                        english,
+                                                    ))
+                                                    .weak(),
+                                                )
+                                                .clicked()
+                                            {
+                                                clicked = true;
+                                            }
+                                        });
+                                    });
+                                });
+                            if clicked {
+                                pending.selected_index = index;
+                                preview_progress =
+                                    Some(pending.candidates[index].anchor_progress);
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui
                         .button(if english {
-                            "Use selected pass"
+                            "Confirm selection"
                         } else {
-                            "使用這次經過"
+                            "確認選擇"
                         })
                         .clicked()
                     {
@@ -683,6 +762,7 @@ impl NativeApp {
             self.preview_progress = progress;
         }
         if cancel {
+            self.preview_progress = original_preview_progress;
             self.pending_landmark = None;
         } else if confirm
             && let Some(pending) = self.pending_landmark.take()
@@ -698,7 +778,6 @@ impl NativeApp {
             self.preview_center_mercator = Some(scene_core::geo_to_mercator(latitude, longitude));
         }
     }
-
     fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
         let Some(track) = self.track.as_ref() else {
             return;
@@ -2827,10 +2906,11 @@ impl NativeApp {
             // Camera composition uses scene_core's logical canvas.  The
             // widget size only controls how the already-computed frame is
             // letterboxed on screen.
+            let preview_landmarks = self.preview_landmarks();
             let initial_scene = Scene {
                 track: track.clone(),
                 options: preview_options.clone(),
-                landmarks: self.landmarks.clone(),
+                landmarks: preview_landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
             let initial_frame = build_frame_with_context(
@@ -2870,7 +2950,7 @@ impl NativeApp {
             let scene = Scene {
                 track: track.clone(),
                 options: preview_options,
-                landmarks: self.landmarks.clone(),
+                landmarks: preview_landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
             let frame = build_frame_with_context(
@@ -2955,11 +3035,12 @@ impl NativeApp {
                 )
             };
             let route: Vec<_> = frame.route_ndc.iter().copied().map(to_screen).collect();
-            let completed = route
+            let completed: Vec<_> = frame
+                .completed_route_ndc
                 .iter()
-                .take(frame.completed_points)
                 .copied()
-                .collect::<Vec<_>>();
+                .map(to_screen)
+                .collect();
             painter.add(egui::Shape::line(
                 route,
                 egui::Stroke::new(
@@ -2984,6 +3065,50 @@ impl NativeApp {
                 12.0 * preview_scale,
                 egui::Color32::from_rgb(255, 93, 59),
             );
+            if let Some(pending) = &self.pending_landmark
+                && let Some(candidate) = pending.candidates.get(pending.selected_index)
+            {
+                let to_screen_geo = |latitude: f64, longitude: f64| {
+                    let projected = scene_core::geo_to_mercator(latitude, longitude);
+                    let ndc = [
+                        ((projected[0] - frame.view_center_mercator[0]) * 2.0 / frame.view_span)
+                            as f32,
+                        (-(projected[1] - frame.view_center_mercator[1]) * 2.0 / frame.view_span_y)
+                            as f32,
+                    ];
+                    to_screen(ndc)
+                };
+                let anchor = to_screen_geo(candidate.nearest_latitude, candidate.nearest_longitude);
+                let pin = to_screen_geo(pending.landmark.latitude, pending.landmark.longitude);
+                if anchor.distance(pin) > 1.0 {
+                    let connector_color = egui::Color32::from_rgba_unmultiplied(
+                        self.model.settings.scene.route_color[0],
+                        self.model.settings.scene.route_color[1],
+                        self.model.settings.scene.route_color[2],
+                        180,
+                    );
+                    draw_dashed_line(
+                        &painter,
+                        anchor,
+                        pin,
+                        egui::Stroke::new(2.0 * preview_scale, connector_color),
+                        8.0 * preview_scale,
+                        5.0 * preview_scale,
+                    );
+                    painter.circle_stroke(
+                        anchor,
+                        8.0 * preview_scale,
+                        egui::Stroke::new(
+                            2.0 * preview_scale,
+                            egui::Color32::from_white_alpha(220),
+                        ),
+                    );
+                }
+            }
+            let pending_selected_id = self
+                .pending_landmark
+                .as_ref()
+                .map(|pending| pending.landmark.id.as_str());
             let landmark_scale = preview_scale;
             for landmark in &frame.landmarks {
                 if landmark.pin_opacity <= 0.0
@@ -3002,7 +3127,8 @@ impl NativeApp {
                     landmark.color[2],
                     alpha,
                 );
-                let selected = self.selected_landmark_id.as_deref() == Some(landmark.id.as_str());
+                let selected = self.selected_landmark_id.as_deref() == Some(landmark.id.as_str())
+                    || pending_selected_id == Some(landmark.id.as_str());
                 let selection_scale = if selected { 1.35 } else { 1.0 };
                 let radius = 18.0 * landmark_scale * landmark.pin_scale.max(0.2) * selection_scale;
                 let body = point + egui::vec2(0.0, -radius * 0.78);
@@ -4064,35 +4190,159 @@ fn candidate_heading_delta(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 }
 
 fn pass_label(candidates: &[RouteAnchorCandidate], index: usize, english: bool) -> String {
-    let candidate = candidates[index];
-    let is_out_and_back = candidates.len() == 2
-        && candidate_heading_delta(candidates[0].heading_deg, candidates[1].heading_deg)
-            .is_some_and(|delta| delta >= 120.0);
-    let name = if is_out_and_back {
-        if index == 0 {
-            if english { "Outbound" } else { "去程" }
-        } else if english {
-            "Return"
-        } else {
-            "回程"
-        }
-    } else if english {
-        "Pass"
-    } else {
-        "經過"
-    };
-    let direction = candidate
-        .heading_deg
-        .map(|heading| format!(" · {heading:.0}°"))
-        .unwrap_or_default();
     format!(
-        "{name} {} / {} · {:.2} km{direction}",
-        index + 1,
-        candidates.len(),
-        candidate.anchor_distance_m / 1000.0
+        "{} · {}",
+        pass_title(candidates, index, english),
+        pass_details(&candidates[index], english)
     )
 }
+fn draw_dashed_line(
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    stroke: egui::Stroke,
+    dash_length: f32,
+    gap_length: f32,
+) {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let direction = delta / length;
+    let step = (dash_length + gap_length).max(1.0);
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + dash_length).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * dash_end],
+            stroke,
+        );
+        offset += step;
+    }
+}
 
+fn pass_is_out_and_back(candidates: &[RouteAnchorCandidate]) -> bool {
+    candidates.len() == 2
+        && candidate_heading_delta(candidates[0].heading_deg, candidates[1].heading_deg)
+            .is_some_and(|delta| delta >= 120.0)
+}
+
+fn pass_title(candidates: &[RouteAnchorCandidate], index: usize, english: bool) -> String {
+    let is_out_and_back = pass_is_out_and_back(candidates);
+    if is_out_and_back {
+        if english {
+            if index == 0 {
+                format!("Outbound · pass 1 of {}", candidates.len())
+            } else {
+                format!("Return · pass 2 of {}", candidates.len())
+            }
+        } else if index == 0 {
+            "去程｜第 1 次經過".into()
+        } else {
+            "回程｜第 2 次經過".into()
+        }
+    } else if english {
+        format!("Pass {} of {}", index + 1, candidates.len())
+    } else {
+        format!("第 {} 次經過", index + 1)
+    }
+}
+
+fn direction_label(heading: f64, english: bool) -> &'static str {
+    let heading = heading.rem_euclid(360.0);
+    match heading {
+        value if !(22.5..337.5).contains(&value) => {
+            if english {
+                "North"
+            } else {
+                "北"
+            }
+        }
+        value if value < 67.5 => {
+            if english {
+                "Northeast"
+            } else {
+                "東北"
+            }
+        }
+        value if value < 112.5 => {
+            if english {
+                "East"
+            } else {
+                "東"
+            }
+        }
+        value if value < 157.5 => {
+            if english {
+                "Southeast"
+            } else {
+                "東南"
+            }
+        }
+        value if value < 202.5 => {
+            if english {
+                "South"
+            } else {
+                "南"
+            }
+        }
+        value if value < 247.5 => {
+            if english {
+                "Southwest"
+            } else {
+                "西南"
+            }
+        }
+        value if value < 292.5 => {
+            if english {
+                "West"
+            } else {
+                "西"
+            }
+        }
+        _ => {
+            if english {
+                "Northwest"
+            } else {
+                "西北"
+            }
+        }
+    }
+}
+
+fn pass_details(candidate: &RouteAnchorCandidate, english: bool) -> String {
+    let mut details = vec![if english {
+        format!(
+            "Route mileage: {:.2} km",
+            candidate.anchor_distance_m / 1000.0
+        )
+    } else {
+        format!("路線里程：{:.2} km", candidate.anchor_distance_m / 1000.0)
+    }];
+    if let Some(heading) = candidate.heading_deg {
+        details.push(if english {
+            format!(
+                "Direction: {} ({heading:.0}°)",
+                direction_label(heading, true)
+            )
+        } else {
+            format!(
+                "行進方向：{}（{heading:.0}°）",
+                direction_label(heading, false)
+            )
+        });
+    }
+    details.push(if english {
+        format!(
+            "Distance from pin: {:.0} m",
+            candidate.distance_from_route_m
+        )
+    } else {
+        format!("距圖針 {:.0} m", candidate.distance_from_route_m)
+    });
+    details.join(" · ")
+}
 impl eframe::App for NativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(path) = ctx.input(|input| {
@@ -4274,5 +4524,24 @@ mod tests {
         assert_eq!(select_candidate_index(&candidates, 0.75), Some(1));
         assert!(pass_label(&candidates, 0, true).starts_with("Outbound"));
         assert!(pass_label(&candidates, 1, true).starts_with("Return"));
+    }
+    #[test]
+    fn pass_details_explain_mileage_direction_and_pin_distance() {
+        let candidate = RouteAnchorCandidate {
+            segment_index: 1,
+            occurrence_index: 0,
+            anchor_distance_m: 3_210.0,
+            anchor_progress: 0.2,
+            distance_from_route_m: 18.0,
+            nearest_latitude: 25.0,
+            nearest_longitude: 121.0,
+            heading_deg: Some(33.0),
+        };
+        assert_eq!(direction_label(33.0, false), "東北");
+        assert_eq!(direction_label(213.0, false), "西南");
+        let details = pass_details(&candidate, false);
+        assert!(details.contains("路線里程"));
+        assert!(details.contains("行進方向"));
+        assert!(details.contains("距圖針"));
     }
 }
