@@ -12,9 +12,9 @@ use places_core::{
     SearchCoordinate,
 };
 use scene_core::{
-    Aspect, CameraMode, Codec, FrameBuildContext, FramePurpose, LandmarkSource, LandmarkStyle,
-    MapStyle, QualityPreset, RenderLanguage, RouteLandmark, Scene, anchor_landmark_to_route,
-    build_frame_with_context, screen_point_to_geo,
+    Aspect, CameraMode, Codec, FrameBuildContext, FramePurpose, LandmarkAnchorMode, LandmarkSource,
+    LandmarkStyle, MapStyle, QualityPreset, RenderLanguage, RouteAnchorCandidate, RouteLandmark,
+    Scene, build_frame_with_context, find_landmark_passes, screen_point_to_geo,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -63,6 +63,12 @@ struct CustomLandmarkState {
     category: String,
 }
 
+struct PendingLandmarkState {
+    landmark: RouteLandmark,
+    candidates: Vec<RouteAnchorCandidate>,
+    selected_index: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsPage {
     General,
@@ -105,6 +111,7 @@ pub struct NativeApp {
     project_path: Option<PathBuf>,
     project_warning: Option<String>,
     custom_landmark: Option<CustomLandmarkState>,
+    pending_landmark: Option<PendingLandmarkState>,
     places_tx: Sender<PlacesMessage>,
     places_rx: Receiver<PlacesMessage>,
     next_places_request_id: u64,
@@ -343,6 +350,7 @@ impl NativeApp {
             project_path: None,
             project_warning: None,
             custom_landmark: None,
+            pending_landmark: None,
             places_tx,
             places_rx,
             next_places_request_id: 0,
@@ -431,7 +439,10 @@ impl NativeApp {
         }
     }
 
-    fn route_landmark_from_place(&self, place: &PlaceSummary) -> Option<RouteLandmark> {
+    fn route_landmark_from_place(
+        &self,
+        place: &PlaceSummary,
+    ) -> Option<(RouteLandmark, Vec<RouteAnchorCandidate>)> {
         let open_place = match place.provider {
             PlaceProvider::Overture | PlaceProvider::OpenStreetMap => place.clone(),
             PlaceProvider::TomTom | PlaceProvider::Foursquare => {
@@ -465,26 +476,52 @@ impl NativeApp {
             _ => return None,
         };
         let track = self.track.as_ref()?;
-        let anchor = anchor_landmark_to_route(track, open_place.latitude, open_place.longitude)?;
+        let candidates = find_landmark_passes(track, open_place.latitude, open_place.longitude);
+        let selected = select_candidate_for_progress(&candidates, self.preview_progress)?;
         let source_tag = match open_place.provider {
             PlaceProvider::Overture => "overture",
             PlaceProvider::OpenStreetMap => "osm",
             _ => "provider",
         };
-        Some(RouteLandmark {
-            id: format!("{source_tag}:{}", open_place.id),
-            source,
-            source_id: Some(open_place.id.clone()),
-            name: open_place.name.clone(),
-            category: open_place.category.clone(),
-            latitude: open_place.latitude,
-            longitude: open_place.longitude,
-            anchor_distance_m: anchor.anchor_distance_m,
-            anchor_progress: anchor.anchor_progress,
-            distance_from_route_m: anchor.distance_from_route_m,
-            enabled: true,
-            style: LandmarkStyle::default(),
-        })
+        Some((
+            RouteLandmark {
+                id: format!("{source_tag}:{}", open_place.id),
+                source,
+                source_id: Some(open_place.id.clone()),
+                name: open_place.name.clone(),
+                category: open_place.category.clone(),
+                latitude: open_place.latitude,
+                longitude: open_place.longitude,
+                anchor_distance_m: selected.anchor_distance_m,
+                anchor_progress: selected.anchor_progress,
+                distance_from_route_m: selected.distance_from_route_m,
+                anchor_mode: LandmarkAnchorMode::SelectedPass,
+                enabled: true,
+                style: LandmarkStyle::default(),
+            },
+            candidates,
+        ))
+    }
+
+    fn queue_landmark(&mut self, landmark: RouteLandmark, candidates: Vec<RouteAnchorCandidate>) {
+        let selected_index =
+            select_candidate_index(&candidates, self.preview_progress).unwrap_or(0);
+        if candidates.len() <= 1 {
+            self.add_landmark(landmark);
+            return;
+        }
+        self.pending_landmark = Some(PendingLandmarkState {
+            landmark,
+            candidates,
+            selected_index,
+        });
+    }
+
+    fn apply_candidate(landmark: &mut RouteLandmark, candidate: RouteAnchorCandidate) {
+        landmark.anchor_distance_m = candidate.anchor_distance_m;
+        landmark.anchor_progress = candidate.anchor_progress;
+        landmark.distance_from_route_m = candidate.distance_from_route_m;
+        landmark.anchor_mode = LandmarkAnchorMode::SelectedPass;
     }
 
     fn add_landmark(&mut self, mut landmark: RouteLandmark) -> String {
@@ -495,8 +532,13 @@ impl NativeApp {
                     && value.name.eq_ignore_ascii_case(&landmark.name))
         }) {
             existing.enabled = true;
+            existing.anchor_distance_m = landmark.anchor_distance_m;
+            existing.anchor_progress = landmark.anchor_progress;
+            existing.distance_from_route_m = landmark.distance_from_route_m;
+            existing.anchor_mode = LandmarkAnchorMode::SelectedPass;
             let id = existing.id.clone();
             self.selected_landmark_id = Some(id.clone());
+            self.save_landmarks();
             return id;
         }
         let id = landmark.id.clone();
@@ -519,8 +561,8 @@ impl NativeApp {
         let Some(place) = dialog.places.get(index).cloned() else {
             return;
         };
-        if let Some(landmark) = self.route_landmark_from_place(&place) {
-            self.add_landmark(landmark);
+        if let Some((landmark, candidates)) = self.route_landmark_from_place(&place) {
+            self.queue_landmark(landmark, candidates);
             self.candidate_place = None;
             self.preview_inspecting = true;
             self.preview_center_mercator =
@@ -542,8 +584,9 @@ impl NativeApp {
         let Some(track) = &self.track else {
             return;
         };
-        let Some(anchor) =
-            anchor_landmark_to_route(track, state.coordinate.latitude, state.coordinate.longitude)
+        let candidates =
+            find_landmark_passes(track, state.coordinate.latitude, state.coordinate.longitude);
+        let Some(selected) = select_candidate_for_progress(&candidates, self.preview_progress)
         else {
             return;
         };
@@ -554,7 +597,7 @@ impl NativeApp {
             self.landmarks.len()
         );
         let coordinate = state.coordinate;
-        self.add_landmark(RouteLandmark {
+        let landmark = RouteLandmark {
             id,
             source: LandmarkSource::Manual,
             source_id: None,
@@ -566,12 +609,14 @@ impl NativeApp {
             category: (!state.category.trim().is_empty()).then(|| state.category.trim().into()),
             latitude: state.coordinate.latitude,
             longitude: state.coordinate.longitude,
-            anchor_distance_m: anchor.anchor_distance_m,
-            anchor_progress: anchor.anchor_progress,
-            distance_from_route_m: anchor.distance_from_route_m,
+            anchor_distance_m: selected.anchor_distance_m,
+            anchor_progress: selected.anchor_progress,
+            distance_from_route_m: selected.distance_from_route_m,
+            anchor_mode: LandmarkAnchorMode::SelectedPass,
             enabled: true,
             style: LandmarkStyle::default(),
-        });
+        };
+        self.queue_landmark(landmark, candidates);
         self.preview_inspecting = true;
         self.preview_center_mercator = Some(scene_core::geo_to_mercator(
             coordinate.latitude,
@@ -579,10 +624,85 @@ impl NativeApp {
         ));
     }
 
-    fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
-        if self.track.is_none() {
+    fn draw_pending_landmark(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_landmark.as_mut() else {
             return;
+        };
+        let english = self.language == UiLanguage::English;
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut preview_progress = None;
+        let title = if english {
+            "Choose route pass"
+        } else {
+            "選擇經過路段"
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("choose-route-pass-window"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.label(if english {
+                    "This place is reached more than once. Choose which pass should trigger the marker."
+                } else {
+                    "這個地點在路線上會經過多次，請選擇要觸發圖針的那一次。"
+                });
+                ui.add_space(6.0);
+                for index in 0..pending.candidates.len() {
+                    let label = pass_label(&pending.candidates, index, english);
+                    if ui
+                        .selectable_label(index == pending.selected_index, label)
+                        .clicked()
+                    {
+                        pending.selected_index = index;
+                        preview_progress = Some(pending.candidates[index].anchor_progress);
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if english {
+                            "Use selected pass"
+                        } else {
+                            "使用這次經過"
+                        })
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui
+                        .button(if english { "Cancel" } else { "取消" })
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(progress) = preview_progress {
+            self.preview_progress = progress;
         }
+        if cancel {
+            self.pending_landmark = None;
+        } else if confirm
+            && let Some(pending) = self.pending_landmark.take()
+            && let Some(candidate) = pending.candidates.get(pending.selected_index).copied()
+        {
+            let mut landmark = pending.landmark;
+            Self::apply_candidate(&mut landmark, candidate);
+            let latitude = landmark.latitude;
+            let longitude = landmark.longitude;
+            self.preview_progress = candidate.anchor_progress;
+            self.add_landmark(landmark);
+            self.preview_inspecting = true;
+            self.preview_center_mercator = Some(scene_core::geo_to_mercator(latitude, longitude));
+        }
+    }
+
+    fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
+        let Some(track) = self.track.as_ref() else {
+            return;
+        };
         let english = self.language == UiLanguage::English;
         ui.small(if english {
             "Markers appear when the route reaches them and remain on the final fit view."
@@ -592,9 +712,43 @@ impl NativeApp {
         let mut changed = false;
         let mut remove = None;
         let mut jump = None;
+        let mut change_pass = None;
         for index in 0..self.landmarks.len() {
+            let candidates = find_landmark_passes(
+                track,
+                self.landmarks[index].latitude,
+                self.landmarks[index].longitude,
+            );
+            let selected_index =
+                select_candidate_index(&candidates, self.landmarks[index].anchor_progress);
             let landmark = &mut self.landmarks[index];
             let id = landmark.id.clone();
+            if let Some(selected_index) = selected_index
+                && candidates.len() > 1
+            {
+                ui.horizontal(|ui| {
+                    ui.label(if english {
+                        "Selected pass"
+                    } else {
+                        "選定經過"
+                    });
+                    egui::ComboBox::from_id_salt(("landmark-pass", &id))
+                        .selected_text(pass_label(&candidates, selected_index, english))
+                        .show_ui(ui, |ui| {
+                            for candidate_index in 0..candidates.len() {
+                                if ui
+                                    .selectable_label(
+                                        candidate_index == selected_index,
+                                        pass_label(&candidates, candidate_index, english),
+                                    )
+                                    .clicked()
+                                {
+                                    change_pass = Some((index, candidate_index));
+                                }
+                            }
+                        });
+                });
+            }
             ui.push_id(id, |ui| {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -658,6 +812,17 @@ impl NativeApp {
         }
         if let Some(index) = remove {
             self.landmarks.remove(index);
+            changed = true;
+        }
+        if let Some((landmark_index, candidate_index)) = change_pass
+            && let Some(landmark) = self.landmarks.get_mut(landmark_index)
+            && let Some(candidate) =
+                find_landmark_passes(track, landmark.latitude, landmark.longitude)
+                    .get(candidate_index)
+                    .copied()
+        {
+            Self::apply_candidate(landmark, candidate);
+            self.preview_progress = candidate.anchor_progress;
             changed = true;
         }
         if let Some(progress) = jump {
@@ -3865,6 +4030,69 @@ impl NativeApp {
     }
 }
 
+fn select_candidate_index(
+    candidates: &[RouteAnchorCandidate],
+    preferred_progress: f64,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a.anchor_progress - preferred_progress)
+                .abs()
+                .total_cmp(&(b.anchor_progress - preferred_progress).abs())
+                .then_with(|| a.anchor_distance_m.total_cmp(&b.anchor_distance_m))
+        })
+        .map(|(index, _)| index)
+}
+
+fn select_candidate_for_progress(
+    candidates: &[RouteAnchorCandidate],
+    preferred_progress: f64,
+) -> Option<RouteAnchorCandidate> {
+    select_candidate_index(candidates, preferred_progress).map(|index| candidates[index])
+}
+
+fn candidate_heading_delta(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    Some(match (a, b) {
+        (Some(a), Some(b)) => {
+            let delta = (a - b).abs().rem_euclid(360.0);
+            delta.min(360.0 - delta)
+        }
+        _ => return None,
+    })
+}
+
+fn pass_label(candidates: &[RouteAnchorCandidate], index: usize, english: bool) -> String {
+    let candidate = candidates[index];
+    let is_out_and_back = candidates.len() == 2
+        && candidate_heading_delta(candidates[0].heading_deg, candidates[1].heading_deg)
+            .is_some_and(|delta| delta >= 120.0);
+    let name = if is_out_and_back {
+        if index == 0 {
+            if english { "Outbound" } else { "去程" }
+        } else if english {
+            "Return"
+        } else {
+            "回程"
+        }
+    } else if english {
+        "Pass"
+    } else {
+        "經過"
+    };
+    let direction = candidate
+        .heading_deg
+        .map(|heading| format!(" · {heading:.0}°"))
+        .unwrap_or_default();
+    format!(
+        "{name} {} / {} · {:.2} km{direction}",
+        index + 1,
+        candidates.len(),
+        candidate.anchor_distance_m / 1000.0
+    )
+}
+
 impl eframe::App for NativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(path) = ctx.input(|input| {
@@ -3889,6 +4117,7 @@ impl eframe::App for NativeApp {
         self.draw_preview(ctx);
         self.draw_context_menu(ctx);
         self.draw_custom_landmark_dialog(ctx);
+        self.draw_pending_landmark(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
         self.persist_preferences();
@@ -4016,5 +4245,34 @@ mod tests {
         assert!((preview_content_scale(960.0, 540.0, 3840, 2160) - 0.25).abs() < 1e-6);
         assert!((preview_content_scale(960.0, 540.0, 1920, 1080) - 0.5).abs() < 1e-6);
         assert_eq!(preview_content_scale(0.0, 540.0, 3840, 2160), 1.0);
+    }
+
+    #[test]
+    fn pass_choice_follows_timeline_and_labels_reverse_direction() {
+        let candidates = vec![
+            RouteAnchorCandidate {
+                segment_index: 1,
+                occurrence_index: 0,
+                anchor_distance_m: 500.0,
+                anchor_progress: 0.2,
+                distance_from_route_m: 3.0,
+                nearest_latitude: 25.0,
+                nearest_longitude: 121.0,
+                heading_deg: Some(90.0),
+            },
+            RouteAnchorCandidate {
+                segment_index: 8,
+                occurrence_index: 1,
+                anchor_distance_m: 2_500.0,
+                anchor_progress: 0.8,
+                distance_from_route_m: 3.0,
+                nearest_latitude: 25.0,
+                nearest_longitude: 121.0,
+                heading_deg: Some(270.0),
+            },
+        ];
+        assert_eq!(select_candidate_index(&candidates, 0.75), Some(1));
+        assert!(pass_label(&candidates, 0, true).starts_with("Outbound"));
+        assert!(pass_label(&candidates, 1, true).starts_with("Return"));
     }
 }

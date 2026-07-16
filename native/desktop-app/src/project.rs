@@ -6,14 +6,14 @@
 //! the GPX content hash.
 
 use gpx_core::Track;
-use scene_core::{RouteLandmark, anchor_landmark_to_route};
+use scene_core::{LandmarkAnchorMode, RouteLandmark, find_landmark_passes};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const PROJECT_SCHEMA_VERSION: u32 = 1;
+const PROJECT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectFile {
@@ -83,13 +83,34 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn reanchor(mut landmarks: Vec<RouteLandmark>, track: &Track) -> Vec<RouteLandmark> {
+fn reanchor(mut landmarks: Vec<RouteLandmark>, track: &Track) -> (Vec<RouteLandmark>, Vec<String>) {
+    let mut warnings = Vec::new();
     for landmark in &mut landmarks {
-        if let Some(anchor) = anchor_landmark_to_route(track, landmark.latitude, landmark.longitude)
-        {
+        let candidates = find_landmark_passes(track, landmark.latitude, landmark.longitude);
+        let candidate = match landmark.anchor_mode {
+            LandmarkAnchorMode::AutomaticNearest => candidates.iter().min_by(|a, b| {
+                a.distance_from_route_m
+                    .total_cmp(&b.distance_from_route_m)
+                    .then_with(|| a.anchor_distance_m.total_cmp(&b.anchor_distance_m))
+            }),
+            LandmarkAnchorMode::SelectedPass => candidates.iter().min_by(|a, b| {
+                (a.anchor_progress - landmark.anchor_progress)
+                    .abs()
+                    .total_cmp(&(b.anchor_progress - landmark.anchor_progress).abs())
+                    .then_with(|| a.distance_from_route_m.total_cmp(&b.distance_from_route_m))
+            }),
+        };
+        if let Some(anchor) = candidate {
             landmark.anchor_distance_m = anchor.anchor_distance_m;
             landmark.anchor_progress = anchor.anchor_progress;
             landmark.distance_from_route_m = anchor.distance_from_route_m;
+            landmark.anchor_mode = LandmarkAnchorMode::SelectedPass;
+        } else {
+            landmark.enabled = false;
+            warnings.push(format!(
+                "Route place '{}' could not be matched to the current GPX route and was disabled.",
+                landmark.name
+            ));
         }
     }
     landmarks.sort_by(|a, b| {
@@ -97,7 +118,7 @@ fn reanchor(mut landmarks: Vec<RouteLandmark>, track: &Track) -> Vec<RouteLandma
             .total_cmp(&b.anchor_distance_m)
             .then_with(|| a.id.cmp(&b.id))
     });
-    landmarks
+    (landmarks, warnings)
 }
 
 pub fn load_for_route(gpx_path: &Path, track: &Track) -> io::Result<LoadedProject> {
@@ -105,18 +126,18 @@ pub fn load_for_route(gpx_path: &Path, track: &Track) -> io::Result<LoadedProjec
     let sidecar = sidecar_path(gpx_path);
     let fallback = app_data_path(&hash);
     let mut selected = None;
-    let mut warning = None;
+    let mut warnings = Vec::new();
     for candidate in [&sidecar, &fallback] {
         if !candidate.exists() {
             continue;
         }
         match read_project(candidate) {
-            Ok(project) if project.schema_version == PROJECT_SCHEMA_VERSION => {
+            Ok(project) if (1..=PROJECT_SCHEMA_VERSION).contains(&project.schema_version) => {
                 selected = Some((candidate.clone(), project));
                 break;
             }
             Ok(_) => {
-                warning = Some("Project schema is newer than this app; ignored.".to_owned());
+                warnings.push("Project schema is newer than this app; ignored.".to_owned());
             }
             Err(error) => {
                 let corrupt = candidate.with_extension(format!(
@@ -126,28 +147,40 @@ pub fn load_for_route(gpx_path: &Path, track: &Track) -> io::Result<LoadedProjec
                         .map_or(0, |value| value.as_secs())
                 ));
                 let _ = fs::rename(candidate, corrupt);
-                warning = Some(format!(
+                warnings.push(format!(
                     "Project file was corrupt and was backed up: {error}"
                 ));
             }
         }
     }
-    let Some((path, project)) = selected else {
+    let Some((path, mut project)) = selected else {
         return Ok(LoadedProject {
             landmarks: Vec::new(),
             path: sidecar,
-            warning,
+            warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
         });
     };
-    if project.gpx_sha256 != hash {
-        warning = Some(
-            "GPX content changed; saved landmarks were re-anchored to the new route.".to_owned(),
+    if project.schema_version < PROJECT_SCHEMA_VERSION {
+        for landmark in &mut project.landmarks {
+            landmark.anchor_mode = LandmarkAnchorMode::SelectedPass;
+        }
+        warnings.push(
+            "Older route project format detected; selected landmark passes were migrated."
+                .to_owned(),
         );
     }
+    if project.gpx_sha256 != hash {
+        warnings.push(
+            "GPX content changed; saved landmark passes were re-matched to the new route."
+                .to_owned(),
+        );
+    }
+    let (landmarks, reanchor_warnings) = reanchor(project.landmarks, track);
+    warnings.extend(reanchor_warnings);
     Ok(LoadedProject {
-        landmarks: reanchor(project.landmarks, track),
+        landmarks,
         path,
-        warning,
+        warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
     })
 }
 
@@ -160,7 +193,7 @@ pub fn save_for_route(
     let project = ProjectFile {
         schema_version: PROJECT_SCHEMA_VERSION,
         gpx_sha256: hash.clone(),
-        landmarks: reanchor(landmarks.to_vec(), track),
+        landmarks: reanchor(landmarks.to_vec(), track).0,
     };
     let bytes = serde_json::to_vec_pretty(&project).map_err(io::Error::other)?;
     let sidecar = sidecar_path(gpx_path);
@@ -182,13 +215,24 @@ pub fn save_for_route(
 mod tests {
     use super::*;
     use gpx_core::{ParseOptions, parse_gpx};
-    use scene_core::{LandmarkSource, LandmarkStyle};
+    use scene_core::{LandmarkSource, LandmarkStyle, find_landmark_passes};
 
     fn track() -> Track {
         parse_gpx(
             r#"<gpx><trk><trkseg>
             <trkpt lat="25" lon="121"/><trkpt lat="25" lon="121.01"/>
             <trkpt lat="25.01" lon="121.02"/>
+            </trkseg></trk></gpx>"#,
+            ParseOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn out_and_back_track() -> Track {
+        parse_gpx(
+            r#"<gpx><trk><trkseg>
+            <trkpt lat="25" lon="121"/><trkpt lat="25" lon="121.01"/>
+            <trkpt lat="25" lon="121"/>
             </trkseg></trk></gpx>"#,
             ParseOptions::default(),
         )
@@ -207,6 +251,7 @@ mod tests {
             anchor_distance_m: 0.0,
             anchor_progress: 0.0,
             distance_from_route_m: 0.0,
+            anchor_mode: LandmarkAnchorMode::SelectedPass,
             enabled: true,
             style: LandmarkStyle::default(),
         }
@@ -245,6 +290,75 @@ mod tests {
                 .unwrap()
                 .flatten()
                 .any(|entry| entry.file_name().to_string_lossy().contains("corrupt-"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_return_pass_survives_save_and_reload() {
+        let root = std::env::temp_dir().join(format!("gpx-project-return-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let gpx = root.join("route.gpx");
+        fs::write(&gpx, "<gpx/>").unwrap();
+        let route = out_and_back_track();
+        let passes = find_landmark_passes(&route, 25.0, 121.005);
+        assert_eq!(passes.len(), 2);
+        let mut place = landmark();
+        place.anchor_distance_m = passes[1].anchor_distance_m;
+        place.anchor_progress = passes[1].anchor_progress;
+        place.distance_from_route_m = passes[1].distance_from_route_m;
+        let saved = save_for_route(&gpx, &[place], &route).unwrap();
+        assert!(matches!(saved, ProjectSaveLocation::Sidecar(_)));
+        let loaded = load_for_route(&gpx, &route).unwrap();
+        assert_eq!(loaded.landmarks.len(), 1);
+        assert!((loaded.landmarks[0].anchor_progress - passes[1].anchor_progress).abs() < 1e-9);
+        assert_eq!(
+            loaded.landmarks[0].anchor_mode,
+            LandmarkAnchorMode::SelectedPass
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v1_project_migrates_saved_anchor_progress() {
+        let root = std::env::temp_dir().join(format!("gpx-project-v1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let gpx = root.join("route.gpx");
+        fs::write(&gpx, "<gpx/>").unwrap();
+        let route = out_and_back_track();
+        let passes = find_landmark_passes(&route, 25.0, 121.005);
+        let mut place = landmark();
+        place.anchor_distance_m = passes[1].anchor_distance_m;
+        place.anchor_progress = passes[1].anchor_progress;
+        place.distance_from_route_m = passes[1].distance_from_route_m;
+        let mut json = serde_json::to_value(ProjectFile {
+            schema_version: 1,
+            gpx_sha256: source_hash(&gpx).unwrap(),
+            landmarks: vec![place],
+        })
+        .unwrap();
+        json["landmarks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("anchor_mode");
+        fs::write(
+            sidecar_path(&gpx),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_for_route(&gpx, &route).unwrap();
+        assert!((loaded.landmarks[0].anchor_progress - passes[1].anchor_progress).abs() < 1e-9);
+        assert_eq!(
+            loaded.landmarks[0].anchor_mode,
+            LandmarkAnchorMode::SelectedPass
+        );
+        assert!(
+            loaded
+                .warning
+                .unwrap()
+                .contains("Older route project format")
         );
         let _ = fs::remove_dir_all(root);
     }

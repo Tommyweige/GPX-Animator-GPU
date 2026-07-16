@@ -89,10 +89,12 @@ placeholder so a transient network failure cannot corrupt the export.
    address and map link. The panel never covers the map and is resizable.
 3. **Preview** draws a temporary blue candidate pin. **Add pin** writes the
    selected WGS84 coordinate to the route sidecar and does not alter the
-   animation timeline or current progress.
-4. Added pins are revealed when the route reaches their closest segment and
-   remain visible in the final Fit view. They use a cream/coral teardrop body,
-   stem, soft pulse and localized category label in both preview and export.
+   animation timeline or current progress. If the route passes the place more
+   than once, the current timeline position preselects a pass and the app asks
+   you to confirm the outbound/return (or numbered) occurrence.
+4. Added pins are revealed when the route reaches the selected pass and remain
+   visible in the final Fit view. They use a cream/coral teardrop body, stem,
+   soft pulse and localized category label in both preview and export.
 
 Offline Free (Overture + OSM) is the default profile. Optional BYOK profiles
 support TomTom Places Search, Foursquare, Google Places and a Gateway contract.

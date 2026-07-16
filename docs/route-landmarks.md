@@ -20,25 +20,37 @@ contract can be used by the UI, export pipeline, and release/CI checks.
 5. Use **Route places** in the left panel to preview a marker, edit its name
    or category, disable it, or remove it. Changes are saved immediately.
 
+When the route reaches the same place more than once, the app projects the
+place onto the GPX in route order and groups nearby segments into distinct
+passes. A unique pass is added immediately. If there are multiple passes, the
+current timeline position is used only as the initial selection and the user
+must confirm the intended pass. Opposite-direction pairs are labelled
+outbound/return; complex loops use pass numbers and headings instead of
+guessing those semantics.
+
 ## Data and persistence contract
 
 `scene-core` owns the provider-neutral `RouteLandmark` model:
 
 - `latitude`/`longitude` remain the real POI coordinate and are never snapped;
-- `anchor_distance_m` and `anchor_progress` identify the nearest GPX segment
+- `anchor_distance_m` and `anchor_progress` identify the selected route pass
   and control activation timing;
+- `anchor_mode` records whether the pass was explicitly selected, so saving or
+  reloading a project cannot silently fall back to a spatially nearest pass;
 - `distance_from_route_m` is retained for user review;
 - `LandmarkSource` and `source_id` preserve provenance;
 - `LandmarkStyle` stores the pin colour and label visibility.
 
 The source GPX is immutable. A project is stored as
-`<route>.gpxanimator.json` with a schema version, SHA-256 of the GPX bytes, and
+`<route>.gpxanimator.json` with schema version 2, SHA-256 of the GPX bytes, and
 the landmark list. Writes are atomic (`.json.tmp` then rename). If the route
 folder is read-only, the same payload is stored under
 `%LOCALAPPDATA%\GPX Animator\projects\<sha256>.gpxanimator.json`. A corrupt
 sidecar is renamed with a `.corrupt-<timestamp>.json` suffix before the app
-continues with an empty list. Loading a project always re-anchors coordinates
-against the current track, and warns when the GPX hash changed.
+continues with an empty list. Loading a project re-matches the saved pass
+against the current track and warns when the GPX hash changed. Schema-v1
+projects are migrated using their stored anchor progress; landmarks that no
+longer match the route are disabled with a visible warning.
 
 ## Reveal and rendering contract
 
@@ -74,9 +86,9 @@ used.
 The implementation is covered by deterministic tests in the normal workspace
 suite:
 
-- `scene-core`: route projection, dateline-safe nearest-segment anchoring,
-  reveal timing, persistent pins, Fit bounds, camera blending, and all aspect
-  ratios;
+- `scene-core`: route projection, repeated-pass detection for out-and-back
+  routes, heading labels, dateline-safe nearest-segment anchoring, reveal
+  timing, persistent pins, Fit bounds, camera blending, and all aspect ratios;
 - `desktop-app::project`: sidecar round-trip, GPX hash re-anchor, atomic write,
   read-only AppData fallback, and corrupt-file backup;
 - UI/export: exact frame/timestamp tests, cancellation cleanup, settings and
