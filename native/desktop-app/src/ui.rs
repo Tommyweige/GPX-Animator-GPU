@@ -5,7 +5,7 @@ use crate::{
 };
 use eframe::egui;
 use gpx_core::{ParseOptions, Track};
-use nvenc_engine::CancellationToken;
+use nvenc_engine::{CancellationToken, ExportActivity};
 use places_core::{
     DataPackManager, GatewayConfig, NearbyProviderPreference, NearbySearchRequest, PlaceLanguage,
     PlaceProvider, PlaceSummary, PoiProfile, PoiSearchResponse, PoiService, ProviderCredentials,
@@ -271,6 +271,85 @@ fn localized_error(language: UiLanguage, message: &str) -> String {
         return message.replacen("地圖圖磚失敗", "Map tile failed", 1);
     }
     message.to_owned()
+}
+
+fn export_step(activity: ExportActivity) -> u8 {
+    match activity {
+        ExportActivity::PreparingRoute
+        | ExportActivity::PreparingMapTiles
+        | ExportActivity::InitializingExporter => 1,
+        ExportActivity::RenderingVideo
+        | ExportActivity::FinalizingFile
+        | ExportActivity::VerifyingOutput => 2,
+    }
+}
+
+fn export_title(activity: ExportActivity, english: bool) -> &'static str {
+    match (export_step(activity), english) {
+        (1, true) => "Preparing export",
+        (1, false) => "準備匯出",
+        (2, true) => "Creating video",
+        (2, false) => "產生影片",
+        _ => unreachable!("export steps are limited to 1 and 2"),
+    }
+}
+
+fn export_detail(activity: ExportActivity, english: bool) -> &'static str {
+    match (activity, english) {
+        (ExportActivity::PreparingRoute, true) => "Analyzing the route and map area…",
+        (ExportActivity::PreparingRoute, false) => "正在分析路線與地圖範圍…",
+        (ExportActivity::PreparingMapTiles, true) => "Preparing map assets",
+        (ExportActivity::PreparingMapTiles, false) => "正在準備地圖素材",
+        (ExportActivity::InitializingExporter, true) => "Starting the video exporter…",
+        (ExportActivity::InitializingExporter, false) => "正在啟動影片輸出…",
+        (ExportActivity::RenderingVideo, true) => "Rendering video frames",
+        (ExportActivity::RenderingVideo, false) => "正在產生影片幀",
+        (ExportActivity::FinalizingFile, true) => "Finishing the MP4…",
+        (ExportActivity::FinalizingFile, false) => "正在完成 MP4…",
+        (ExportActivity::VerifyingOutput, true) => "Checking the output file…",
+        (ExportActivity::VerifyingOutput, false) => "正在檢查輸出檔案…",
+    }
+}
+
+fn format_eta(eta_seconds: Option<f64>, english: bool) -> String {
+    let Some(seconds) = eta_seconds.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return if english {
+            "Estimating time remaining…".to_owned()
+        } else {
+            "正在估算剩餘時間…".to_owned()
+        };
+    };
+    if seconds < 0.5 {
+        return if english {
+            "Almost done".to_owned()
+        } else {
+            "即將完成".to_owned()
+        };
+    }
+    let total_seconds = seconds.ceil() as u64;
+    let minutes = total_seconds / 60;
+    let remaining_seconds = total_seconds % 60;
+    if minutes == 0 {
+        if english {
+            format!("About {total_seconds}s remaining")
+        } else {
+            format!("約剩 {total_seconds} 秒")
+        }
+    } else if minutes < 60 {
+        if english {
+            format!("About {minutes}m {remaining_seconds:02}s remaining")
+        } else {
+            format!("約剩 {minutes} 分 {remaining_seconds:02} 秒")
+        }
+    } else {
+        let hours = minutes / 60;
+        let remaining_minutes = minutes % 60;
+        if english {
+            format!("About {hours}h {remaining_minutes:02}m remaining")
+        } else {
+            format!("約剩 {hours} 小時 {remaining_minutes:02} 分")
+        }
+    }
 }
 
 impl NativeApp {
@@ -1786,35 +1865,8 @@ impl NativeApp {
                     }
                     match &self.model.state {
                         JobState::Running(value) => {
-                            if value.stage == nvenc_engine::ExportStage::Preflight {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("正在讀取本地地圖快取並補齊缺少圖磚…");
-                                });
-                            }
-                            let ratio = if value.stage_total == 0 {
-                                0.0
-                            } else {
-                                value.stage_completed as f32 / value.stage_total as f32
-                            };
-                            let status = if value.stage == nvenc_engine::ExportStage::Preflight {
-                                format!("地圖圖磚 {}/{}", value.stage_completed, value.stage_total)
-                            } else {
-                                format!(
-                                    "影片 {} FPS · 輸出 {:.1} fps ({:.2}×) · ETA {:.1}s",
-                                    self.model.settings.fps,
-                                    value.fps,
-                                    value.fps / self.model.settings.fps as f64,
-                                    value.eta_seconds
-                                )
-                            };
-                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
-                            if ui.button("取消匯出").clicked() {
-                                if let Some(token) = &self.active_token {
-                                    token.cancel()
-                                }
-                                self.model.cancel();
-                            }
+                            let value = value.clone();
+                            self.draw_export_progress(ui, &value, false);
                         }
                         _ => {
                             if ui
@@ -2146,6 +2198,64 @@ impl NativeApp {
         apply_long_edge(&mut self.model.settings, long_edge);
     }
 
+    fn draw_export_progress(&mut self, ui: &mut egui::Ui, value: &ExportProgress, english: bool) {
+        let step = export_step(value.activity);
+        ui.horizontal(|ui| {
+            ui.strong(format!(
+                "{}  {step}/2",
+                export_title(value.activity, english)
+            ));
+        });
+        ui.small(export_detail(value.activity, english));
+
+        let stage_total = value.stage_total.filter(|total| *total > 0);
+        if let Some(total) = stage_total {
+            let ratio = (value.stage_completed as f32 / total as f32).clamp(0.0, 1.0);
+            let progress_text = match (value.activity, english) {
+                (ExportActivity::PreparingMapTiles, true) => {
+                    format!("Map assets {} / {total}", value.stage_completed)
+                }
+                (ExportActivity::PreparingMapTiles, false) => {
+                    format!("地圖素材 {} / {total}", value.stage_completed)
+                }
+                (ExportActivity::RenderingVideo, true) => {
+                    format!("Video frames {} / {total}", value.stage_completed)
+                }
+                (ExportActivity::RenderingVideo, false) => {
+                    format!("影片幀 {} / {total}", value.stage_completed)
+                }
+                _ => format!("{} / {total}", value.stage_completed),
+            };
+            ui.add(
+                egui::ProgressBar::new(ratio)
+                    .show_percentage()
+                    .text(progress_text),
+            );
+        } else {
+            ui.add(egui::ProgressBar::new(0.0).animate(true).text(if english {
+                "Working…"
+            } else {
+                "請稍候…"
+            }));
+        }
+
+        if matches!(
+            value.activity,
+            ExportActivity::PreparingMapTiles | ExportActivity::RenderingVideo
+        ) {
+            ui.small(format_eta(value.eta_seconds, english));
+        }
+        if ui
+            .button(if english { "Cancel" } else { "取消匯出" })
+            .clicked()
+        {
+            if let Some(token) = &self.active_token {
+                token.cancel();
+            }
+            self.model.cancel();
+        }
+    }
+
     fn draw_export_footer(&mut self, ui: &mut egui::Ui, english: bool) {
         ui.separator();
         ui.strong(if english { "Export" } else { "輸出" });
@@ -2261,22 +2371,8 @@ impl NativeApp {
         }
         match &self.model.state {
             JobState::Running(value) => {
-                let ratio = if value.stage_total == 0 {
-                    0.0
-                } else {
-                    value.stage_completed as f32 / value.stage_total as f32
-                };
-                ui.add(
-                    egui::ProgressBar::new(ratio)
-                        .show_percentage()
-                        .text(format!("{:?} · {:.1} FPS", value.stage, value.fps)),
-                );
-                if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
-                    if let Some(token) = &self.active_token {
-                        token.cancel();
-                    }
-                    self.model.cancel();
-                }
+                let value = value.clone();
+                self.draw_export_progress(ui, &value, english);
             }
             _ => {
                 let long_edge = current_long_edge(&self.model.settings);
@@ -2528,38 +2624,8 @@ impl NativeApp {
                     }
                     match &self.model.state {
                         JobState::Running(value) => {
-                            if value.stage == nvenc_engine::ExportStage::Preflight {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Preparing cached map tiles…");
-                                });
-                            }
-                            let ratio = if value.stage_total == 0 {
-                                0.0
-                            } else {
-                                value.stage_completed as f32 / value.stage_total as f32
-                            };
-                            let status = if value.stage == nvenc_engine::ExportStage::Preflight {
-                                format!(
-                                    "Map tiles {} / {}",
-                                    value.stage_completed, value.stage_total
-                                )
-                            } else {
-                                format!(
-                                    "{} / {} · {:.1} FPS · ETA {:.1}s",
-                                    value.stage_completed,
-                                    value.stage_total,
-                                    value.fps,
-                                    value.eta_seconds
-                                )
-                            };
-                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
-                            if ui.button("Cancel").clicked() {
-                                if let Some(token) = &self.active_token {
-                                    token.cancel();
-                                }
-                                self.model.cancel();
-                            }
+                            let value = value.clone();
+                            self.draw_export_progress(ui, &value, true);
                         }
                         _ => {
                             if ui
@@ -4001,6 +4067,29 @@ mod tests {
         assert_eq!(
             localized_error(UiLanguage::TraditionalChinese, "錯誤"),
             "錯誤"
+        );
+    }
+
+    #[test]
+    fn export_eta_is_localized_and_never_renders_zero_seconds() {
+        assert_eq!(format_eta(None, false), "正在估算剩餘時間…");
+        assert_eq!(format_eta(Some(0.0), false), "即將完成");
+        assert_eq!(format_eta(Some(12.1), false), "約剩 13 秒");
+        assert_eq!(format_eta(Some(128.0), true), "About 2m 08s remaining");
+        assert_eq!(format_eta(Some(3661.0), false), "約剩 1 小時 01 分");
+    }
+
+    #[test]
+    fn export_activity_uses_two_plain_language_steps() {
+        assert_eq!(export_step(ExportActivity::PreparingMapTiles), 1);
+        assert_eq!(export_step(ExportActivity::RenderingVideo), 2);
+        assert_eq!(
+            export_title(ExportActivity::PreparingRoute, false),
+            "準備匯出"
+        );
+        assert_eq!(
+            export_title(ExportActivity::FinalizingFile, true),
+            "Creating video"
         );
     }
 
