@@ -1,7 +1,7 @@
 use crate::{
     AppModel, AppPreferences, Diagnostics, ExportOutcome, ExportProgress, ExportRequest,
-    ExportSettings, JobState, UiLanguage, UiLayoutPreferences, detect_gpu_capabilities,
-    load_gpx_file, run_native_export,
+    ExportSettings, JobState, SettingsWindowPreferences, UiLanguage, UiLayoutPreferences,
+    detect_gpu_capabilities, load_gpx_file, run_native_export,
 };
 use eframe::egui;
 use gpx_core::{ParseOptions, Track};
@@ -205,16 +205,92 @@ fn current_long_edge(settings: &ExportSettings) -> u32 {
 
 const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
 const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 620.0;
+const SETTINGS_WINDOW_MIN_WIDTH: f32 = 680.0;
+const SETTINGS_WINDOW_MIN_HEIGHT: f32 = 500.0;
 const SETTINGS_WINDOW_OUTER_MARGIN: f32 = 24.0;
 
-fn settings_window_size(available_rect: egui::Rect) -> egui::Vec2 {
+fn settings_window_max_size(available_rect: egui::Rect) -> egui::Vec2 {
     let available_size = available_rect.size();
-    let usable_width = (available_size.x - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0);
-    let usable_height = (available_size.y - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0);
     egui::vec2(
-        SETTINGS_WINDOW_DEFAULT_WIDTH.min(usable_width),
-        SETTINGS_WINDOW_DEFAULT_HEIGHT.min(usable_height),
+        (available_size.x - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0),
+        (available_size.y - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0),
     )
+}
+
+fn settings_window_min_size(available_rect: egui::Rect) -> egui::Vec2 {
+    let max_size = settings_window_max_size(available_rect);
+    egui::vec2(
+        SETTINGS_WINDOW_MIN_WIDTH.min(max_size.x),
+        SETTINGS_WINDOW_MIN_HEIGHT.min(max_size.y),
+    )
+}
+
+fn settings_window_size(available_rect: egui::Rect) -> egui::Vec2 {
+    let min_size = settings_window_min_size(available_rect);
+    let max_size = settings_window_max_size(available_rect);
+    egui::vec2(
+        SETTINGS_WINDOW_DEFAULT_WIDTH.clamp(min_size.x, max_size.x),
+        SETTINGS_WINDOW_DEFAULT_HEIGHT.clamp(min_size.y, max_size.y),
+    )
+}
+
+fn settings_window_initial_rect(
+    available_rect: egui::Rect,
+    default_size: egui::Vec2,
+    min_size: egui::Vec2,
+    max_size: egui::Vec2,
+    saved: &SettingsWindowPreferences,
+) -> egui::Rect {
+    let size = saved
+        .size
+        .and_then(|size| {
+            if size[0].is_finite() && size[1].is_finite() && size[0] > 0.0 && size[1] > 0.0 {
+                Some(egui::vec2(size[0], size[1]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default_size);
+    let size = egui::vec2(
+        size.x.clamp(min_size.x, max_size.x),
+        size.y.clamp(min_size.y, max_size.y),
+    );
+    let default_position = available_rect.center() - size / 2.0;
+    let position = saved
+        .position
+        .and_then(|position| {
+            if position[0].is_finite() && position[1].is_finite() {
+                Some(egui::pos2(position[0], position[1]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default_position);
+    let margin_x = SETTINGS_WINDOW_OUTER_MARGIN.min(available_rect.width() * 0.5);
+    let margin_y = SETTINGS_WINDOW_OUTER_MARGIN.min(available_rect.height() * 0.5);
+    let min_x = available_rect.left() + margin_x;
+    let min_y = available_rect.top() + margin_y;
+    let max_x = (available_rect.right() - margin_x - size.x).max(min_x);
+    let max_y = (available_rect.bottom() - margin_y - size.y).max(min_y);
+    egui::Rect::from_min_size(
+        egui::pos2(
+            position.x.clamp(min_x, max_x),
+            position.y.clamp(min_y, max_y),
+        ),
+        size,
+    )
+}
+
+fn settings_window_preferences_from_rect(rect: egui::Rect) -> SettingsWindowPreferences {
+    let values = [rect.left(), rect.top(), rect.width(), rect.height()];
+    if values.iter().all(|value| value.is_finite()) {
+        SettingsWindowPreferences {
+            position: Some([rect.left(), rect.top()]),
+            size: Some([rect.width(), rect.height()]),
+        }
+    } else {
+        SettingsWindowPreferences::default()
+    }
 }
 
 fn apply_long_edge(settings: &mut ExportSettings, long_edge: u32) {
@@ -3198,19 +3274,30 @@ impl NativeApp {
         let mut download_pack = false;
         let mut clear_cache = false;
         let language_before = self.language;
-        let window_size = settings_window_size(ctx.available_rect());
+        let available_rect = ctx.content_rect();
+        let window_min_size = settings_window_min_size(available_rect);
+        let window_max_size = settings_window_max_size(available_rect);
+        let window_size = settings_window_size(available_rect);
+        let saved_window = self.layout.settings_window.clone();
+        let window_rect = settings_window_initial_rect(
+            available_rect,
+            window_size,
+            window_min_size,
+            window_max_size,
+            &saved_window,
+        );
+        let settings_window_id = egui::Id::new("settings-window-stable");
         egui::Window::new(if english { "Settings" } else { "設定" })
-            .id(egui::Id::new("settings-window-stable"))
+            .id(settings_window_id)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(window_size)
-            .resizable(false)
+            .default_rect(window_rect)
+            .min_size(window_min_size)
+            .max_size(window_max_size)
+            .movable(true)
+            .resizable(true)
+            .constrain_to(available_rect)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.set_min_size(egui::vec2(
-                    (window_size.x - 30.0).max(0.0),
-                    (window_size.y - 50.0).max(0.0),
-                ));
                 let content_size = ui.available_size_before_wrap();
                 ui.horizontal_top(|ui| {
                     let sidebar_width = 150.0_f32.min(content_size.x);
@@ -3454,6 +3541,20 @@ impl NativeApp {
                     );
                 });
             });
+        if let Some(rect) = ctx.memory(|memory| memory.area_rect(settings_window_id)) {
+            let actual_geometry = settings_window_preferences_from_rect(rect);
+            let safe_rect = settings_window_initial_rect(
+                available_rect,
+                window_size,
+                window_min_size,
+                window_max_size,
+                &actual_geometry,
+            );
+            let geometry = settings_window_preferences_from_rect(safe_rect);
+            if self.layout.settings_window != geometry {
+                self.layout.settings_window = geometry;
+            }
+        }
         self.show_settings = open;
         if self.language != language_before {
             self.model.settings.scene.render_language = render_language(self.language);
@@ -4070,6 +4171,57 @@ mod tests {
         assert_eq!(high_dpi_size, egui::vec2(760.0, 552.0));
         assert!(high_dpi_size.x <= high_dpi.width() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
         assert!(high_dpi_size.y <= high_dpi.height() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+    }
+
+    #[test]
+    fn settings_window_defaults_are_centered_and_bounded() {
+        let available =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1440.0, 900.0));
+        let min_size = settings_window_min_size(available);
+        let max_size = settings_window_max_size(available);
+        let default_size = settings_window_size(available);
+        let rect = settings_window_initial_rect(
+            available,
+            default_size,
+            min_size,
+            max_size,
+            &SettingsWindowPreferences::default(),
+        );
+        assert_eq!(rect.size(), egui::vec2(760.0, 620.0));
+        assert!((rect.center().x - available.center().x).abs() < f32::EPSILON);
+        assert!((rect.center().y - available.center().y).abs() < f32::EPSILON);
+        assert!(rect.left() >= available.left() + SETTINGS_WINDOW_OUTER_MARGIN);
+        assert!(rect.right() <= available.right() - SETTINGS_WINDOW_OUTER_MARGIN);
+        assert!(rect.top() >= available.top() + SETTINGS_WINDOW_OUTER_MARGIN);
+        assert!(rect.bottom() <= available.bottom() - SETTINGS_WINDOW_OUTER_MARGIN);
+    }
+
+    #[test]
+    fn settings_window_restores_and_clamps_persisted_geometry() {
+        let available = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(956.0, 764.0));
+        let min_size = settings_window_min_size(available);
+        let max_size = settings_window_max_size(available);
+        let saved = SettingsWindowPreferences {
+            position: Some([-500.0, -300.0]),
+            size: Some([1500.0, 1200.0]),
+        };
+        let rect = settings_window_initial_rect(
+            available,
+            settings_window_size(available),
+            min_size,
+            max_size,
+            &saved,
+        );
+        assert_eq!(rect.size(), max_size);
+        assert_eq!(rect.left(), SETTINGS_WINDOW_OUTER_MARGIN);
+        assert_eq!(rect.top(), SETTINGS_WINDOW_OUTER_MARGIN);
+
+        let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 450.0));
+        assert_eq!(
+            settings_window_min_size(tiny),
+            settings_window_max_size(tiny)
+        );
+        assert_eq!(settings_window_size(tiny), settings_window_max_size(tiny));
     }
 
     #[test]
