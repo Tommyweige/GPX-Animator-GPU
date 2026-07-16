@@ -113,19 +113,38 @@ pub enum ExportStage {
     Cancelled,
     Failed,
 }
+
+/// User-facing activity within an export.  `ExportStage` remains useful for
+/// the encoder lifecycle, while this value lets the desktop UI explain what
+/// the user is waiting for without exposing internal stage names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportActivity {
+    PreparingRoute,
+    PreparingMapTiles,
+    InitializingExporter,
+    RenderingVideo,
+    FinalizingFile,
+    VerifyingOutput,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportProgress {
     pub stage: ExportStage,
+    pub activity: ExportActivity,
     pub completed_frames: u64,
     pub total_frames: u64,
     /// Work completed for the current stage. During preflight this is the
     /// number of prepared tiles; during rendering/encoding it is frames.
     pub stage_completed: u64,
-    /// Total work for the current stage. This keeps tile preparation from
-    /// being displayed as an incorrect video FPS/frame count.
-    pub stage_total: u64,
-    pub fps: f64,
-    pub eta_seconds: f64,
+    /// Total work for the current stage. `None` means that the stage is
+    /// indeterminate (for example GPU initialization or MP4 finalization).
+    /// This keeps tile preparation from being displayed as an incorrect video
+    /// FPS/frame count.
+    pub stage_total: Option<u64>,
+    /// Actual render throughput.  This is absent while preparing assets or
+    /// while the sample count is too small to produce a useful estimate.
+    pub fps: Option<f64>,
+    pub eta_seconds: Option<f64>,
 }
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ExportMetrics {
@@ -195,12 +214,17 @@ where
             let fps = completed as f64 / elapsed;
             progress(ExportProgress {
                 stage: ExportStage::Encoding,
+                activity: ExportActivity::RenderingVideo,
                 completed_frames: completed,
                 total_frames,
                 stage_completed: completed,
-                stage_total: total_frames,
-                fps,
-                eta_seconds: (total_frames - completed) as f64 / fps,
+                stage_total: Some(total_frames),
+                fps: Some(fps),
+                eta_seconds: if completed < total_frames {
+                    Some((total_frames - completed) as f64 / fps)
+                } else {
+                    None
+                },
             });
         }
         for packet in encoder.flush().map_err(NvencError::Native)? {
@@ -984,6 +1008,12 @@ mod tests {
         assert_eq!(metrics.encoded_frames, 120);
         assert_eq!(metrics.cpu_frame_readbacks, 0);
         assert_eq!(updates.last().unwrap().completed_frames, 120);
+        assert_eq!(
+            updates.last().unwrap().activity,
+            ExportActivity::RenderingVideo
+        );
+        assert_eq!(updates.last().unwrap().stage_total, Some(120));
+        assert!(updates.last().unwrap().fps.is_some());
     }
     #[test]
     fn cancellation_aborts_muxer_without_finalizing() {

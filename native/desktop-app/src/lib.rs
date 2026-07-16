@@ -1,5 +1,5 @@
 use nvenc_engine::{
-    CancellationToken, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
+    CancellationToken, ExportActivity, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
 };
 use scene_core::{Codec, QualityPreset, SceneOptions};
 use serde::{Deserialize, Serialize};
@@ -271,12 +271,13 @@ impl AppModel {
         let token = CancellationToken::default();
         let progress = ExportProgress {
             stage: ExportStage::Preflight,
+            activity: ExportActivity::PreparingRoute,
             completed_frames: 0,
             total_frames: self.settings.total_frames(),
             stage_completed: 0,
-            stage_total: 0,
-            fps: 0.0,
-            eta_seconds: 0.0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
         };
         self.cancellation = Some(token.clone());
         self.state = JobState::Running(progress);
