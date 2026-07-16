@@ -1,0 +1,7 @@
+interface:
+  display_name: "Worktree 功能開發"
+  short_description: "在獨立 Worktree 建立功能 branch、完成任務、測試並提交"
+  default_prompt: "請在目前獨立 Worktree 中執行功能任務，建立唯一功能 branch、完成修改、測試並提交。"
+
+policy:
+  allow_implicit_invocation: false
