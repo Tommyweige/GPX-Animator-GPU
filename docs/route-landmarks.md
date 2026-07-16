@@ -8,16 +8,22 @@ contract can be used by the UI, export pipeline, and release/CI checks.
 
 1. Load a GPX track and right-click a visible location in the aspect-correct
    preview.
-2. Choose **Search nearby places**. The context menu converts the clicked
-   screen point back to WGS84 and opens a fixed results window.
-3. Select **Add to route** for Overture/OSM, or **Match & add** for a
+2. Choose **Search nearby places** or **Add custom route marker**. Both flows
+   use the same resizable right-hand inspector and persisted search radius
+   (500 m, 1 km, 2 km, or 5 km).
+3. **Search nearby places** converts the clicked screen point back to WGS84,
+   runs the provider lookup in the background, and shows the results in the
+   inspector.
+4. Select **Add to route** for Overture/OSM, or **Match & add** for a
    TomTom/Foursquare result. Live provider rows are accepted only when a
    same-name Overture/OSM row is found within 100 m; this prevents a paid
    provider object from being silently copied into the project.
-4. If there is no open-data match, choose **Add custom route marker** from the
-   map context menu, enter a name/category, and confirm. This is the supported
-   fallback for Google, Gateway, and private/unmapped locations.
-5. Use **Route places** in the left panel to preview a marker, edit its name
+5. **Add custom route marker** opens a form for the clicked coordinate. The
+   form can search the same nearby radius and use a compatible result's real
+   coordinate, name, category, and source; otherwise **Add custom pin** saves
+   the original coordinate as a manual marker. This is the supported fallback
+   for Google, Gateway, and private/unmapped locations.
+6. Use **Route places** in the left panel to preview a marker, edit its name
    or category, disable it, or remove it. Changes are saved immediately.
 
 When the route reaches the same place more than once, the app projects the
@@ -25,8 +31,8 @@ place onto the GPX in route order and groups nearby segments into distinct
 passes. A unique pass is added immediately. If there are multiple passes, the
 current timeline position is used only as the initial selection and the user
 must confirm the intended pass. Opposite-direction pairs are labelled
-outbound/return; complex loops use pass numbers and headings instead of
-guessing those semantics.
+outbound/return; complex loops use pass numbers. Heading data is retained for
+this classification but is not displayed in the compact UI.
 
 ## Data and persistence contract
 
@@ -87,7 +93,7 @@ The implementation is covered by deterministic tests in the normal workspace
 suite:
 
 - `scene-core`: route projection, repeated-pass detection for out-and-back
-  routes, heading labels, dateline-safe nearest-segment anchoring, reveal
+  routes, heading-based pass classification, dateline-safe nearest-segment anchoring, reveal
   timing, persistent pins, Fit bounds, camera blending, and all aspect ratios;
 - `desktop-app::project`: sidecar round-trip, GPX hash re-anchor, atomic write,
   read-only AppData fallback, and corrupt-file backup;

@@ -46,9 +46,11 @@ struct ContextMenuState {
     coordinate: SearchCoordinate,
 }
 
+#[derive(Clone)]
 struct NearbyDialogState {
     coordinate: SearchCoordinate,
     request_id: u64,
+    purpose: NearbySearchPurpose,
     loading: bool,
     places: Vec<PlaceSummary>,
     error: Option<String>,
@@ -57,10 +59,17 @@ struct NearbyDialogState {
     degraded: bool,
 }
 
+#[derive(Clone)]
 struct CustomLandmarkState {
     coordinate: SearchCoordinate,
     name: String,
     category: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NearbySearchPurpose {
+    Browse,
+    CustomMarker,
 }
 
 struct PendingLandmarkState {
@@ -574,22 +583,36 @@ impl NativeApp {
     }
 
     fn add_place_from_dialog(&mut self, index: usize) {
-        let Some(dialog) = &self.nearby_dialog else {
-            return;
-        };
-        let Some(place) = dialog.places.get(index).cloned() else {
-            return;
+        let (place, custom_mode) = {
+            let Some(dialog) = self.nearby_dialog.as_ref() else {
+                return;
+            };
+            let Some(place) = dialog.places.get(index).cloned() else {
+                return;
+            };
+            (place, dialog.purpose == NearbySearchPurpose::CustomMarker)
         };
         if let Some((landmark, candidates)) = self.route_landmark_from_place(&place) {
             self.queue_landmark(landmark, candidates);
+            if custom_mode {
+                self.custom_landmark = None;
+                self.nearby_dialog = None;
+            }
             self.candidate_place = None;
             self.preview_inspecting = true;
             self.preview_center_mercator =
                 Some(scene_core::geo_to_mercator(place.latitude, place.longitude));
         } else {
             self.last_error = Some(if self.language == UiLanguage::English {
-                "This provider result has no matching open-data place; use Add custom route marker from the map."
-                    .into()
+                if custom_mode {
+                    "This result cannot be saved as a route pin; return to the custom form to add the clicked coordinate."
+                        .into()
+                } else {
+                    "This provider result has no matching open-data place; use Add custom route marker from the map."
+                        .into()
+                }
+            } else if custom_mode {
+                "這個結果沒有可保存的開放資料，請返回自訂表單加入原本點選的座標。".into()
             } else {
                 "找不到對應的開放資料地點，請從地圖右鍵使用「新增自訂沿途地點」。".into()
             });
@@ -805,14 +828,15 @@ impl NativeApp {
             if let Some(selected_index) = selected_index
                 && candidates.len() > 1
             {
-                ui.horizontal(|ui| {
+                ui.vertical(|ui| {
                     ui.label(if english {
                         "Selected pass"
                     } else {
                         "選定經過"
                     });
                     egui::ComboBox::from_id_salt(("landmark-pass", &id))
-                        .selected_text(pass_label(&candidates, selected_index, english))
+                        .selected_text(pass_title(&candidates, selected_index, english))
+                        .width(ui.available_width().max(120.0))
                         .show_ui(ui, |ui| {
                             for candidate_index in 0..candidates.len() {
                                 if ui
@@ -826,6 +850,9 @@ impl NativeApp {
                                 }
                             }
                         });
+                    ui.add(
+                        egui::Label::new(pass_details(&candidates[selected_index], english)).wrap(),
+                    );
                 });
             }
             ui.push_id(id, |ui| {
@@ -984,7 +1011,10 @@ impl NativeApp {
         }
     }
 
-    fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate) {
+    fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate, purpose: NearbySearchPurpose) {
+        if purpose == NearbySearchPurpose::Browse {
+            self.custom_landmark = None;
+        }
         self.candidate_place = None;
         self.selected_landmark_id = None;
         self.next_places_request_id = self.next_places_request_id.wrapping_add(1);
@@ -992,6 +1022,7 @@ impl NativeApp {
         self.nearby_dialog = Some(NearbyDialogState {
             coordinate,
             request_id,
+            purpose,
             loading: true,
             places: Vec::new(),
             error: None,
@@ -1161,7 +1192,7 @@ impl NativeApp {
             });
         if search {
             self.context_menu = None;
-            self.start_nearby_lookup(menu.coordinate);
+            self.start_nearby_lookup(menu.coordinate, NearbySearchPurpose::Browse);
         }
         if custom {
             self.context_menu = None;
@@ -1409,10 +1440,11 @@ impl NativeApp {
             }
         });
         let coordinate = dialog.coordinate;
+        let purpose = dialog.purpose;
         if close {
             self.nearby_dialog = None;
         } else if retry {
-            self.start_nearby_lookup(coordinate);
+            self.start_nearby_lookup(coordinate, purpose);
         }
         if let Some(index) = add_index {
             self.add_place_from_dialog(index);
@@ -1422,66 +1454,147 @@ impl NativeApp {
         }
     }
 
-    fn draw_custom_landmark_dialog(&mut self, ctx: &egui::Context) {
-        let Some(state) = self.custom_landmark.as_mut() else {
+    fn draw_custom_landmark_panel(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.custom_landmark.clone() else {
             return;
         };
         let english = self.language == UiLanguage::English;
-        let mut save = false;
+        let mut search = false;
+        let mut add = false;
         let mut cancel = false;
-        egui::Window::new(if english {
-            "Add custom route marker"
-        } else {
-            "新增自訂沿途地點"
-        })
-        .id(egui::Id::new("custom-route-landmark"))
-        .fixed_pos(egui::pos2(460.0, 110.0))
-        .default_size(egui::vec2(360.0, 190.0))
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.small(format!(
-                "{:.6}, {:.6}",
-                state.coordinate.latitude, state.coordinate.longitude
-            ));
-            ui.label(if english { "Name" } else { "名稱" });
-            ui.text_edit_singleline(&mut state.name);
-            ui.label(if english {
-                "Category (optional)"
-            } else {
-                "分類（可選）"
+        let available_width = ctx.available_rect().width().max(0.0);
+        let min_width = 300.0_f32;
+        let (preferred_width, max_width) =
+            nearby_panel_widths(available_width, self.layout.nearby_panel_width);
+        let coordinate = draft.coordinate;
+        let panel_response = egui::SidePanel::right("nearby-places-inspector")
+            .resizable(true)
+            .default_width(preferred_width)
+            .width_range(min_width..=max_width)
+            .show(ctx, |ui| {
+                ui.set_max_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading(if english {
+                        "Add route pin"
+                    } else {
+                        "新增沿途圖針"
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.small(if english {
+                    "Enter a custom name, or search this coordinate for a place to use."
+                } else {
+                    "可直接填寫自訂名稱，也可以用這個座標搜尋附近地點。"
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(if english { "Coordinate" } else { "座標" });
+                    ui.monospace(format!(
+                        "{:.5}, {:.5}",
+                        draft.coordinate.latitude, draft.coordinate.longitude
+                    ));
+                });
+                ui.label(if english { "Name" } else { "名稱" });
+                ui.text_edit_singleline(&mut draft.name);
+                ui.label(if english {
+                    "Category (optional)"
+                } else {
+                    "分類（可選）"
+                });
+                ui.text_edit_singleline(&mut draft.category);
+                ui.horizontal(|ui| {
+                    ui.label(if english {
+                        "Search radius"
+                    } else {
+                        "搜尋半徑"
+                    });
+                    egui::ComboBox::from_id_salt("custom-nearby-radius")
+                        .selected_text(format!("{} m", self.preferences.nearby_radius_m))
+                        .show_ui(ui, |ui| {
+                            for radius in places_core::ALLOWED_RADII_M {
+                                ui.selectable_value(
+                                    &mut self.preferences.nearby_radius_m,
+                                    radius,
+                                    format!("{} m", radius),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(if english {
+                            "Search nearby places"
+                        } else {
+                            "搜尋附近地點"
+                        })
+                        .clicked()
+                    {
+                        search = true;
+                    }
+                    if ui
+                        .button(if english {
+                            "Add custom pin"
+                        } else {
+                            "直接建立自訂圖針"
+                        })
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.separator();
+                ui.small(if english {
+                    "Nearby results will use their real coordinates and provider data."
+                } else {
+                    "附近搜尋結果會使用該地點的真實座標與資料來源。"
+                });
             });
-            ui.text_edit_singleline(&mut state.category);
-            ui.horizontal(|ui| {
-                if ui.button(if english { "Add" } else { "加入" }).clicked() {
-                    save = true;
-                }
-                if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        if save {
-            self.add_custom_landmark();
-        } else if cancel {
+        let measured_width = panel_response.response.rect.width();
+        if measured_width.is_finite() && measured_width >= min_width {
+            self.layout.nearby_panel_width = measured_width.clamp(min_width, max_width);
+        }
+        if cancel {
             self.custom_landmark = None;
+            self.candidate_place = None;
+        } else {
+            self.custom_landmark = Some(draft);
+            if search {
+                self.start_nearby_lookup(coordinate, NearbySearchPurpose::CustomMarker);
+            } else if add {
+                self.add_custom_landmark();
+            }
         }
     }
 
-    /// Render nearby search results in a real right-hand inspector.  The old
-    /// floating window is kept only as a compatibility shim for saved UI
-    /// state; this panel is the sole active entry point.
+    /// Render nearby search results and custom-pin editing in one right-hand
+    /// inspector so the preview remains the primary surface.
     fn draw_nearby_panel(&mut self, ctx: &egui::Context) {
+        if self.nearby_dialog.is_none() {
+            if self.custom_landmark.is_some() {
+                self.draw_custom_landmark_panel(ctx);
+            }
+            return;
+        }
         let Some(dialog) = self.nearby_dialog.as_mut() else {
             return;
         };
         let language = self.language;
         let english = language == UiLanguage::English;
+        let custom_mode = dialog.purpose == NearbySearchPurpose::CustomMarker;
         let landmark_ids: HashSet<String> = self
             .landmarks
             .iter()
             .map(|value| value.id.clone())
             .collect();
         let mut close = false;
+        let mut return_to_custom = false;
         let mut retry = false;
         let mut open_settings = false;
         let mut add_index = None;
@@ -1498,7 +1611,13 @@ impl NativeApp {
                 ui.set_max_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.heading(if english {
-                        "Nearby places"
+                        if custom_mode {
+                            "Choose nearby place"
+                        } else {
+                            "Nearby places"
+                        }
+                    } else if custom_mode {
+                        "選擇附近地點"
                     } else {
                         "附近地點"
                     });
@@ -1506,10 +1625,27 @@ impl NativeApp {
                         if ui.small_button("×").clicked() {
                             close = true;
                         }
+                        if custom_mode
+                            && ui
+                                .small_button(if english {
+                                    "Back to custom pin"
+                                } else {
+                                    "返回自訂圖針"
+                                })
+                                .clicked()
+                        {
+                            return_to_custom = true;
+                        }
                     });
                 });
                 ui.small(if english {
-                    "Select a place to preview a pin, then add it to the route."
+                    if custom_mode {
+                        "Choose a result to use its real place data, or return to add the clicked coordinate."
+                    } else {
+                        "Select a place to preview a pin, then add it to the route."
+                    }
+                } else if custom_mode {
+                    "可使用搜尋結果的真實資料，也可以返回直接建立原本點選的座標。"
                 } else {
                     "選取地點可預覽圖針；按加入後才會寫入路線。"
                 });
@@ -1593,7 +1729,17 @@ impl NativeApp {
                                     if added {
                                         ui.label(if english { "Added" } else { "已加入" });
                                     } else if ui
-                                        .button(if english { "Add pin" } else { "加入圖針" })
+                                        .button(if english {
+                                            if custom_mode {
+                                                "Use this place"
+                                            } else {
+                                                "Add pin"
+                                            }
+                                        } else if custom_mode {
+                                            "使用此地點"
+                                        } else {
+                                            "加入圖針"
+                                        })
                                         .clicked()
                                     {
                                         add_index = Some(index);
@@ -1661,11 +1807,19 @@ impl NativeApp {
             self.layout.nearby_panel_width = measured_width.clamp(min_width, max_width);
         }
         let coordinate = dialog.coordinate;
+        let purpose = dialog.purpose;
         let candidate = preview_index.and_then(|index| dialog.places.get(index).cloned());
         if close {
             self.nearby_dialog = None;
+            if custom_mode {
+                self.custom_landmark = None;
+            }
+            self.candidate_place = None;
+        } else if return_to_custom {
+            self.nearby_dialog = None;
+            self.candidate_place = None;
         } else if retry {
-            self.start_nearby_lookup(coordinate);
+            self.start_nearby_lookup(coordinate, purpose);
         }
         if let Some(index) = add_index {
             self.add_place_from_dialog(index);
@@ -4249,99 +4403,20 @@ fn pass_title(candidates: &[RouteAnchorCandidate], index: usize, english: bool) 
     }
 }
 
-fn direction_label(heading: f64, english: bool) -> &'static str {
-    let heading = heading.rem_euclid(360.0);
-    match heading {
-        value if !(22.5..337.5).contains(&value) => {
-            if english {
-                "North"
-            } else {
-                "北"
-            }
-        }
-        value if value < 67.5 => {
-            if english {
-                "Northeast"
-            } else {
-                "東北"
-            }
-        }
-        value if value < 112.5 => {
-            if english {
-                "East"
-            } else {
-                "東"
-            }
-        }
-        value if value < 157.5 => {
-            if english {
-                "Southeast"
-            } else {
-                "東南"
-            }
-        }
-        value if value < 202.5 => {
-            if english {
-                "South"
-            } else {
-                "南"
-            }
-        }
-        value if value < 247.5 => {
-            if english {
-                "Southwest"
-            } else {
-                "西南"
-            }
-        }
-        value if value < 292.5 => {
-            if english {
-                "West"
-            } else {
-                "西"
-            }
-        }
-        _ => {
-            if english {
-                "Northwest"
-            } else {
-                "西北"
-            }
-        }
-    }
-}
-
 fn pass_details(candidate: &RouteAnchorCandidate, english: bool) -> String {
-    let mut details = vec![if english {
+    if english {
         format!(
-            "Route mileage: {:.2} km",
-            candidate.anchor_distance_m / 1000.0
+            "Route mileage: {:.2} km · {:.0} m from pin",
+            candidate.anchor_distance_m / 1000.0,
+            candidate.distance_from_route_m,
         )
     } else {
-        format!("路線里程：{:.2} km", candidate.anchor_distance_m / 1000.0)
-    }];
-    if let Some(heading) = candidate.heading_deg {
-        details.push(if english {
-            format!(
-                "Direction: {} ({heading:.0}°)",
-                direction_label(heading, true)
-            )
-        } else {
-            format!(
-                "行進方向：{}（{heading:.0}°）",
-                direction_label(heading, false)
-            )
-        });
+        format!(
+            "路線里程 {:.2} km · 距圖針 {:.0} m",
+            candidate.anchor_distance_m / 1000.0,
+            candidate.distance_from_route_m,
+        )
     }
-    details.push(if english {
-        format!(
-            "Distance from pin: {:.0} m",
-            candidate.distance_from_route_m
-        )
-    } else {
-        format!("距圖針 {:.0} m", candidate.distance_from_route_m)
-    });
-    details.join(" · ")
 }
 impl eframe::App for NativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -4366,7 +4441,6 @@ impl eframe::App for NativeApp {
         self.draw_nearby_panel(ctx);
         self.draw_preview(ctx);
         self.draw_context_menu(ctx);
-        self.draw_custom_landmark_dialog(ctx);
         self.draw_pending_landmark(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
@@ -4526,7 +4600,7 @@ mod tests {
         assert!(pass_label(&candidates, 1, true).starts_with("Return"));
     }
     #[test]
-    fn pass_details_explain_mileage_direction_and_pin_distance() {
+    fn pass_details_explain_mileage_and_pin_distance_without_direction() {
         let candidate = RouteAnchorCandidate {
             segment_index: 1,
             occurrence_index: 0,
@@ -4537,11 +4611,10 @@ mod tests {
             nearest_longitude: 121.0,
             heading_deg: Some(33.0),
         };
-        assert_eq!(direction_label(33.0, false), "東北");
-        assert_eq!(direction_label(213.0, false), "西南");
         let details = pass_details(&candidate, false);
         assert!(details.contains("路線里程"));
-        assert!(details.contains("行進方向"));
         assert!(details.contains("距圖針"));
+        assert!(!details.contains("行進方向"));
+        assert!(!details.contains('°'));
     }
 }
