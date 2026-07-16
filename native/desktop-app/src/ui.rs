@@ -72,6 +72,18 @@ enum SettingsPage {
     Advanced,
 }
 
+impl SettingsPage {
+    fn scroll_id(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Places => "places",
+            Self::ApiKeys => "api-keys",
+            Self::Storage => "storage",
+            Self::Advanced => "advanced",
+        }
+    }
+}
+
 pub struct NativeApp {
     model: AppModel,
     track: Option<Track>,
@@ -189,6 +201,20 @@ fn current_long_edge(settings: &ExportSettings) -> u32 {
         Aspect::Portrait => settings.height,
         Aspect::Landscape | Aspect::Square => settings.width,
     }
+}
+
+const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
+const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 620.0;
+const SETTINGS_WINDOW_OUTER_MARGIN: f32 = 24.0;
+
+fn settings_window_size(available_rect: egui::Rect) -> egui::Vec2 {
+    let available_size = available_rect.size();
+    let usable_width = (available_size.x - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0);
+    let usable_height = (available_size.y - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0);
+    egui::vec2(
+        SETTINGS_WINDOW_DEFAULT_WIDTH.min(usable_width),
+        SETTINGS_WINDOW_DEFAULT_HEIGHT.min(usable_height),
+    )
 }
 
 fn apply_long_edge(settings: &mut ExportSettings, long_edge: u32) {
@@ -3172,18 +3198,26 @@ impl NativeApp {
         let mut download_pack = false;
         let mut clear_cache = false;
         let language_before = self.language;
+        let window_size = settings_window_size(ctx.available_rect());
         egui::Window::new(if english { "Settings" } else { "設定" })
             .id(egui::Id::new("settings-window-stable"))
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(egui::vec2(760.0, 620.0))
+            .fixed_size(window_size)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.set_min_size(egui::vec2(730.0, 570.0));
-                ui.horizontal(|ui| {
-                    ui.set_min_width(150.0);
-                    ui.vertical(|ui| {
+                ui.set_min_size(egui::vec2(
+                    (window_size.x - 30.0).max(0.0),
+                    (window_size.y - 50.0).max(0.0),
+                ));
+                let content_size = ui.available_size_before_wrap();
+                ui.horizontal_top(|ui| {
+                    let sidebar_width = 150.0_f32.min(content_size.x);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(sidebar_width, content_size.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
                         ui.heading(if english { "Settings" } else { "設定" });
                         ui.add_space(8.0);
                         for (page, label) in [
@@ -3215,12 +3249,18 @@ impl NativeApp {
                                 self.settings_page = page;
                             }
                         }
-                    });
+                        },
+                    );
                     ui.separator();
-                    ui.vertical(|ui| {
+                    let content_width = ui.available_width().max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(content_width, content_size.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
                         egui::ScrollArea::vertical()
-                            .id_salt("settings-content-scroll")
+                            .id_salt(("settings-content-scroll", self.settings_page.scroll_id()))
                             .auto_shrink([false, false])
+                            .max_height(content_size.y)
                             .show(ui, |ui| match self.settings_page {
                                 SettingsPage::General => {
                                     ui.heading(if english { "General" } else { "一般" });
@@ -3410,7 +3450,8 @@ impl NativeApp {
                                     if ui.button(if english { "Open detailed diagnostics" } else { "開啟詳細診斷" }).clicked() { self.show_diagnostics = true; }
                                 }
                             });
-                    });
+                        },
+                    );
                 });
             });
         self.show_settings = open;
@@ -4009,6 +4050,26 @@ mod tests {
         assert_eq!(nearby_panel_widths(1800.0, 900.0), (720.0, 720.0));
         assert_eq!(nearby_panel_widths(1200.0, 410.0), (410.0, 560.0));
         assert_eq!(nearby_panel_widths(800.0, 600.0), (300.0, 300.0));
+    }
+
+    #[test]
+    fn settings_window_uses_standard_size_when_screen_has_room() {
+        let available = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        assert_eq!(settings_window_size(available), egui::vec2(760.0, 620.0));
+    }
+
+    #[test]
+    fn settings_window_stays_inside_small_or_high_dpi_available_rect() {
+        let small = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(956.0, 764.0));
+        let small_size = settings_window_size(small);
+        assert!(small_size.x <= small.width() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+        assert!(small_size.y <= small.height() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+
+        let high_dpi = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0));
+        let high_dpi_size = settings_window_size(high_dpi);
+        assert_eq!(high_dpi_size, egui::vec2(760.0, 552.0));
+        assert!(high_dpi_size.x <= high_dpi.width() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+        assert!(high_dpi_size.y <= high_dpi.height() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
     }
 
     #[test]
