@@ -1195,13 +1195,23 @@ impl NativeApp {
             self.start_nearby_lookup(menu.coordinate, NearbySearchPurpose::Browse);
         }
         if custom {
-            self.context_menu = None;
-            self.custom_landmark = Some(CustomLandmarkState {
-                coordinate: menu.coordinate,
-                name: String::new(),
-                category: String::new(),
-            });
+            self.open_custom_landmark(menu.coordinate, ctx);
         }
+    }
+
+    fn open_custom_landmark(&mut self, coordinate: SearchCoordinate, ctx: &egui::Context) {
+        // The custom-pin flow is a deliberate mode switch.  Close any active
+        // nearby search first so draw_nearby_panel renders the custom form on
+        // the very next frame, even when the nearby inspector was already open.
+        self.context_menu = None;
+        self.nearby_dialog = None;
+        self.candidate_place = None;
+        self.custom_landmark = Some(CustomLandmarkState {
+            coordinate,
+            name: String::new(),
+            category: String::new(),
+        });
+        ctx.request_repaint();
     }
 
     #[allow(dead_code, clippy::collapsible_else_if)]
