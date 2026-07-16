@@ -2239,12 +2239,17 @@ impl NativeApp {
             }));
         }
 
-        if matches!(
+        let status_line = if matches!(
             value.activity,
             ExportActivity::PreparingMapTiles | ExportActivity::RenderingVideo
         ) {
-            ui.small(format_eta(value.eta_seconds, english));
-        }
+            format_eta(value.eta_seconds, english)
+        } else if english {
+            "Please wait…".to_owned()
+        } else {
+            "請稍候…".to_owned()
+        };
+        ui.small(status_line);
         if ui
             .button(if english { "Cancel" } else { "取消匯出" })
             .clicked()
