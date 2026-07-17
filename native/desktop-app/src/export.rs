@@ -226,7 +226,7 @@ where
             let fit = build_frame(&fit_scene, 1.0);
             let transition_frames = 2 * request.settings.fps as u64;
             // Preload every interpolated camera view. Without these keys the
-            // transition can clear to the dark background while the camera
+            // transition can clear to the background while the camera
             // moves between two otherwise-preloaded views.
             for index in 0..=transition_frames {
                 let linear = index as f64 / transition_frames.max(1) as f64;
@@ -332,10 +332,6 @@ where
             }
             Ok(decoded)
         })?;
-        let mut decoded = decoded;
-        for tile in &mut decoded {
-            d3d11_renderer::apply_map_color_transform(tile, scene.options.map_style);
-        }
         Some(renderer.prepare_tiles(decoded)?)
     };
     progress(export_progress(

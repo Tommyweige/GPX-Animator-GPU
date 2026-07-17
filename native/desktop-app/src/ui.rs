@@ -1141,8 +1141,6 @@ impl NativeApp {
                         self.pending_tiles.remove(&key);
                         continue;
                     }
-                    let mut tile = tile;
-                    d3d11_renderer::apply_map_color_transform(&mut tile, style);
                     let mut rgba = tile.bgra;
                     for pixel in rgba.chunks_exact_mut(4) {
                         pixel.swap(0, 2)
@@ -2235,7 +2233,6 @@ impl NativeApp {
                     egui::ComboBox::from_label("地圖樣式")
                         .selected_text(match self.model.settings.scene.map_style {
                             MapStyle::Light => "淺色地圖",
-                            MapStyle::Dark => "深色地圖",
                             MapStyle::Satellite => "衛星圖",
                             MapStyle::Transparent => "透明背景",
                         })
@@ -2244,11 +2241,6 @@ impl NativeApp {
                                 &mut self.model.settings.scene.map_style,
                                 MapStyle::Light,
                                 "淺色地圖",
-                            );
-                            ui.selectable_value(
-                                &mut self.model.settings.scene.map_style,
-                                MapStyle::Dark,
-                                "深色地圖",
                             );
                             ui.selectable_value(
                                 &mut self.model.settings.scene.map_style,
@@ -2583,13 +2575,6 @@ impl NativeApp {
                                 "淺色"
                             }
                         }
-                        MapStyle::Dark => {
-                            if english {
-                                "Dark"
-                            } else {
-                                "深色"
-                            }
-                        }
                         MapStyle::Satellite => {
                             if english {
                                 "Satellite"
@@ -2610,11 +2595,6 @@ impl NativeApp {
                             &mut self.model.settings.scene.map_style,
                             MapStyle::Light,
                             if english { "Light" } else { "淺色" },
-                        );
-                        ui.selectable_value(
-                            &mut self.model.settings.scene.map_style,
-                            MapStyle::Dark,
-                            if english { "Dark" } else { "深色" },
                         );
                         ui.selectable_value(
                             &mut self.model.settings.scene.map_style,
@@ -2996,7 +2976,6 @@ impl NativeApp {
                     egui::ComboBox::from_label("Map style")
                         .selected_text(match self.model.settings.scene.map_style {
                             MapStyle::Light => "Light",
-                            MapStyle::Dark => "Dark",
                             MapStyle::Satellite => "Satellite",
                             MapStyle::Transparent => "Transparent",
                         })
@@ -3005,11 +2984,6 @@ impl NativeApp {
                                 &mut self.model.settings.scene.map_style,
                                 MapStyle::Light,
                                 "Light",
-                            );
-                            ui.selectable_value(
-                                &mut self.model.settings.scene.map_style,
-                                MapStyle::Dark,
-                                "Dark",
                             );
                             ui.selectable_value(
                                 &mut self.model.settings.scene.map_style,
@@ -3219,7 +3193,6 @@ impl NativeApp {
             );
             let background = match self.model.settings.scene.map_style {
                 MapStyle::Light => egui::Color32::from_rgb(232, 236, 232),
-                MapStyle::Dark => egui::Color32::from_rgb(26, 35, 42),
                 MapStyle::Satellite => egui::Color32::from_rgb(24, 28, 32),
                 MapStyle::Transparent => egui::Color32::from_rgb(16, 22, 28),
             };
@@ -4039,7 +4012,7 @@ impl NativeApp {
                                     let mut cache_gb = self.model.settings.cache_limit_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
                                     ui.add(egui::Slider::new(&mut cache_gb, 0.25..=8.0).text(if english { "Map cache (GB)" } else { "地圖快取（GB）" }).step_by(0.25));
                                     self.model.settings.cache_limit_bytes = (cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-                                    ui.small(if english { "Light, Dark and Transparent share the OSM cache. Satellite uses a separate cache." } else { "淺色、深色與淡化地圖共用 OSM 快取；衛星圖使用獨立快取。" });
+                                    ui.small(if english { "Light and Transparent share the OSM cache. Satellite uses a separate cache." } else { "淺色與淡化地圖共用 OSM 快取；衛星圖使用獨立快取。" });
                                     if ui.button(if english { "Clear current map cache" } else { "清除目前地圖快取" }).clicked() { clear_cache = true; }
                                     if let Some(status) = &self.poi_pack_status { ui.separator(); ui.label(if english { "POI pack" } else { "POI 資料包" }); ui.small(status); }
                                 }

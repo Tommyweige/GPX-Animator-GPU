@@ -20,25 +20,6 @@ pub struct DecodedTile {
     pub bgra: Vec<u8>,
 }
 
-/// Apply the deterministic presentation transform used by both the native
-/// export renderer and the egui preview.  Disk caches always retain the raw
-/// provider pixels, so switching between Light/Dark/Transparent never causes
-/// another network download.
-pub fn apply_map_color_transform(tile: &mut DecodedTile, style: scene_core::MapStyle) {
-    if style != scene_core::MapStyle::Dark {
-        return;
-    }
-    for pixel in tile.bgra.chunks_exact_mut(4) {
-        let r = pixel[2] as f32 / 255.0;
-        let g = pixel[1] as f32 / 255.0;
-        let b = pixel[0] as f32 / 255.0;
-        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
-        pixel[2] = ((0.08 + 0.22 * luma) * 255.0).round() as u8;
-        pixel[1] = ((0.10 + 0.25 * luma) * 255.0).round() as u8;
-        pixel[0] = ((0.13 + 0.28 * luma) * 255.0).round() as u8;
-    }
-}
-
 /// Immutable list of tiles required by one export. Keeping the manifest
 /// separate from the worker queue makes preflight deterministic and lets the
 /// UI report cached/missing work without treating it as video frames.
@@ -832,12 +813,6 @@ impl D2dSceneRenderer {
                 b: 0.93,
                 a: 1.0,
             },
-            scene_core::MapStyle::Dark => D2D1_COLOR_F {
-                r: 0.045,
-                g: 0.064,
-                b: 0.080,
-                a: 1.0,
-            },
             scene_core::MapStyle::Satellite => D2D1_COLOR_F {
                 r: 0.08,
                 g: 0.10,
@@ -1581,37 +1556,16 @@ mod tests {
     }
 
     #[test]
-    fn dark_map_transform_preserves_alpha_and_is_deterministic() {
-        let mut tile = DecodedTile {
-            key: TileKey {
-                zoom: 1,
-                x: 0,
-                y: 0,
-            },
-            width: 1,
-            height: 1,
-            bgra: vec![255, 128, 0, 255],
-        };
-        apply_map_color_transform(&mut tile, scene_core::MapStyle::Dark);
-        assert_eq!(tile.bgra[3], 255);
-        assert_eq!(&tile.bgra[..3], &[64, 53, 45]);
-        let before = tile.bgra.clone();
-        apply_map_color_transform(&mut tile, scene_core::MapStyle::Light);
-        assert_eq!(tile.bgra, before);
-    }
-
-    #[test]
-    fn dark_and_transparent_use_real_osm_tile_source() {
-        let dark = TileDiskCache::for_map_style(scene_core::MapStyle::Dark);
+    fn transparent_uses_real_osm_tile_source() {
         let transparent = TileDiskCache::for_map_style(scene_core::MapStyle::Transparent);
-        assert_eq!(dark.root(), transparent.root());
         assert!(
-            dark.tile_url(TileKey {
-                zoom: 2,
-                x: 1,
-                y: 1
-            })
-            .contains("openstreetmap.org")
+            transparent
+                .tile_url(TileKey {
+                    zoom: 2,
+                    x: 1,
+                    y: 1,
+                })
+                .contains("openstreetmap.org")
         );
     }
     #[test]
