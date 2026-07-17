@@ -29,6 +29,8 @@ data class TripEntity(
     val syncState: SyncState,
     val startedAtEpochMillis: Long,
     val startElapsedRealtimeNanos: Long,
+    val startBootCount: Int = -1,
+    val startZoneId: String = "UTC",
     val endedAtEpochMillis: Long? = null,
     val distanceMeters: Double = 0.0,
     val durationMillis: Long = 0,
@@ -37,6 +39,9 @@ data class TripEntity(
     val localGpxSha256: String? = null,
     val driveFileId: String? = null,
     val driveFolderId: String? = null,
+    val driveUploadSessionUrl: String? = null,
+    val driveUploadSessionSha256: String? = null,
+    val driveUploadSessionLength: Long? = null,
     val lastError: String? = null,
     val updatedAtEpochMillis: Long,
 )

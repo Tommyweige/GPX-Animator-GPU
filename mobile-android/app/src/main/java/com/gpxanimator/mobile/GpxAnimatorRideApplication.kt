@@ -3,9 +3,25 @@ package com.gpxanimator.mobile
 import android.app.Application
 import com.gpxanimator.mobile.data.RideDatabase
 import com.gpxanimator.mobile.data.RideRepository
+import com.gpxanimator.mobile.recovery.StartupRecoveryCoordinator
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class GpxAnimatorRideApplication : Application() {
     val container: AppContainer by lazy { AppContainer(this) }
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    override fun onCreate() {
+        super.onCreate()
+        applicationScope.launch {
+            StartupRecoveryCoordinator.recover(
+                context = this@GpxAnimatorRideApplication,
+                repository = container.rideRepository,
+            )
+        }
+    }
 }
 
 class AppContainer(application: Application) {
