@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="GPX Animator Ride"
+     xmlns="http://www.topografix.com/GPX/1/1"
+     xmlns:gpxa="https://gpxanimator.app/xmlschemas/TrackPointExtension/1">
+  <metadata>
+    <name>Taipei Night Ride</name>
+    <time>2026-07-17T12:00:00Z</time>
+  </metadata>
+  <trk>
+    <name>Taipei Night Ride</name>
+    <trkseg>
+      <trkpt lat="25.03300000" lon="121.56540000">
+        <ele>12.50</ele>
+        <time>2026-07-17T12:00:00Z</time>
+        <extensions>
+          <gpxa:accuracy>4.0</gpxa:accuracy>
+          <gpxa:verticalAccuracy>6.0</gpxa:verticalAccuracy>
+          <gpxa:speed>8.500</gpxa:speed>
+          <gpxa:bearing>90.0</gpxa:bearing>
+        </extensions>
+      </trkpt>
+      <trkpt lat="25.03310000" lon="121.56570000">
+        <ele>13.20</ele>
+        <time>2026-07-17T12:00:01Z</time>
+        <extensions>
+          <gpxa:accuracy>4.5</gpxa:accuracy>
+          <gpxa:speed>9.100</gpxa:speed>
+          <gpxa:bearing>88.0</gpxa:bearing>
+        </extensions>
+      </trkpt>
+      <trkpt lat="25.03320000" lon="121.56600000">
+        <ele>13.80</ele>
+        <time>2026-07-17T12:00:02Z</time>
+        <extensions>
+          <gpxa:accuracy>5.0</gpxa:accuracy>
+          <gpxa:speed>9.400</gpxa:speed>
+          <gpxa:bearing>87.0</gpxa:bearing>
+        </extensions>
+      </trkpt>
+      <trkpt lat="25.03330000" lon="121.56630000">
+        <ele>14.10</ele>
+        <time>2026-07-17T12:00:03Z</time>
+        <extensions>
+          <gpxa:accuracy>4.0</gpxa:accuracy>
+          <gpxa:speed>9.000</gpxa:speed>
+          <gpxa:bearing>86.0</gpxa:bearing>
+        </extensions>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>
