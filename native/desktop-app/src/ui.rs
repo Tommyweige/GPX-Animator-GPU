@@ -1,20 +1,20 @@
 use crate::{
     AppModel, AppPreferences, Diagnostics, ExportOutcome, ExportProgress, ExportRequest,
-    ExportSettings, JobState, UiLanguage, UiLayoutPreferences, detect_gpu_capabilities,
-    load_gpx_file, run_native_export,
+    ExportSettings, JobState, SettingsWindowPreferences, UiLanguage, UiLayoutPreferences,
+    detect_gpu_capabilities, load_gpx_file, run_native_export,
 };
 use eframe::egui;
 use gpx_core::{ParseOptions, Track};
-use nvenc_engine::CancellationToken;
+use nvenc_engine::{CancellationToken, ExportActivity};
 use places_core::{
     DataPackManager, GatewayConfig, NearbyProviderPreference, NearbySearchRequest, PlaceLanguage,
     PlaceProvider, PlaceSummary, PoiProfile, PoiSearchResponse, PoiService, ProviderCredentials,
     SearchCoordinate,
 };
 use scene_core::{
-    Aspect, CameraMode, Codec, FrameBuildContext, FramePurpose, LandmarkSource, LandmarkStyle,
-    MapStyle, QualityPreset, RenderLanguage, RouteLandmark, Scene, anchor_landmark_to_route,
-    build_frame_with_context, screen_point_to_geo,
+    Aspect, CameraMode, Codec, FrameBuildContext, FramePurpose, LandmarkAnchorMode, LandmarkSource,
+    LandmarkStyle, MapStyle, QualityPreset, RenderLanguage, RouteAnchorCandidate, RouteLandmark,
+    Scene, build_frame_with_context, find_landmark_passes, screen_point_to_geo,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -46,9 +46,11 @@ struct ContextMenuState {
     coordinate: SearchCoordinate,
 }
 
+#[derive(Clone)]
 struct NearbyDialogState {
     coordinate: SearchCoordinate,
     request_id: u64,
+    purpose: NearbySearchPurpose,
     loading: bool,
     places: Vec<PlaceSummary>,
     error: Option<String>,
@@ -57,10 +59,24 @@ struct NearbyDialogState {
     degraded: bool,
 }
 
+#[derive(Clone)]
 struct CustomLandmarkState {
     coordinate: SearchCoordinate,
     name: String,
     category: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NearbySearchPurpose {
+    Browse,
+    CustomMarker,
+}
+
+struct PendingLandmarkState {
+    landmark: RouteLandmark,
+    candidates: Vec<RouteAnchorCandidate>,
+    selected_index: usize,
+    original_preview_progress: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +86,18 @@ enum SettingsPage {
     ApiKeys,
     Storage,
     Advanced,
+}
+
+impl SettingsPage {
+    fn scroll_id(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Places => "places",
+            Self::ApiKeys => "api-keys",
+            Self::Storage => "storage",
+            Self::Advanced => "advanced",
+        }
+    }
 }
 
 pub struct NativeApp {
@@ -105,6 +133,7 @@ pub struct NativeApp {
     project_path: Option<PathBuf>,
     project_warning: Option<String>,
     custom_landmark: Option<CustomLandmarkState>,
+    pending_landmark: Option<PendingLandmarkState>,
     places_tx: Sender<PlacesMessage>,
     places_rx: Receiver<PlacesMessage>,
     next_places_request_id: u64,
@@ -191,6 +220,96 @@ fn current_long_edge(settings: &ExportSettings) -> u32 {
     }
 }
 
+const SETTINGS_WINDOW_DEFAULT_WIDTH: f32 = 760.0;
+const SETTINGS_WINDOW_DEFAULT_HEIGHT: f32 = 620.0;
+const SETTINGS_WINDOW_MIN_WIDTH: f32 = 680.0;
+const SETTINGS_WINDOW_MIN_HEIGHT: f32 = 500.0;
+const SETTINGS_WINDOW_OUTER_MARGIN: f32 = 24.0;
+
+fn settings_window_max_size(available_rect: egui::Rect) -> egui::Vec2 {
+    let available_size = available_rect.size();
+    egui::vec2(
+        (available_size.x - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0),
+        (available_size.y - SETTINGS_WINDOW_OUTER_MARGIN * 2.0).max(0.0),
+    )
+}
+
+fn settings_window_min_size(available_rect: egui::Rect) -> egui::Vec2 {
+    let max_size = settings_window_max_size(available_rect);
+    egui::vec2(
+        SETTINGS_WINDOW_MIN_WIDTH.min(max_size.x),
+        SETTINGS_WINDOW_MIN_HEIGHT.min(max_size.y),
+    )
+}
+
+fn settings_window_size(available_rect: egui::Rect) -> egui::Vec2 {
+    let min_size = settings_window_min_size(available_rect);
+    let max_size = settings_window_max_size(available_rect);
+    egui::vec2(
+        SETTINGS_WINDOW_DEFAULT_WIDTH.clamp(min_size.x, max_size.x),
+        SETTINGS_WINDOW_DEFAULT_HEIGHT.clamp(min_size.y, max_size.y),
+    )
+}
+
+fn settings_window_initial_rect(
+    available_rect: egui::Rect,
+    default_size: egui::Vec2,
+    min_size: egui::Vec2,
+    max_size: egui::Vec2,
+    saved: &SettingsWindowPreferences,
+) -> egui::Rect {
+    let size = saved
+        .size
+        .and_then(|size| {
+            if size[0].is_finite() && size[1].is_finite() && size[0] > 0.0 && size[1] > 0.0 {
+                Some(egui::vec2(size[0], size[1]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default_size);
+    let size = egui::vec2(
+        size.x.clamp(min_size.x, max_size.x),
+        size.y.clamp(min_size.y, max_size.y),
+    );
+    let default_position = available_rect.center() - size / 2.0;
+    let position = saved
+        .position
+        .and_then(|position| {
+            if position[0].is_finite() && position[1].is_finite() {
+                Some(egui::pos2(position[0], position[1]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default_position);
+    let margin_x = SETTINGS_WINDOW_OUTER_MARGIN.min(available_rect.width() * 0.5);
+    let margin_y = SETTINGS_WINDOW_OUTER_MARGIN.min(available_rect.height() * 0.5);
+    let min_x = available_rect.left() + margin_x;
+    let min_y = available_rect.top() + margin_y;
+    let max_x = (available_rect.right() - margin_x - size.x).max(min_x);
+    let max_y = (available_rect.bottom() - margin_y - size.y).max(min_y);
+    egui::Rect::from_min_size(
+        egui::pos2(
+            position.x.clamp(min_x, max_x),
+            position.y.clamp(min_y, max_y),
+        ),
+        size,
+    )
+}
+
+fn settings_window_preferences_from_rect(rect: egui::Rect) -> SettingsWindowPreferences {
+    let values = [rect.left(), rect.top(), rect.width(), rect.height()];
+    if values.iter().all(|value| value.is_finite()) {
+        SettingsWindowPreferences {
+            position: Some([rect.left(), rect.top()]),
+            size: Some([rect.width(), rect.height()]),
+        }
+    } else {
+        SettingsWindowPreferences::default()
+    }
+}
+
 fn apply_long_edge(settings: &mut ExportSettings, long_edge: u32) {
     let long_edge = long_edge.clamp(320, 8192);
     match settings.scene.aspect {
@@ -273,6 +392,85 @@ fn localized_error(language: UiLanguage, message: &str) -> String {
     message.to_owned()
 }
 
+fn export_step(activity: ExportActivity) -> u8 {
+    match activity {
+        ExportActivity::PreparingRoute
+        | ExportActivity::PreparingMapTiles
+        | ExportActivity::InitializingExporter => 1,
+        ExportActivity::RenderingVideo
+        | ExportActivity::FinalizingFile
+        | ExportActivity::VerifyingOutput => 2,
+    }
+}
+
+fn export_title(activity: ExportActivity, english: bool) -> &'static str {
+    match (export_step(activity), english) {
+        (1, true) => "Preparing export",
+        (1, false) => "準備匯出",
+        (2, true) => "Creating video",
+        (2, false) => "產生影片",
+        _ => unreachable!("export steps are limited to 1 and 2"),
+    }
+}
+
+fn export_detail(activity: ExportActivity, english: bool) -> &'static str {
+    match (activity, english) {
+        (ExportActivity::PreparingRoute, true) => "Analyzing the route and map area…",
+        (ExportActivity::PreparingRoute, false) => "正在分析路線與地圖範圍…",
+        (ExportActivity::PreparingMapTiles, true) => "Preparing map assets",
+        (ExportActivity::PreparingMapTiles, false) => "正在準備地圖素材",
+        (ExportActivity::InitializingExporter, true) => "Starting the video exporter…",
+        (ExportActivity::InitializingExporter, false) => "正在啟動影片輸出…",
+        (ExportActivity::RenderingVideo, true) => "Rendering video frames",
+        (ExportActivity::RenderingVideo, false) => "正在產生影片幀",
+        (ExportActivity::FinalizingFile, true) => "Finishing the MP4…",
+        (ExportActivity::FinalizingFile, false) => "正在完成 MP4…",
+        (ExportActivity::VerifyingOutput, true) => "Checking the output file…",
+        (ExportActivity::VerifyingOutput, false) => "正在檢查輸出檔案…",
+    }
+}
+
+fn format_eta(eta_seconds: Option<f64>, english: bool) -> String {
+    let Some(seconds) = eta_seconds.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return if english {
+            "Estimating time remaining…".to_owned()
+        } else {
+            "正在估算剩餘時間…".to_owned()
+        };
+    };
+    if seconds < 0.5 {
+        return if english {
+            "Almost done".to_owned()
+        } else {
+            "即將完成".to_owned()
+        };
+    }
+    let total_seconds = seconds.ceil() as u64;
+    let minutes = total_seconds / 60;
+    let remaining_seconds = total_seconds % 60;
+    if minutes == 0 {
+        if english {
+            format!("About {total_seconds}s remaining")
+        } else {
+            format!("約剩 {total_seconds} 秒")
+        }
+    } else if minutes < 60 {
+        if english {
+            format!("About {minutes}m {remaining_seconds:02}s remaining")
+        } else {
+            format!("約剩 {minutes} 分 {remaining_seconds:02} 秒")
+        }
+    } else {
+        let hours = minutes / 60;
+        let remaining_minutes = minutes % 60;
+        if english {
+            format!("About {hours}h {remaining_minutes:02}m remaining")
+        } else {
+            format!("約剩 {hours} 小時 {remaining_minutes:02} 分")
+        }
+    }
+}
+
 impl NativeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&cc.egui_ctx);
@@ -343,6 +541,7 @@ impl NativeApp {
             project_path: None,
             project_warning: None,
             custom_landmark: None,
+            pending_landmark: None,
             places_tx,
             places_rx,
             next_places_request_id: 0,
@@ -431,7 +630,10 @@ impl NativeApp {
         }
     }
 
-    fn route_landmark_from_place(&self, place: &PlaceSummary) -> Option<RouteLandmark> {
+    fn route_landmark_from_place(
+        &self,
+        place: &PlaceSummary,
+    ) -> Option<(RouteLandmark, Vec<RouteAnchorCandidate>)> {
         let open_place = match place.provider {
             PlaceProvider::Overture | PlaceProvider::OpenStreetMap => place.clone(),
             PlaceProvider::TomTom | PlaceProvider::Foursquare => {
@@ -465,26 +667,70 @@ impl NativeApp {
             _ => return None,
         };
         let track = self.track.as_ref()?;
-        let anchor = anchor_landmark_to_route(track, open_place.latitude, open_place.longitude)?;
+        let candidates = find_landmark_passes(track, open_place.latitude, open_place.longitude);
+        let selected = select_candidate_for_progress(&candidates, self.preview_progress)?;
         let source_tag = match open_place.provider {
             PlaceProvider::Overture => "overture",
             PlaceProvider::OpenStreetMap => "osm",
             _ => "provider",
         };
-        Some(RouteLandmark {
-            id: format!("{source_tag}:{}", open_place.id),
-            source,
-            source_id: Some(open_place.id.clone()),
-            name: open_place.name.clone(),
-            category: open_place.category.clone(),
-            latitude: open_place.latitude,
-            longitude: open_place.longitude,
-            anchor_distance_m: anchor.anchor_distance_m,
-            anchor_progress: anchor.anchor_progress,
-            distance_from_route_m: anchor.distance_from_route_m,
-            enabled: true,
-            style: LandmarkStyle::default(),
-        })
+        Some((
+            RouteLandmark {
+                id: format!("{source_tag}:{}", open_place.id),
+                source,
+                source_id: Some(open_place.id.clone()),
+                name: open_place.name.clone(),
+                category: open_place.category.clone(),
+                latitude: open_place.latitude,
+                longitude: open_place.longitude,
+                anchor_distance_m: selected.anchor_distance_m,
+                anchor_progress: selected.anchor_progress,
+                distance_from_route_m: selected.distance_from_route_m,
+                anchor_mode: LandmarkAnchorMode::SelectedPass,
+                enabled: true,
+                style: LandmarkStyle::default(),
+            },
+            candidates,
+        ))
+    }
+
+    fn queue_landmark(&mut self, landmark: RouteLandmark, candidates: Vec<RouteAnchorCandidate>) {
+        let selected_index =
+            select_candidate_index(&candidates, self.preview_progress).unwrap_or(0);
+        if candidates.len() <= 1 {
+            self.add_landmark(landmark);
+            return;
+        }
+        self.pending_landmark = Some(PendingLandmarkState {
+            landmark,
+            candidates,
+            selected_index,
+            original_preview_progress: self.preview_progress,
+        });
+    }
+
+    fn preview_landmarks(&self) -> Vec<RouteLandmark> {
+        let mut landmarks = self.landmarks.clone();
+        let Some(pending) = &self.pending_landmark else {
+            return landmarks;
+        };
+        let Some(candidate) = pending.candidates.get(pending.selected_index).copied() else {
+            return landmarks;
+        };
+        let mut landmark = pending.landmark.clone();
+        Self::apply_candidate(&mut landmark, candidate);
+        if let Some(existing) = landmarks.iter_mut().find(|value| value.id == landmark.id) {
+            *existing = landmark;
+        } else {
+            landmarks.push(landmark);
+        }
+        landmarks
+    }
+    fn apply_candidate(landmark: &mut RouteLandmark, candidate: RouteAnchorCandidate) {
+        landmark.anchor_distance_m = candidate.anchor_distance_m;
+        landmark.anchor_progress = candidate.anchor_progress;
+        landmark.distance_from_route_m = candidate.distance_from_route_m;
+        landmark.anchor_mode = LandmarkAnchorMode::SelectedPass;
     }
 
     fn add_landmark(&mut self, mut landmark: RouteLandmark) -> String {
@@ -495,8 +741,13 @@ impl NativeApp {
                     && value.name.eq_ignore_ascii_case(&landmark.name))
         }) {
             existing.enabled = true;
+            existing.anchor_distance_m = landmark.anchor_distance_m;
+            existing.anchor_progress = landmark.anchor_progress;
+            existing.distance_from_route_m = landmark.distance_from_route_m;
+            existing.anchor_mode = LandmarkAnchorMode::SelectedPass;
             let id = existing.id.clone();
             self.selected_landmark_id = Some(id.clone());
+            self.save_landmarks();
             return id;
         }
         let id = landmark.id.clone();
@@ -513,22 +764,36 @@ impl NativeApp {
     }
 
     fn add_place_from_dialog(&mut self, index: usize) {
-        let Some(dialog) = &self.nearby_dialog else {
-            return;
+        let (place, custom_mode) = {
+            let Some(dialog) = self.nearby_dialog.as_ref() else {
+                return;
+            };
+            let Some(place) = dialog.places.get(index).cloned() else {
+                return;
+            };
+            (place, dialog.purpose == NearbySearchPurpose::CustomMarker)
         };
-        let Some(place) = dialog.places.get(index).cloned() else {
-            return;
-        };
-        if let Some(landmark) = self.route_landmark_from_place(&place) {
-            self.add_landmark(landmark);
+        if let Some((landmark, candidates)) = self.route_landmark_from_place(&place) {
+            self.queue_landmark(landmark, candidates);
+            if custom_mode {
+                self.custom_landmark = None;
+                self.nearby_dialog = None;
+            }
             self.candidate_place = None;
             self.preview_inspecting = true;
             self.preview_center_mercator =
                 Some(scene_core::geo_to_mercator(place.latitude, place.longitude));
         } else {
             self.last_error = Some(if self.language == UiLanguage::English {
-                "This provider result has no matching open-data place; use Add custom route marker from the map."
-                    .into()
+                if custom_mode {
+                    "This result cannot be saved as a route pin; return to the custom form to add the clicked coordinate."
+                        .into()
+                } else {
+                    "This provider result has no matching open-data place; use Add custom route marker from the map."
+                        .into()
+                }
+            } else if custom_mode {
+                "這個結果沒有可保存的開放資料，請返回自訂表單加入原本點選的座標。".into()
             } else {
                 "找不到對應的開放資料地點，請從地圖右鍵使用「新增自訂沿途地點」。".into()
             });
@@ -542,8 +807,9 @@ impl NativeApp {
         let Some(track) = &self.track else {
             return;
         };
-        let Some(anchor) =
-            anchor_landmark_to_route(track, state.coordinate.latitude, state.coordinate.longitude)
+        let candidates =
+            find_landmark_passes(track, state.coordinate.latitude, state.coordinate.longitude);
+        let Some(selected) = select_candidate_for_progress(&candidates, self.preview_progress)
         else {
             return;
         };
@@ -554,7 +820,7 @@ impl NativeApp {
             self.landmarks.len()
         );
         let coordinate = state.coordinate;
-        self.add_landmark(RouteLandmark {
+        let landmark = RouteLandmark {
             id,
             source: LandmarkSource::Manual,
             source_id: None,
@@ -566,12 +832,14 @@ impl NativeApp {
             category: (!state.category.trim().is_empty()).then(|| state.category.trim().into()),
             latitude: state.coordinate.latitude,
             longitude: state.coordinate.longitude,
-            anchor_distance_m: anchor.anchor_distance_m,
-            anchor_progress: anchor.anchor_progress,
-            distance_from_route_m: anchor.distance_from_route_m,
+            anchor_distance_m: selected.anchor_distance_m,
+            anchor_progress: selected.anchor_progress,
+            distance_from_route_m: selected.distance_from_route_m,
+            anchor_mode: LandmarkAnchorMode::SelectedPass,
             enabled: true,
             style: LandmarkStyle::default(),
-        });
+        };
+        self.queue_landmark(landmark, candidates);
         self.preview_inspecting = true;
         self.preview_center_mercator = Some(scene_core::geo_to_mercator(
             coordinate.latitude,
@@ -579,10 +847,145 @@ impl NativeApp {
         ));
     }
 
-    fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
-        if self.track.is_none() {
+    fn draw_pending_landmark(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_landmark.as_mut() else {
             return;
+        };
+        let english = self.language == UiLanguage::English;
+        let original_preview_progress = pending.original_preview_progress;
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut preview_progress = None;
+        let title = if english {
+            "Choose when the pin appears"
+        } else {
+            "選擇圖針出現時機"
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("choose-route-pass-window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                let place_name = pending.landmark.name.clone();
+                ui.label(if english {
+                    format!(
+                        "The route passes \"{place_name}\" {} times. Choose when the pin should appear.",
+                        pending.candidates.len()
+                    )
+                } else {
+                    format!(
+                        "路線會經過「{place_name}」{} 次，請選擇圖針要在哪一次經過時出現。",
+                        pending.candidates.len()
+                    )
+                });
+                ui.small(if english {
+                    "Selecting an option previews the route position. The coloured route ends at the closest point on the road."
+                } else {
+                    "點選選項會立即預覽該次經過；橘色路線終點是道路上距離圖針最近的位置。"
+                });
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for index in 0..pending.candidates.len() {
+                            let selected = index == pending.selected_index;
+                            let mut clicked = false;
+                            egui::Frame::group(ui.style())
+                                .fill(if selected {
+                                    egui::Color32::from_rgba_unmultiplied(92, 190, 255, 38)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.radio(selected, "").clicked() {
+                                            clicked = true;
+                                        }
+                                        ui.vertical(|ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    false,
+                                                    egui::RichText::new(pass_title(
+                                                        &pending.candidates,
+                                                        index,
+                                                        english,
+                                                    ))
+                                                    .strong(),
+                                                )
+                                                .clicked()
+                                            {
+                                                clicked = true;
+                                            }
+                                            if ui
+                                                .selectable_label(
+                                                    false,
+                                                    egui::RichText::new(pass_details(
+                                                        &pending.candidates[index],
+                                                        english,
+                                                    ))
+                                                    .weak(),
+                                                )
+                                                .clicked()
+                                            {
+                                                clicked = true;
+                                            }
+                                        });
+                                    });
+                                });
+                            if clicked {
+                                pending.selected_index = index;
+                                preview_progress =
+                                    Some(pending.candidates[index].anchor_progress);
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if english {
+                            "Confirm selection"
+                        } else {
+                            "確認選擇"
+                        })
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui
+                        .button(if english { "Cancel" } else { "取消" })
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(progress) = preview_progress {
+            self.preview_progress = progress;
         }
+        if cancel {
+            self.preview_progress = original_preview_progress;
+            self.pending_landmark = None;
+        } else if confirm
+            && let Some(pending) = self.pending_landmark.take()
+            && let Some(candidate) = pending.candidates.get(pending.selected_index).copied()
+        {
+            let mut landmark = pending.landmark;
+            Self::apply_candidate(&mut landmark, candidate);
+            let latitude = landmark.latitude;
+            let longitude = landmark.longitude;
+            self.preview_progress = candidate.anchor_progress;
+            self.add_landmark(landmark);
+            self.preview_inspecting = true;
+            self.preview_center_mercator = Some(scene_core::geo_to_mercator(latitude, longitude));
+        }
+    }
+    fn draw_landmark_manager(&mut self, ui: &mut egui::Ui) {
+        let Some(track) = self.track.as_ref() else {
+            return;
+        };
         let english = self.language == UiLanguage::English;
         ui.small(if english {
             "Markers appear when the route reaches them and remain on the final fit view."
@@ -592,9 +995,47 @@ impl NativeApp {
         let mut changed = false;
         let mut remove = None;
         let mut jump = None;
+        let mut change_pass = None;
         for index in 0..self.landmarks.len() {
+            let candidates = find_landmark_passes(
+                track,
+                self.landmarks[index].latitude,
+                self.landmarks[index].longitude,
+            );
+            let selected_index =
+                select_candidate_index(&candidates, self.landmarks[index].anchor_progress);
             let landmark = &mut self.landmarks[index];
             let id = landmark.id.clone();
+            if let Some(selected_index) = selected_index
+                && candidates.len() > 1
+            {
+                ui.vertical(|ui| {
+                    ui.label(if english {
+                        "Selected pass"
+                    } else {
+                        "選定經過"
+                    });
+                    egui::ComboBox::from_id_salt(("landmark-pass", &id))
+                        .selected_text(pass_title(&candidates, selected_index, english))
+                        .width(ui.available_width().max(120.0))
+                        .show_ui(ui, |ui| {
+                            for candidate_index in 0..candidates.len() {
+                                if ui
+                                    .selectable_label(
+                                        candidate_index == selected_index,
+                                        pass_label(&candidates, candidate_index, english),
+                                    )
+                                    .clicked()
+                                {
+                                    change_pass = Some((index, candidate_index));
+                                }
+                            }
+                        });
+                    ui.add(
+                        egui::Label::new(pass_details(&candidates[selected_index], english)).wrap(),
+                    );
+                });
+            }
             ui.push_id(id, |ui| {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -658,6 +1099,17 @@ impl NativeApp {
         }
         if let Some(index) = remove {
             self.landmarks.remove(index);
+            changed = true;
+        }
+        if let Some((landmark_index, candidate_index)) = change_pass
+            && let Some(landmark) = self.landmarks.get_mut(landmark_index)
+            && let Some(candidate) =
+                find_landmark_passes(track, landmark.latitude, landmark.longitude)
+                    .get(candidate_index)
+                    .copied()
+        {
+            Self::apply_candidate(landmark, candidate);
+            self.preview_progress = candidate.anchor_progress;
             changed = true;
         }
         if let Some(progress) = jump {
@@ -740,7 +1192,10 @@ impl NativeApp {
         }
     }
 
-    fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate) {
+    fn start_nearby_lookup(&mut self, coordinate: SearchCoordinate, purpose: NearbySearchPurpose) {
+        if purpose == NearbySearchPurpose::Browse {
+            self.custom_landmark = None;
+        }
         self.candidate_place = None;
         self.selected_landmark_id = None;
         self.next_places_request_id = self.next_places_request_id.wrapping_add(1);
@@ -748,6 +1203,7 @@ impl NativeApp {
         self.nearby_dialog = Some(NearbyDialogState {
             coordinate,
             request_id,
+            purpose,
             loading: true,
             places: Vec::new(),
             error: None,
@@ -917,16 +1373,25 @@ impl NativeApp {
             });
         if search {
             self.context_menu = None;
-            self.start_nearby_lookup(menu.coordinate);
+            self.start_nearby_lookup(menu.coordinate, NearbySearchPurpose::Browse);
         }
         if custom {
-            self.context_menu = None;
-            self.custom_landmark = Some(CustomLandmarkState {
-                coordinate: menu.coordinate,
-                name: String::new(),
-                category: String::new(),
-            });
+            self.open_custom_landmark(menu.coordinate, ctx);
         }
+    }
+
+    fn open_custom_landmark(&mut self, coordinate: SearchCoordinate, ctx: &egui::Context) {
+        // The custom-pin flow is a deliberate mode switch.  Close any active
+        // nearby search first so draw_nearby_panel renders the custom form on
+        // the very next frame, even when the nearby inspector was already open.
+        self.context_menu = None;
+        switch_to_custom_landmark(
+            &mut self.nearby_dialog,
+            &mut self.candidate_place,
+            &mut self.custom_landmark,
+            coordinate,
+        );
+        ctx.request_repaint();
     }
 
     #[allow(dead_code, clippy::collapsible_else_if)]
@@ -1165,10 +1630,11 @@ impl NativeApp {
             }
         });
         let coordinate = dialog.coordinate;
+        let purpose = dialog.purpose;
         if close {
             self.nearby_dialog = None;
         } else if retry {
-            self.start_nearby_lookup(coordinate);
+            self.start_nearby_lookup(coordinate, purpose);
         }
         if let Some(index) = add_index {
             self.add_place_from_dialog(index);
@@ -1178,66 +1644,147 @@ impl NativeApp {
         }
     }
 
-    fn draw_custom_landmark_dialog(&mut self, ctx: &egui::Context) {
-        let Some(state) = self.custom_landmark.as_mut() else {
+    fn draw_custom_landmark_panel(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.custom_landmark.clone() else {
             return;
         };
         let english = self.language == UiLanguage::English;
-        let mut save = false;
+        let mut search = false;
+        let mut add = false;
         let mut cancel = false;
-        egui::Window::new(if english {
-            "Add custom route marker"
-        } else {
-            "新增自訂沿途地點"
-        })
-        .id(egui::Id::new("custom-route-landmark"))
-        .fixed_pos(egui::pos2(460.0, 110.0))
-        .default_size(egui::vec2(360.0, 190.0))
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.small(format!(
-                "{:.6}, {:.6}",
-                state.coordinate.latitude, state.coordinate.longitude
-            ));
-            ui.label(if english { "Name" } else { "名稱" });
-            ui.text_edit_singleline(&mut state.name);
-            ui.label(if english {
-                "Category (optional)"
-            } else {
-                "分類（可選）"
+        let available_width = ctx.available_rect().width().max(0.0);
+        let min_width = 300.0_f32;
+        let (preferred_width, max_width) =
+            nearby_panel_widths(available_width, self.layout.nearby_panel_width);
+        let coordinate = draft.coordinate;
+        let panel_response = egui::SidePanel::right("nearby-places-inspector")
+            .resizable(true)
+            .default_width(preferred_width)
+            .width_range(min_width..=max_width)
+            .show(ctx, |ui| {
+                ui.set_max_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading(if english {
+                        "Add route pin"
+                    } else {
+                        "新增沿途圖針"
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.small(if english {
+                    "Enter a custom name, or search this coordinate for a place to use."
+                } else {
+                    "可直接填寫自訂名稱，也可以用這個座標搜尋附近地點。"
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(if english { "Coordinate" } else { "座標" });
+                    ui.monospace(format!(
+                        "{:.5}, {:.5}",
+                        draft.coordinate.latitude, draft.coordinate.longitude
+                    ));
+                });
+                ui.label(if english { "Name" } else { "名稱" });
+                ui.text_edit_singleline(&mut draft.name);
+                ui.label(if english {
+                    "Category (optional)"
+                } else {
+                    "分類（可選）"
+                });
+                ui.text_edit_singleline(&mut draft.category);
+                ui.horizontal(|ui| {
+                    ui.label(if english {
+                        "Search radius"
+                    } else {
+                        "搜尋半徑"
+                    });
+                    egui::ComboBox::from_id_salt("custom-nearby-radius")
+                        .selected_text(format!("{} m", self.preferences.nearby_radius_m))
+                        .show_ui(ui, |ui| {
+                            for radius in places_core::ALLOWED_RADII_M {
+                                ui.selectable_value(
+                                    &mut self.preferences.nearby_radius_m,
+                                    radius,
+                                    format!("{} m", radius),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(if english {
+                            "Search nearby places"
+                        } else {
+                            "搜尋附近地點"
+                        })
+                        .clicked()
+                    {
+                        search = true;
+                    }
+                    if ui
+                        .button(if english {
+                            "Add custom pin"
+                        } else {
+                            "直接建立自訂圖針"
+                        })
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.separator();
+                ui.small(if english {
+                    "Nearby results will use their real coordinates and provider data."
+                } else {
+                    "附近搜尋結果會使用該地點的真實座標與資料來源。"
+                });
             });
-            ui.text_edit_singleline(&mut state.category);
-            ui.horizontal(|ui| {
-                if ui.button(if english { "Add" } else { "加入" }).clicked() {
-                    save = true;
-                }
-                if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
-                    cancel = true;
-                }
-            });
-        });
-        if save {
-            self.add_custom_landmark();
-        } else if cancel {
+        let measured_width = panel_response.response.rect.width();
+        if measured_width.is_finite() && measured_width >= min_width {
+            self.layout.nearby_panel_width = measured_width.clamp(min_width, max_width);
+        }
+        if cancel {
             self.custom_landmark = None;
+            self.candidate_place = None;
+        } else {
+            self.custom_landmark = Some(draft);
+            if search {
+                self.start_nearby_lookup(coordinate, NearbySearchPurpose::CustomMarker);
+            } else if add {
+                self.add_custom_landmark();
+            }
         }
     }
 
-    /// Render nearby search results in a real right-hand inspector.  The old
-    /// floating window is kept only as a compatibility shim for saved UI
-    /// state; this panel is the sole active entry point.
+    /// Render nearby search results and custom-pin editing in one right-hand
+    /// inspector so the preview remains the primary surface.
     fn draw_nearby_panel(&mut self, ctx: &egui::Context) {
+        if self.nearby_dialog.is_none() {
+            if self.custom_landmark.is_some() {
+                self.draw_custom_landmark_panel(ctx);
+            }
+            return;
+        }
         let Some(dialog) = self.nearby_dialog.as_mut() else {
             return;
         };
         let language = self.language;
         let english = language == UiLanguage::English;
+        let custom_mode = dialog.purpose == NearbySearchPurpose::CustomMarker;
         let landmark_ids: HashSet<String> = self
             .landmarks
             .iter()
             .map(|value| value.id.clone())
             .collect();
         let mut close = false;
+        let mut return_to_custom = false;
         let mut retry = false;
         let mut open_settings = false;
         let mut add_index = None;
@@ -1254,7 +1801,13 @@ impl NativeApp {
                 ui.set_max_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.heading(if english {
-                        "Nearby places"
+                        if custom_mode {
+                            "Choose nearby place"
+                        } else {
+                            "Nearby places"
+                        }
+                    } else if custom_mode {
+                        "選擇附近地點"
                     } else {
                         "附近地點"
                     });
@@ -1262,10 +1815,27 @@ impl NativeApp {
                         if ui.small_button("×").clicked() {
                             close = true;
                         }
+                        if custom_mode
+                            && ui
+                                .small_button(if english {
+                                    "Back to custom pin"
+                                } else {
+                                    "返回自訂圖針"
+                                })
+                                .clicked()
+                        {
+                            return_to_custom = true;
+                        }
                     });
                 });
                 ui.small(if english {
-                    "Select a place to preview a pin, then add it to the route."
+                    if custom_mode {
+                        "Choose a result to use its real place data, or return to add the clicked coordinate."
+                    } else {
+                        "Select a place to preview a pin, then add it to the route."
+                    }
+                } else if custom_mode {
+                    "可使用搜尋結果的真實資料，也可以返回直接建立原本點選的座標。"
                 } else {
                     "選取地點可預覽圖針；按加入後才會寫入路線。"
                 });
@@ -1349,7 +1919,17 @@ impl NativeApp {
                                     if added {
                                         ui.label(if english { "Added" } else { "已加入" });
                                     } else if ui
-                                        .button(if english { "Add pin" } else { "加入圖針" })
+                                        .button(if english {
+                                            if custom_mode {
+                                                "Use this place"
+                                            } else {
+                                                "Add pin"
+                                            }
+                                        } else if custom_mode {
+                                            "使用此地點"
+                                        } else {
+                                            "加入圖針"
+                                        })
                                         .clicked()
                                     {
                                         add_index = Some(index);
@@ -1417,11 +1997,19 @@ impl NativeApp {
             self.layout.nearby_panel_width = measured_width.clamp(min_width, max_width);
         }
         let coordinate = dialog.coordinate;
+        let purpose = dialog.purpose;
         let candidate = preview_index.and_then(|index| dialog.places.get(index).cloned());
         if close {
             self.nearby_dialog = None;
+            if custom_mode {
+                self.custom_landmark = None;
+            }
+            self.candidate_place = None;
+        } else if return_to_custom {
+            self.nearby_dialog = None;
+            self.candidate_place = None;
         } else if retry {
-            self.start_nearby_lookup(coordinate);
+            self.start_nearby_lookup(coordinate, purpose);
         }
         if let Some(index) = add_index {
             self.add_place_from_dialog(index);
@@ -1786,35 +2374,8 @@ impl NativeApp {
                     }
                     match &self.model.state {
                         JobState::Running(value) => {
-                            if value.stage == nvenc_engine::ExportStage::Preflight {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("正在讀取本地地圖快取並補齊缺少圖磚…");
-                                });
-                            }
-                            let ratio = if value.stage_total == 0 {
-                                0.0
-                            } else {
-                                value.stage_completed as f32 / value.stage_total as f32
-                            };
-                            let status = if value.stage == nvenc_engine::ExportStage::Preflight {
-                                format!("地圖圖磚 {}/{}", value.stage_completed, value.stage_total)
-                            } else {
-                                format!(
-                                    "影片 {} FPS · 輸出 {:.1} fps ({:.2}×) · ETA {:.1}s",
-                                    self.model.settings.fps,
-                                    value.fps,
-                                    value.fps / self.model.settings.fps as f64,
-                                    value.eta_seconds
-                                )
-                            };
-                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
-                            if ui.button("取消匯出").clicked() {
-                                if let Some(token) = &self.active_token {
-                                    token.cancel()
-                                }
-                                self.model.cancel();
-                            }
+                            let value = value.clone();
+                            self.draw_export_progress(ui, &value, false);
                         }
                         _ => {
                             if ui
@@ -2146,6 +2707,69 @@ impl NativeApp {
         apply_long_edge(&mut self.model.settings, long_edge);
     }
 
+    fn draw_export_progress(&mut self, ui: &mut egui::Ui, value: &ExportProgress, english: bool) {
+        let step = export_step(value.activity);
+        ui.horizontal(|ui| {
+            ui.strong(format!(
+                "{}  {step}/2",
+                export_title(value.activity, english)
+            ));
+        });
+        ui.small(export_detail(value.activity, english));
+
+        let stage_total = value.stage_total.filter(|total| *total > 0);
+        if let Some(total) = stage_total {
+            let ratio = (value.stage_completed as f32 / total as f32).clamp(0.0, 1.0);
+            let progress_text = match (value.activity, english) {
+                (ExportActivity::PreparingMapTiles, true) => {
+                    format!("Map assets {} / {total}", value.stage_completed)
+                }
+                (ExportActivity::PreparingMapTiles, false) => {
+                    format!("地圖素材 {} / {total}", value.stage_completed)
+                }
+                (ExportActivity::RenderingVideo, true) => {
+                    format!("Video frames {} / {total}", value.stage_completed)
+                }
+                (ExportActivity::RenderingVideo, false) => {
+                    format!("影片幀 {} / {total}", value.stage_completed)
+                }
+                _ => format!("{} / {total}", value.stage_completed),
+            };
+            ui.add(
+                egui::ProgressBar::new(ratio)
+                    .show_percentage()
+                    .text(progress_text),
+            );
+        } else {
+            ui.add(egui::ProgressBar::new(0.0).animate(true).text(if english {
+                "Working…"
+            } else {
+                "請稍候…"
+            }));
+        }
+
+        let status_line = if matches!(
+            value.activity,
+            ExportActivity::PreparingMapTiles | ExportActivity::RenderingVideo
+        ) {
+            format_eta(value.eta_seconds, english)
+        } else if english {
+            "Please wait…".to_owned()
+        } else {
+            "請稍候…".to_owned()
+        };
+        ui.small(status_line);
+        if ui
+            .button(if english { "Cancel" } else { "取消匯出" })
+            .clicked()
+        {
+            if let Some(token) = &self.active_token {
+                token.cancel();
+            }
+            self.model.cancel();
+        }
+    }
+
     fn draw_export_footer(&mut self, ui: &mut egui::Ui, english: bool) {
         ui.separator();
         ui.strong(if english { "Export" } else { "輸出" });
@@ -2261,22 +2885,8 @@ impl NativeApp {
         }
         match &self.model.state {
             JobState::Running(value) => {
-                let ratio = if value.stage_total == 0 {
-                    0.0
-                } else {
-                    value.stage_completed as f32 / value.stage_total as f32
-                };
-                ui.add(
-                    egui::ProgressBar::new(ratio)
-                        .show_percentage()
-                        .text(format!("{:?} · {:.1} FPS", value.stage, value.fps)),
-                );
-                if ui.button(if english { "Cancel" } else { "取消" }).clicked() {
-                    if let Some(token) = &self.active_token {
-                        token.cancel();
-                    }
-                    self.model.cancel();
-                }
+                let value = value.clone();
+                self.draw_export_progress(ui, &value, english);
             }
             _ => {
                 let long_edge = current_long_edge(&self.model.settings);
@@ -2528,38 +3138,8 @@ impl NativeApp {
                     }
                     match &self.model.state {
                         JobState::Running(value) => {
-                            if value.stage == nvenc_engine::ExportStage::Preflight {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Preparing cached map tiles…");
-                                });
-                            }
-                            let ratio = if value.stage_total == 0 {
-                                0.0
-                            } else {
-                                value.stage_completed as f32 / value.stage_total as f32
-                            };
-                            let status = if value.stage == nvenc_engine::ExportStage::Preflight {
-                                format!(
-                                    "Map tiles {} / {}",
-                                    value.stage_completed, value.stage_total
-                                )
-                            } else {
-                                format!(
-                                    "{} / {} · {:.1} FPS · ETA {:.1}s",
-                                    value.stage_completed,
-                                    value.stage_total,
-                                    value.fps,
-                                    value.eta_seconds
-                                )
-                            };
-                            ui.add(egui::ProgressBar::new(ratio).show_percentage().text(status));
-                            if ui.button("Cancel").clicked() {
-                                if let Some(token) = &self.active_token {
-                                    token.cancel();
-                                }
-                                self.model.cancel();
-                            }
+                            let value = value.clone();
+                            self.draw_export_progress(ui, &value, true);
                         }
                         _ => {
                             if ui
@@ -2662,10 +3242,11 @@ impl NativeApp {
             // Camera composition uses scene_core's logical canvas.  The
             // widget size only controls how the already-computed frame is
             // letterboxed on screen.
+            let preview_landmarks = self.preview_landmarks();
             let initial_scene = Scene {
                 track: track.clone(),
                 options: preview_options.clone(),
-                landmarks: self.landmarks.clone(),
+                landmarks: preview_landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
             let initial_frame = build_frame_with_context(
@@ -2705,7 +3286,7 @@ impl NativeApp {
             let scene = Scene {
                 track: track.clone(),
                 options: preview_options,
-                landmarks: self.landmarks.clone(),
+                landmarks: preview_landmarks.clone(),
                 route_duration_seconds: self.model.settings.duration_seconds as f64,
             };
             let frame = build_frame_with_context(
@@ -2790,11 +3371,12 @@ impl NativeApp {
                 )
             };
             let route: Vec<_> = frame.route_ndc.iter().copied().map(to_screen).collect();
-            let completed = route
+            let completed: Vec<_> = frame
+                .completed_route_ndc
                 .iter()
-                .take(frame.completed_points)
                 .copied()
-                .collect::<Vec<_>>();
+                .map(to_screen)
+                .collect();
             painter.add(egui::Shape::line(
                 route,
                 egui::Stroke::new(
@@ -2819,6 +3401,50 @@ impl NativeApp {
                 12.0 * preview_scale,
                 egui::Color32::from_rgb(255, 93, 59),
             );
+            if let Some(pending) = &self.pending_landmark
+                && let Some(candidate) = pending.candidates.get(pending.selected_index)
+            {
+                let to_screen_geo = |latitude: f64, longitude: f64| {
+                    let projected = scene_core::geo_to_mercator(latitude, longitude);
+                    let ndc = [
+                        ((projected[0] - frame.view_center_mercator[0]) * 2.0 / frame.view_span)
+                            as f32,
+                        (-(projected[1] - frame.view_center_mercator[1]) * 2.0 / frame.view_span_y)
+                            as f32,
+                    ];
+                    to_screen(ndc)
+                };
+                let anchor = to_screen_geo(candidate.nearest_latitude, candidate.nearest_longitude);
+                let pin = to_screen_geo(pending.landmark.latitude, pending.landmark.longitude);
+                if anchor.distance(pin) > 1.0 {
+                    let connector_color = egui::Color32::from_rgba_unmultiplied(
+                        self.model.settings.scene.route_color[0],
+                        self.model.settings.scene.route_color[1],
+                        self.model.settings.scene.route_color[2],
+                        180,
+                    );
+                    draw_dashed_line(
+                        &painter,
+                        anchor,
+                        pin,
+                        egui::Stroke::new(2.0 * preview_scale, connector_color),
+                        8.0 * preview_scale,
+                        5.0 * preview_scale,
+                    );
+                    painter.circle_stroke(
+                        anchor,
+                        8.0 * preview_scale,
+                        egui::Stroke::new(
+                            2.0 * preview_scale,
+                            egui::Color32::from_white_alpha(220),
+                        ),
+                    );
+                }
+            }
+            let pending_selected_id = self
+                .pending_landmark
+                .as_ref()
+                .map(|pending| pending.landmark.id.as_str());
             let landmark_scale = preview_scale;
             for landmark in &frame.landmarks {
                 if landmark.pin_opacity <= 0.0
@@ -2837,7 +3463,8 @@ impl NativeApp {
                     landmark.color[2],
                     alpha,
                 );
-                let selected = self.selected_landmark_id.as_deref() == Some(landmark.id.as_str());
+                let selected = self.selected_landmark_id.as_deref() == Some(landmark.id.as_str())
+                    || pending_selected_id == Some(landmark.id.as_str());
                 let selection_scale = if selected { 1.35 } else { 1.0 };
                 let radius = 18.0 * landmark_scale * landmark.pin_scale.max(0.2) * selection_scale;
                 let body = point + egui::vec2(0.0, -radius * 0.78);
@@ -3172,18 +3799,37 @@ impl NativeApp {
         let mut download_pack = false;
         let mut clear_cache = false;
         let language_before = self.language;
+        let available_rect = ctx.content_rect();
+        let window_min_size = settings_window_min_size(available_rect);
+        let window_max_size = settings_window_max_size(available_rect);
+        let window_size = settings_window_size(available_rect);
+        let saved_window = self.layout.settings_window.clone();
+        let window_rect = settings_window_initial_rect(
+            available_rect,
+            window_size,
+            window_min_size,
+            window_max_size,
+            &saved_window,
+        );
+        let settings_window_id = egui::Id::new("settings-window-stable");
         egui::Window::new(if english { "Settings" } else { "設定" })
-            .id(egui::Id::new("settings-window-stable"))
+            .id(settings_window_id)
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(egui::vec2(760.0, 620.0))
-            .resizable(false)
+            .default_rect(window_rect)
+            .min_size(window_min_size)
+            .max_size(window_max_size)
+            .movable(true)
+            .resizable(true)
+            .constrain_to(available_rect)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.set_min_size(egui::vec2(730.0, 570.0));
-                ui.horizontal(|ui| {
-                    ui.set_min_width(150.0);
-                    ui.vertical(|ui| {
+                let content_size = ui.available_size_before_wrap();
+                ui.horizontal_top(|ui| {
+                    let sidebar_width = 150.0_f32.min(content_size.x);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(sidebar_width, content_size.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
                         ui.heading(if english { "Settings" } else { "設定" });
                         ui.add_space(8.0);
                         for (page, label) in [
@@ -3215,12 +3861,18 @@ impl NativeApp {
                                 self.settings_page = page;
                             }
                         }
-                    });
+                        },
+                    );
                     ui.separator();
-                    ui.vertical(|ui| {
+                    let content_width = ui.available_width().max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(content_width, content_size.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
                         egui::ScrollArea::vertical()
-                            .id_salt("settings-content-scroll")
+                            .id_salt(("settings-content-scroll", self.settings_page.scroll_id()))
                             .auto_shrink([false, false])
+                            .max_height(content_size.y)
                             .show(ui, |ui| match self.settings_page {
                                 SettingsPage::General => {
                                     ui.heading(if english { "General" } else { "一般" });
@@ -3410,9 +4062,24 @@ impl NativeApp {
                                     if ui.button(if english { "Open detailed diagnostics" } else { "開啟詳細診斷" }).clicked() { self.show_diagnostics = true; }
                                 }
                             });
-                    });
+                        },
+                    );
                 });
             });
+        if let Some(rect) = ctx.memory(|memory| memory.area_rect(settings_window_id)) {
+            let actual_geometry = settings_window_preferences_from_rect(rect);
+            let safe_rect = settings_window_initial_rect(
+                available_rect,
+                window_size,
+                window_min_size,
+                window_max_size,
+                &actual_geometry,
+            );
+            let geometry = settings_window_preferences_from_rect(safe_rect);
+            if self.layout.settings_window != geometry {
+                self.layout.settings_window = geometry;
+            }
+        }
         self.show_settings = open;
         if self.language != language_before {
             self.model.settings.scene.render_language = render_language(self.language);
@@ -3865,6 +4532,114 @@ impl NativeApp {
     }
 }
 
+fn select_candidate_index(
+    candidates: &[RouteAnchorCandidate],
+    preferred_progress: f64,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a.anchor_progress - preferred_progress)
+                .abs()
+                .total_cmp(&(b.anchor_progress - preferred_progress).abs())
+                .then_with(|| a.anchor_distance_m.total_cmp(&b.anchor_distance_m))
+        })
+        .map(|(index, _)| index)
+}
+
+fn select_candidate_for_progress(
+    candidates: &[RouteAnchorCandidate],
+    preferred_progress: f64,
+) -> Option<RouteAnchorCandidate> {
+    select_candidate_index(candidates, preferred_progress).map(|index| candidates[index])
+}
+
+fn candidate_heading_delta(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    Some(match (a, b) {
+        (Some(a), Some(b)) => {
+            let delta = (a - b).abs().rem_euclid(360.0);
+            delta.min(360.0 - delta)
+        }
+        _ => return None,
+    })
+}
+
+fn pass_label(candidates: &[RouteAnchorCandidate], index: usize, english: bool) -> String {
+    format!(
+        "{} · {}",
+        pass_title(candidates, index, english),
+        pass_details(&candidates[index], english)
+    )
+}
+fn draw_dashed_line(
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    stroke: egui::Stroke,
+    dash_length: f32,
+    gap_length: f32,
+) {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let direction = delta / length;
+    let step = (dash_length + gap_length).max(1.0);
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + dash_length).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * dash_end],
+            stroke,
+        );
+        offset += step;
+    }
+}
+
+fn pass_is_out_and_back(candidates: &[RouteAnchorCandidate]) -> bool {
+    candidates.len() == 2
+        && candidate_heading_delta(candidates[0].heading_deg, candidates[1].heading_deg)
+            .is_some_and(|delta| delta >= 120.0)
+}
+
+fn pass_title(candidates: &[RouteAnchorCandidate], index: usize, english: bool) -> String {
+    let is_out_and_back = pass_is_out_and_back(candidates);
+    if is_out_and_back {
+        if english {
+            if index == 0 {
+                format!("Outbound · pass 1 of {}", candidates.len())
+            } else {
+                format!("Return · pass 2 of {}", candidates.len())
+            }
+        } else if index == 0 {
+            "去程｜第 1 次經過".into()
+        } else {
+            "回程｜第 2 次經過".into()
+        }
+    } else if english {
+        format!("Pass {} of {}", index + 1, candidates.len())
+    } else {
+        format!("第 {} 次經過", index + 1)
+    }
+}
+
+fn pass_details(candidate: &RouteAnchorCandidate, english: bool) -> String {
+    if english {
+        format!(
+            "Route mileage: {:.2} km · {:.0} m from pin",
+            candidate.anchor_distance_m / 1000.0,
+            candidate.distance_from_route_m,
+        )
+    } else {
+        format!(
+            "路線里程 {:.2} km · 距圖針 {:.0} m",
+            candidate.anchor_distance_m / 1000.0,
+            candidate.distance_from_route_m,
+        )
+    }
+}
 impl eframe::App for NativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(path) = ctx.input(|input| {
@@ -3888,7 +4663,7 @@ impl eframe::App for NativeApp {
         self.draw_nearby_panel(ctx);
         self.draw_preview(ctx);
         self.draw_context_menu(ctx);
-        self.draw_custom_landmark_dialog(ctx);
+        self.draw_pending_landmark(ctx);
         self.diagnostics_window(ctx);
         self.settings_window(ctx);
         self.persist_preferences();
@@ -3928,6 +4703,21 @@ fn nearby_panel_widths(available_width: f32, preferred_width: f32) -> (f32, f32)
     let min_width = 300.0_f32;
     let max_width = (available_width - 640.0).max(min_width).min(720.0);
     (preferred_width.clamp(min_width, max_width), max_width)
+}
+
+fn switch_to_custom_landmark(
+    nearby_dialog: &mut Option<NearbyDialogState>,
+    candidate_place: &mut Option<PlaceSummary>,
+    custom_landmark: &mut Option<CustomLandmarkState>,
+    coordinate: SearchCoordinate,
+) {
+    *nearby_dialog = None;
+    *candidate_place = None;
+    *custom_landmark = Some(CustomLandmarkState {
+        coordinate,
+        name: String::new(),
+        category: String::new(),
+    });
 }
 
 fn preview_content_scale(
@@ -4005,6 +4795,29 @@ mod tests {
     }
 
     #[test]
+    fn export_eta_is_localized_and_never_renders_zero_seconds() {
+        assert_eq!(format_eta(None, false), "正在估算剩餘時間…");
+        assert_eq!(format_eta(Some(0.0), false), "即將完成");
+        assert_eq!(format_eta(Some(12.1), false), "約剩 13 秒");
+        assert_eq!(format_eta(Some(128.0), true), "About 2m 08s remaining");
+        assert_eq!(format_eta(Some(3661.0), false), "約剩 1 小時 01 分");
+    }
+
+    #[test]
+    fn export_activity_uses_two_plain_language_steps() {
+        assert_eq!(export_step(ExportActivity::PreparingMapTiles), 1);
+        assert_eq!(export_step(ExportActivity::RenderingVideo), 2);
+        assert_eq!(
+            export_title(ExportActivity::PreparingRoute, false),
+            "準備匯出"
+        );
+        assert_eq!(
+            export_title(ExportActivity::FinalizingFile, true),
+            "Creating video"
+        );
+    }
+
+    #[test]
     fn nearby_panel_width_is_clamped_without_content_growth() {
         assert_eq!(nearby_panel_widths(1800.0, 900.0), (720.0, 720.0));
         assert_eq!(nearby_panel_widths(1200.0, 410.0), (410.0, 560.0));
@@ -4012,9 +4825,161 @@ mod tests {
     }
 
     #[test]
+    fn settings_window_uses_standard_size_when_screen_has_room() {
+        let available = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        assert_eq!(settings_window_size(available), egui::vec2(760.0, 620.0));
+    }
+
+    #[test]
+    fn settings_window_stays_inside_small_or_high_dpi_available_rect() {
+        let small = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(956.0, 764.0));
+        let small_size = settings_window_size(small);
+        assert!(small_size.x <= small.width() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+        assert!(small_size.y <= small.height() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+
+        let high_dpi = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0));
+        let high_dpi_size = settings_window_size(high_dpi);
+        assert_eq!(high_dpi_size, egui::vec2(760.0, 552.0));
+        assert!(high_dpi_size.x <= high_dpi.width() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+        assert!(high_dpi_size.y <= high_dpi.height() - SETTINGS_WINDOW_OUTER_MARGIN * 2.0);
+    }
+
+    #[test]
+    fn settings_window_defaults_are_centered_and_bounded() {
+        let available =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1440.0, 900.0));
+        let min_size = settings_window_min_size(available);
+        let max_size = settings_window_max_size(available);
+        let default_size = settings_window_size(available);
+        let rect = settings_window_initial_rect(
+            available,
+            default_size,
+            min_size,
+            max_size,
+            &SettingsWindowPreferences::default(),
+        );
+        assert_eq!(rect.size(), egui::vec2(760.0, 620.0));
+        assert!((rect.center().x - available.center().x).abs() < f32::EPSILON);
+        assert!((rect.center().y - available.center().y).abs() < f32::EPSILON);
+        assert!(rect.left() >= available.left() + SETTINGS_WINDOW_OUTER_MARGIN);
+        assert!(rect.right() <= available.right() - SETTINGS_WINDOW_OUTER_MARGIN);
+        assert!(rect.top() >= available.top() + SETTINGS_WINDOW_OUTER_MARGIN);
+        assert!(rect.bottom() <= available.bottom() - SETTINGS_WINDOW_OUTER_MARGIN);
+    }
+
+    #[test]
+    fn settings_window_restores_and_clamps_persisted_geometry() {
+        let available = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(956.0, 764.0));
+        let min_size = settings_window_min_size(available);
+        let max_size = settings_window_max_size(available);
+        let saved = SettingsWindowPreferences {
+            position: Some([-500.0, -300.0]),
+            size: Some([1500.0, 1200.0]),
+        };
+        let rect = settings_window_initial_rect(
+            available,
+            settings_window_size(available),
+            min_size,
+            max_size,
+            &saved,
+        );
+        assert_eq!(rect.size(), max_size);
+        assert_eq!(rect.left(), SETTINGS_WINDOW_OUTER_MARGIN);
+        assert_eq!(rect.top(), SETTINGS_WINDOW_OUTER_MARGIN);
+
+        let tiny = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 450.0));
+        assert_eq!(
+            settings_window_min_size(tiny),
+            settings_window_max_size(tiny)
+        );
+        assert_eq!(settings_window_size(tiny), settings_window_max_size(tiny));
+    }
+
+    #[test]
     fn preview_scale_matches_selected_output_density() {
         assert!((preview_content_scale(960.0, 540.0, 3840, 2160) - 0.25).abs() < 1e-6);
         assert!((preview_content_scale(960.0, 540.0, 1920, 1080) - 0.5).abs() < 1e-6);
         assert_eq!(preview_content_scale(0.0, 540.0, 3840, 2160), 1.0);
+    }
+
+    #[test]
+    fn pass_choice_follows_timeline_and_labels_reverse_direction() {
+        let candidates = vec![
+            RouteAnchorCandidate {
+                segment_index: 1,
+                occurrence_index: 0,
+                anchor_distance_m: 500.0,
+                anchor_progress: 0.2,
+                distance_from_route_m: 3.0,
+                nearest_latitude: 25.0,
+                nearest_longitude: 121.0,
+                heading_deg: Some(90.0),
+            },
+            RouteAnchorCandidate {
+                segment_index: 8,
+                occurrence_index: 1,
+                anchor_distance_m: 2_500.0,
+                anchor_progress: 0.8,
+                distance_from_route_m: 3.0,
+                nearest_latitude: 25.0,
+                nearest_longitude: 121.0,
+                heading_deg: Some(270.0),
+            },
+        ];
+        assert_eq!(select_candidate_index(&candidates, 0.75), Some(1));
+        assert!(pass_label(&candidates, 0, true).starts_with("Outbound"));
+        assert!(pass_label(&candidates, 1, true).starts_with("Return"));
+    }
+    #[test]
+    fn pass_details_explain_mileage_and_pin_distance_without_direction() {
+        let candidate = RouteAnchorCandidate {
+            segment_index: 1,
+            occurrence_index: 0,
+            anchor_distance_m: 3_210.0,
+            anchor_progress: 0.2,
+            distance_from_route_m: 18.0,
+            nearest_latitude: 25.0,
+            nearest_longitude: 121.0,
+            heading_deg: Some(33.0),
+        };
+        let details = pass_details(&candidate, false);
+        assert!(details.contains("路線里程"));
+        assert!(details.contains("距圖針"));
+        assert!(!details.contains("行進方向"));
+        assert!(!details.contains('°'));
+    }
+
+    #[test]
+    fn custom_pin_action_replaces_an_open_nearby_panel() {
+        let coordinate = SearchCoordinate {
+            latitude: 23.92854,
+            longitude: 121.50508,
+        };
+        let mut nearby_dialog = Some(NearbyDialogState {
+            coordinate,
+            request_id: 7,
+            purpose: NearbySearchPurpose::Browse,
+            loading: false,
+            places: Vec::new(),
+            error: None,
+            attempts: Vec::new(),
+            attribution: Vec::new(),
+            degraded: false,
+        });
+        let mut candidate_place = None;
+        let mut custom_landmark = None;
+
+        switch_to_custom_landmark(
+            &mut nearby_dialog,
+            &mut candidate_place,
+            &mut custom_landmark,
+            coordinate,
+        );
+
+        assert!(nearby_dialog.is_none());
+        assert!(candidate_place.is_none());
+        let custom_landmark = custom_landmark.expect("custom form should be opened");
+        assert_eq!(custom_landmark.coordinate, coordinate);
+        assert!(custom_landmark.name.is_empty());
     }
 }

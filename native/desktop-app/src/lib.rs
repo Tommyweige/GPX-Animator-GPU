@@ -1,5 +1,5 @@
 use nvenc_engine::{
-    CancellationToken, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
+    CancellationToken, ExportActivity, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
 };
 use scene_core::{Codec, QualityPreset, SceneOptions};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,19 @@ pub struct UiLayoutPreferences {
     pub preview_section_open: bool,
     pub landmarks_section_open: bool,
     pub export_advanced_open: bool,
+    #[serde(default)]
+    pub settings_window: SettingsWindowPreferences,
+}
+
+/// Persisted position and size for the Settings dialog.
+///
+/// Both values are optional so older settings files keep using the normal
+/// centered default until the user has opened and positioned the dialog.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SettingsWindowPreferences {
+    pub position: Option<[f32; 2]>,
+    pub size: Option<[f32; 2]>,
 }
 
 impl Default for UiLayoutPreferences {
@@ -83,6 +96,7 @@ impl Default for UiLayoutPreferences {
             preview_section_open: true,
             landmarks_section_open: false,
             export_advanced_open: false,
+            settings_window: SettingsWindowPreferences::default(),
         }
     }
 }
@@ -271,12 +285,13 @@ impl AppModel {
         let token = CancellationToken::default();
         let progress = ExportProgress {
             stage: ExportStage::Preflight,
+            activity: ExportActivity::PreparingRoute,
             completed_frames: 0,
             total_frames: self.settings.total_frames(),
             stage_completed: 0,
-            stage_total: 0,
-            fps: 0.0,
-            eta_seconds: 0.0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
         };
         self.cancellation = Some(token.clone());
         self.state = JobState::Running(progress);

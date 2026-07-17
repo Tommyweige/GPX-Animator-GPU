@@ -957,8 +957,7 @@ impl D2dSceneRenderer {
                 );
             }
         }
-        for pair in frame.route_ndc[..frame.completed_points.min(frame.route_ndc.len())].windows(2)
-        {
+        for pair in frame.completed_route_ndc.windows(2) {
             unsafe {
                 self.context.DrawLine(
                     to_pixel(pair[0]),

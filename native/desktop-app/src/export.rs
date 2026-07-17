@@ -2,8 +2,8 @@ use crate::ExportSettings;
 use gpx_core::{GpxError, ParseOptions, Track, parse_gpx};
 use mp4_output::{AtomicAvcFile, AtomicHevcFile, Mp4Error, avc_parameter_sets, parameter_sets};
 use nvenc_engine::{
-    CancellationToken, EncoderConfig, ExportMetrics, ExportProgress, ExportStage, GpuCapabilities,
-    NativeEncoder, NvencError,
+    CancellationToken, EncoderConfig, ExportActivity, ExportMetrics, ExportProgress, ExportStage,
+    GpuCapabilities, NativeEncoder, NvencError,
 };
 use scene_core::{CameraMode, Codec, RouteLandmark, Scene, blend_frames, build_frame};
 use std::collections::HashSet;
@@ -105,6 +105,66 @@ fn percentile(values: &[f64], fraction: f64) -> f64 {
     sorted[index]
 }
 
+struct ProgressEstimator {
+    started: Instant,
+    smoothed_rate: Option<f64>,
+}
+
+impl ProgressEstimator {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            smoothed_rate: None,
+        }
+    }
+
+    fn update(&mut self, completed: u64, total: u64) -> (Option<f64>, Option<f64>) {
+        if completed == 0 || total == 0 {
+            return (None, None);
+        }
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let instantaneous_rate = completed as f64 / elapsed.max(f64::EPSILON);
+        let rate = self.smoothed_rate.get_or_insert(instantaneous_rate);
+        if (*rate - instantaneous_rate).abs() > f64::EPSILON {
+            *rate = *rate * 0.8 + instantaneous_rate * 0.2;
+        }
+        let stable = elapsed >= 0.5 && completed >= 4;
+        let fps = stable.then_some(*rate);
+        let eta = if stable && completed < total {
+            Some((total - completed) as f64 / (*rate).max(f64::EPSILON))
+        } else {
+            None
+        };
+        (fps, eta)
+    }
+}
+
+struct ProgressSnapshot {
+    completed_frames: u64,
+    total_frames: u64,
+    stage_completed: u64,
+    stage_total: Option<u64>,
+    fps: Option<f64>,
+    eta_seconds: Option<f64>,
+}
+
+fn export_progress(
+    stage: ExportStage,
+    activity: ExportActivity,
+    snapshot: ProgressSnapshot,
+) -> ExportProgress {
+    ExportProgress {
+        stage,
+        activity,
+        completed_frames: snapshot.completed_frames,
+        total_frames: snapshot.total_frames,
+        stage_completed: snapshot.stage_completed,
+        stage_total: snapshot.stage_total,
+        fps: snapshot.fps,
+        eta_seconds: snapshot.eta_seconds,
+    }
+}
+
 pub fn run_native_export<F>(
     request: ExportRequest,
     token: &CancellationToken,
@@ -115,16 +175,18 @@ where
 {
     let route_frames = request.settings.route_frames();
     let total_frames = request.settings.total_frames();
-    let update = |stage, completed, fps, eta| ExportProgress {
-        stage,
-        completed_frames: completed,
-        total_frames,
-        stage_completed: completed,
-        stage_total: total_frames,
-        fps,
-        eta_seconds: eta,
-    };
-    progress(update(ExportStage::Preflight, 0, 0.0, 0.0));
+    progress(export_progress(
+        ExportStage::Preflight,
+        ExportActivity::PreparingRoute,
+        ProgressSnapshot {
+            completed_frames: 0,
+            total_frames,
+            stage_completed: 0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
+        },
+    ));
     token.check().map_err(|_| ExportError::Cancelled)?;
     let mut scene_options = request.settings.scene.clone();
     scene_options.camera_viewport_width_px = request.settings.width;
@@ -212,15 +274,20 @@ where
             .min(tile_total.max(1));
         let next = Arc::new(AtomicUsize::new(0));
         let (tile_tx, tile_rx) = mpsc::channel();
-        progress(ExportProgress {
-            stage: ExportStage::Preflight,
-            completed_frames: 0,
-            total_frames,
-            stage_completed: 0,
-            stage_total: tile_total as u64,
-            fps: 0.0,
-            eta_seconds: 0.0,
-        });
+        let tile_stage_total = (tile_total > 0).then_some(tile_total as u64);
+        progress(export_progress(
+            ExportStage::Preflight,
+            ExportActivity::PreparingMapTiles,
+            ProgressSnapshot {
+                completed_frames: 0,
+                total_frames,
+                stage_completed: 0,
+                stage_total: tile_stage_total,
+                fps: None,
+                eta_seconds: None,
+            },
+        ));
+        let mut tile_estimator = ProgressEstimator::new();
         let decoded = std::thread::scope(|scope| -> Result<Vec<_>, ExportError> {
             for _ in 0..workers {
                 let keys = Arc::clone(&keys);
@@ -248,15 +315,20 @@ where
             for (index, result) in tile_rx.into_iter().enumerate() {
                 token.check().map_err(|_| ExportError::Cancelled)?;
                 decoded.push(result?);
-                progress(ExportProgress {
-                    stage: ExportStage::Preflight,
-                    completed_frames: 0,
-                    total_frames,
-                    stage_completed: (index + 1) as u64,
-                    stage_total: tile_total as u64,
-                    fps: 0.0,
-                    eta_seconds: 0.0,
-                });
+                let completed = (index + 1) as u64;
+                let (_, eta) = tile_estimator.update(completed, tile_total as u64);
+                progress(export_progress(
+                    ExportStage::Preflight,
+                    ExportActivity::PreparingMapTiles,
+                    ProgressSnapshot {
+                        completed_frames: 0,
+                        total_frames,
+                        stage_completed: completed,
+                        stage_total: tile_stage_total,
+                        fps: None,
+                        eta_seconds: eta,
+                    },
+                ));
             }
             Ok(decoded)
         })?;
@@ -266,12 +338,25 @@ where
         }
         Some(renderer.prepare_tiles(decoded)?)
     };
+    progress(export_progress(
+        ExportStage::Preflight,
+        ExportActivity::InitializingExporter,
+        ProgressSnapshot {
+            completed_frames: 0,
+            total_frames,
+            stage_completed: 0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
+        },
+    ));
     let mut config = EncoderConfig::four_k_60(request.settings.codec, request.settings.quality);
     config.width = request.settings.width;
     config.height = request.settings.height;
     config.fps = request.settings.fps;
     let encoder = NativeEncoder::create(&device, &textures, config)?;
     let started = Instant::now();
+    let mut render_estimator = ProgressEstimator::new();
     let mut free_slots: VecDeque<usize> = (0..textures.len()).collect();
     let mut mux: Option<NativeFileMux> = None;
     let mut dts = 0u64;
@@ -380,17 +465,33 @@ where
             &mut encoded,
             &mut mux_ms,
         )?;
-        let elapsed = started.elapsed().as_secs_f64();
         let rendered = frame_index + 1;
-        let rate = rendered as f64 / elapsed.max(1e-9);
-        progress(update(
+        let (fps, eta) = render_estimator.update(rendered, total_frames);
+        progress(export_progress(
             ExportStage::Rendering,
-            encoded,
-            rate,
-            (total_frames - rendered) as f64 / rate.max(1e-9),
+            ExportActivity::RenderingVideo,
+            ProgressSnapshot {
+                completed_frames: rendered,
+                total_frames,
+                stage_completed: rendered,
+                stage_total: Some(total_frames),
+                fps,
+                eta_seconds: eta,
+            },
         ));
     }
-    progress(update(ExportStage::Encoding, encoded, 0.0, 0.0));
+    progress(export_progress(
+        ExportStage::Encoding,
+        ExportActivity::FinalizingFile,
+        ProgressSnapshot {
+            completed_frames: total_frames,
+            total_frames,
+            stage_completed: 0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
+        },
+    ));
     let packets = encoder.finish_packets()?;
     consume(
         packets,
@@ -404,9 +505,31 @@ where
         return Err(ExportError::NoPackets);
     }
     token.check().map_err(|_| ExportError::Cancelled)?;
-    progress(update(ExportStage::Muxing, encoded, 0.0, 0.0));
+    progress(export_progress(
+        ExportStage::Muxing,
+        ExportActivity::FinalizingFile,
+        ProgressSnapshot {
+            completed_frames: encoded,
+            total_frames,
+            stage_completed: 0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
+        },
+    ));
     let output = mux.ok_or(ExportError::NoPackets)?.finalize()?;
-    progress(update(ExportStage::Verifying, encoded, 0.0, 0.0));
+    progress(export_progress(
+        ExportStage::Verifying,
+        ExportActivity::VerifyingOutput,
+        ProgressSnapshot {
+            completed_frames: encoded,
+            total_frames,
+            stage_completed: 0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
+        },
+    ));
     let elapsed = started.elapsed().as_secs_f64();
     let metrics = ExportMetrics {
         cpu_frame_readbacks: 0,
@@ -427,11 +550,17 @@ where
         mux_p95_ms: percentile(&mux_ms, 0.95),
         elapsed_seconds: elapsed,
     };
-    progress(update(
+    progress(export_progress(
         ExportStage::Completed,
-        encoded,
-        encoded as f64 / elapsed.max(1e-9),
-        0.0,
+        ExportActivity::VerifyingOutput,
+        ProgressSnapshot {
+            completed_frames: encoded,
+            total_frames,
+            stage_completed: 0,
+            stage_total: None,
+            fps: None,
+            eta_seconds: None,
+        },
     ));
     Ok(ExportOutcome {
         output_path: output,
@@ -460,6 +589,32 @@ mod tests {
         assert_eq!(percentile(&[], 0.95), 0.0);
         assert_eq!(percentile(&[3.0, 1.0, 2.0], 0.5), 2.0);
     }
+
+    #[test]
+    fn progress_can_represent_unknown_work_without_zero_sentinels() {
+        let progress = export_progress(
+            ExportStage::Preflight,
+            ExportActivity::InitializingExporter,
+            ProgressSnapshot {
+                completed_frames: 0,
+                total_frames: 120,
+                stage_completed: 0,
+                stage_total: None,
+                fps: None,
+                eta_seconds: None,
+            },
+        );
+        assert_eq!(progress.stage_total, None);
+        assert_eq!(progress.fps, None);
+        assert_eq!(progress.eta_seconds, None);
+    }
+
+    #[test]
+    fn progress_estimator_does_not_claim_an_eta_before_work_starts() {
+        let mut estimator = ProgressEstimator::new();
+        assert_eq!(estimator.update(0, 120), (None, None));
+    }
+
     #[test]
     fn cancelled_preflight_does_not_create_file() {
         let output = std::env::temp_dir().join("gpx-native-cancelled.mp4");
