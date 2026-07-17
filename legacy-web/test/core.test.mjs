@@ -3,11 +3,11 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { formatDuration, haversineMeters, lonLatToWorld, sampleTrack } from '../public/js/geo.js';
-import { parseGpx } from '../public/js/gpx.js';
+import { formatDuration, haversineMeters, lonLatToWorld, sampleTrack } from '../js/geo.js';
+import { parseGpx } from '../js/gpx.js';
 
 test('parses the bundled multi-point GPX sample', async () => {
-  const path = fileURLToPath(new URL('../public/samples/taipei-riverside.gpx', import.meta.url));
+  const path = fileURLToPath(new URL('../samples/taipei-riverside.gpx', import.meta.url));
   const track = parseGpx(await readFile(path, 'utf8'));
   assert.equal(track.name, '台北河濱晨騎');
   assert.equal(track.points.length, 36);
