@@ -55,6 +55,23 @@ Close an existing GPX Animator process before replacing the executable. The
 default profile is 3840×2160 at 60 FPS, HEVC High quality, satellite imagery
 and an 8 px route; every setting is editable in the left panel.
 
+## Android ride recorder
+
+`mobile-android/` contains **GPX Animator Ride**, a native Kotlin/Compose
+companion that records a ride with an Android location foreground service,
+persists every accepted fix to Room, exports an atomic GPX 1.1 file and queues
+it for Google Drive. The recorder keeps running while Google Maps or another
+app is visible, when the screen is off, and after the activity is removed from
+Recents. Android force-stop remains an operating-system boundary; already
+persisted points are shown as an interrupted ride on next open and can still be
+exported, shared, or queued for Drive as a partial GPX.
+
+The generated GPX includes WGS84 latitude/longitude, monotonic UTC timestamps,
+available elevation and optional accuracy/speed/bearing extensions. Unknown
+extensions are intentionally ignored by `gpx-core`, so the same file can be
+opened directly in the Windows animator. See [the Android guide](docs/mobile-android.md)
+for build, OAuth, permission and device-test instructions.
+
 ## Requirements and GPU policy
 
 - Windows 10 or Windows 11 x64.
@@ -165,6 +182,7 @@ native/nvenc-engine      RTX texture ring and NVENC session
 native/mp4-output        HEVC/H.264 sample conversion and MP4 muxing
 native/desktop-app       egui UI, inspector and export state machine
 native/places-core       Offline Overture/OSM and optional provider clients
+mobile-android/           Kotlin/Compose Android ride recorder and Drive sync
 legacy-web/              Previous browser prototype (not the release path)
 packaging/               Windows packaging helpers
 dist/                    Packaged executable
