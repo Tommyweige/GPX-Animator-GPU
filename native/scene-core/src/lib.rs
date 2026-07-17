@@ -82,8 +82,20 @@ pub struct RouteLandmark {
     pub anchor_distance_m: f64,
     pub anchor_progress: f64,
     pub distance_from_route_m: f64,
+    /// Whether the saved anchor was selected from a list of route passes.
+    /// `AutomaticNearest` is kept for schema-v1 projects and is converted to
+    /// `SelectedPass` when the project is loaded.
+    #[serde(default)]
+    pub anchor_mode: LandmarkAnchorMode,
     pub enabled: bool,
     pub style: LandmarkStyle,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LandmarkAnchorMode {
+    #[default]
+    AutomaticNearest,
+    SelectedPass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -93,6 +105,34 @@ pub struct RouteAnchor {
     pub distance_from_route_m: f64,
     pub nearest_latitude: f64,
     pub nearest_longitude: f64,
+}
+
+/// One distinct visit of a landmark along the ordered GPX route.
+///
+/// The route order, rather than spatial distance alone, is what distinguishes
+/// an outbound visit from a return visit on the same road.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RouteAnchorCandidate {
+    pub segment_index: usize,
+    pub occurrence_index: usize,
+    pub anchor_distance_m: f64,
+    pub anchor_progress: f64,
+    pub distance_from_route_m: f64,
+    pub nearest_latitude: f64,
+    pub nearest_longitude: f64,
+    pub heading_deg: Option<f64>,
+}
+
+impl RouteAnchorCandidate {
+    pub fn anchor(self) -> RouteAnchor {
+        RouteAnchor {
+            anchor_distance_m: self.anchor_distance_m,
+            anchor_progress: self.anchor_progress,
+            distance_from_route_m: self.distance_from_route_m,
+            nearest_latitude: self.nearest_latitude,
+            nearest_longitude: self.nearest_longitude,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,7 +258,10 @@ pub struct FramePlan {
     pub view_span: f64,
     pub view_span_y: f64,
     pub route_ndc: Vec<[f32; 2]>,
-    pub completed_points: usize,
+    /// The route already travelled at this progress. The final point is the
+    /// exact interpolated marker position, so renderers do not stop at the
+    /// previous raw GPX sample.
+    pub completed_route_ndc: Vec<[f32; 2]>,
     pub marker_ndc: [f32; 2],
     pub elevation_line: Vec<[f32; 2]>,
     pub progress: f32,
@@ -270,18 +313,24 @@ fn local_meters(
     ]
 }
 
-/// Find the closest point on the GPX polyline to a real-world POI.  The POI is
-/// deliberately not moved: the returned anchor only controls when its marker
-/// is revealed during the animation.
-pub fn anchor_landmark_to_route(
+#[derive(Debug, Clone, Copy)]
+struct ProjectedAnchor {
+    segment_index: usize,
+    anchor_distance_m: f64,
+    distance_from_route_m: f64,
+    nearest_latitude: f64,
+    nearest_longitude: f64,
+}
+
+fn project_landmark_to_route(
     track: &Track,
     latitude: f64,
     longitude: f64,
-) -> Option<RouteAnchor> {
+) -> Option<Vec<ProjectedAnchor>> {
     if track.points.len() < 2 || !latitude.is_finite() || !longitude.is_finite() {
         return None;
     }
-    let mut best: Option<(f64, usize, f64, [f64; 2])> = None;
+    let mut projections = Vec::with_capacity(track.points.len().saturating_sub(1));
     for (index, pair) in track.points.windows(2).enumerate() {
         let a = pair[0];
         let b = pair[1];
@@ -298,33 +347,206 @@ pub fn anchor_landmark_to_route(
         };
         let closest = [p0[0] + dx * t, p0[1] + dy * t];
         let distance_squared = closest[0] * closest[0] + closest[1] * closest[1];
-        if best.is_none_or(|value| distance_squared < value.0) {
-            let delta_lon = wrapped_longitude_delta(a.lon, b.lon);
-            let nearest_latitude = a.lat + (b.lat - a.lat) * t;
-            let nearest_longitude = a.lon + delta_lon * t;
-            best = Some((
-                distance_squared,
-                index,
-                t,
-                [nearest_latitude, nearest_longitude],
-            ));
-        }
+        let delta_lon = wrapped_longitude_delta(a.lon, b.lon);
+        let nearest_latitude = a.lat + (b.lat - a.lat) * t;
+        let nearest_longitude = a.lon + delta_lon * t;
+        let segment_distance = haversine_m(&a, &b);
+        let anchor_distance_m =
+            (a.distance_m + segment_distance * t).clamp(0.0, track.distance_m.max(0.0));
+        projections.push(ProjectedAnchor {
+            segment_index: index,
+            anchor_distance_m,
+            distance_from_route_m: distance_squared.max(0.0).sqrt(),
+            nearest_latitude,
+            nearest_longitude,
+        });
     }
-    let (distance_squared, index, t, nearest) = best?;
-    let segment_distance = haversine_m(&track.points[index], &track.points[index + 1]);
-    let anchor_distance_m = (track.points[index].distance_m + segment_distance * t)
+    Some(projections)
+}
+
+fn anchor_from_projection(track: &Track, projection: ProjectedAnchor) -> RouteAnchor {
+    let anchor_distance_m = projection
+        .anchor_distance_m
         .clamp(0.0, track.distance_m.max(0.0));
-    Some(RouteAnchor {
+    RouteAnchor {
         anchor_distance_m,
         anchor_progress: if track.distance_m > f64::EPSILON {
             (anchor_distance_m / track.distance_m).clamp(0.0, 1.0)
         } else {
             0.0
         },
-        distance_from_route_m: distance_squared.max(0.0).sqrt(),
-        nearest_latitude: nearest[0],
-        nearest_longitude: nearest[1],
+        distance_from_route_m: projection.distance_from_route_m,
+        nearest_latitude: projection.nearest_latitude,
+        nearest_longitude: projection.nearest_longitude,
+    }
+}
+
+fn bearing_deg(a: &gpx_core::Point, b: &gpx_core::Point) -> Option<f64> {
+    if haversine_m(a, b) <= 0.5 {
+        return None;
+    }
+    let lat1 = a.lat.to_radians();
+    let lat2 = b.lat.to_radians();
+    let delta_lon = wrapped_longitude_delta(a.lon, b.lon).to_radians();
+    let y = delta_lon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * delta_lon.cos();
+    Some(y.atan2(x).to_degrees().rem_euclid(360.0))
+}
+
+fn bearing_at_distance(track: &Track, distance_m: f64) -> Option<f64> {
+    if track.distance_m <= f64::EPSILON {
+        return None;
+    }
+    let before = sample_distance(
+        track,
+        ((distance_m - 30.0) / track.distance_m).clamp(0.0, 1.0),
+    );
+    let after = sample_distance(
+        track,
+        ((distance_m + 30.0) / track.distance_m).clamp(0.0, 1.0),
+    );
+    bearing_deg(&before, &after)
+}
+
+fn segment_bearing_deg(track: &Track, segment_index: usize) -> Option<f64> {
+    let pair = track.points.get(segment_index..=segment_index + 1)?;
+    bearing_deg(&pair[0], &pair[1])
+}
+
+fn bearing_delta_deg(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    Some(match (a, b) {
+        (Some(a), Some(b)) => {
+            let delta = (a - b).abs().rem_euclid(360.0);
+            delta.min(360.0 - delta)
+        }
+        _ => return None,
     })
+}
+
+/// Find every distinct route visit close enough to a real-world POI to be a
+/// meaningful candidate for animation.  Candidates are ordered by GPX travel
+/// order, not by geometric proximity, so an out-and-back route can expose both
+/// the outbound and return pass even when they use the exact same road.
+pub fn find_landmark_passes(
+    track: &Track,
+    latitude: f64,
+    longitude: f64,
+) -> Vec<RouteAnchorCandidate> {
+    const MIN_EQUIVALENCE_SLACK_M: f64 = 30.0;
+    const MAX_EQUIVALENCE_SLACK_M: f64 = 75.0;
+    const EXIT_HYSTERESIS_M: f64 = 20.0;
+    const SAME_PASS_GAP_M: f64 = 100.0;
+
+    let Some(projections) = project_landmark_to_route(track, latitude, longitude) else {
+        return Vec::new();
+    };
+    let Some(best_distance_m) = projections
+        .iter()
+        .map(|projection| projection.distance_from_route_m)
+        .min_by(|a, b| a.total_cmp(b))
+    else {
+        return Vec::new();
+    };
+    let slack_m = (best_distance_m * 0.25).clamp(MIN_EQUIVALENCE_SLACK_M, MAX_EQUIVALENCE_SLACK_M);
+    let enter_distance_m = best_distance_m + slack_m;
+    let exit_distance_m = enter_distance_m + EXIT_HYSTERESIS_M;
+
+    let mut groups: Vec<Vec<ProjectedAnchor>> = Vec::new();
+    let mut current = Vec::new();
+    for projection in projections {
+        let near_enough = projection.distance_from_route_m <= enter_distance_m;
+        let within_current_visit = current.last().is_some_and(|previous: &ProjectedAnchor| {
+            let route_gap = projection.anchor_distance_m - previous.anchor_distance_m;
+            if route_gap <= SAME_PASS_GAP_M {
+                return true;
+            }
+            projection.segment_index == previous.segment_index + 1
+                && bearing_delta_deg(
+                    segment_bearing_deg(track, previous.segment_index),
+                    segment_bearing_deg(track, projection.segment_index),
+                )
+                .is_none_or(|delta| delta <= 45.0)
+        });
+        if current.is_empty() {
+            if near_enough {
+                current.push(projection);
+            }
+        } else if within_current_visit && projection.distance_from_route_m <= exit_distance_m {
+            current.push(projection);
+        } else {
+            groups.push(std::mem::take(&mut current));
+            if near_enough {
+                current.push(projection);
+            }
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    let mut candidates: Vec<RouteAnchorCandidate> = groups
+        .into_iter()
+        .filter_map(|group| {
+            let projection = group.into_iter().min_by(|a, b| {
+                a.distance_from_route_m
+                    .total_cmp(&b.distance_from_route_m)
+                    .then_with(|| a.anchor_distance_m.total_cmp(&b.anchor_distance_m))
+            })?;
+            let anchor = anchor_from_projection(track, projection);
+            Some(RouteAnchorCandidate {
+                segment_index: projection.segment_index,
+                occurrence_index: 0,
+                anchor_distance_m: anchor.anchor_distance_m,
+                anchor_progress: anchor.anchor_progress,
+                distance_from_route_m: anchor.distance_from_route_m,
+                nearest_latitude: anchor.nearest_latitude,
+                nearest_longitude: anchor.nearest_longitude,
+                heading_deg: bearing_at_distance(track, anchor.anchor_distance_m)
+                    .or_else(|| segment_bearing_deg(track, projection.segment_index)),
+            })
+        })
+        .collect();
+
+    let mut merged: Vec<RouteAnchorCandidate> = Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        let should_merge = merged.last().is_some_and(|previous| {
+            let gap = candidate.anchor_distance_m - previous.anchor_distance_m;
+            gap.abs() <= SAME_PASS_GAP_M
+                && bearing_delta_deg(previous.heading_deg, candidate.heading_deg)
+                    .is_none_or(|delta| delta <= 45.0)
+        });
+        if should_merge {
+            if let Some(previous) = merged.last_mut()
+                && candidate.distance_from_route_m < previous.distance_from_route_m
+            {
+                *previous = candidate;
+            }
+        } else {
+            merged.push(candidate);
+        }
+    }
+    for (index, candidate) in merged.iter_mut().enumerate() {
+        candidate.occurrence_index = index;
+    }
+    merged
+}
+
+/// Find the closest point on the GPX polyline to a real-world POI.  This
+/// compatibility helper remains useful for callers that do not need to expose
+/// multiple pass choices; new landmark workflows should use
+/// [`find_landmark_passes`] instead.
+pub fn anchor_landmark_to_route(
+    track: &Track,
+    latitude: f64,
+    longitude: f64,
+) -> Option<RouteAnchor> {
+    let projections = project_landmark_to_route(track, latitude, longitude)?;
+    let projection = projections.into_iter().min_by(|a, b| {
+        a.distance_from_route_m
+            .total_cmp(&b.distance_from_route_m)
+            .then_with(|| a.anchor_distance_m.total_cmp(&b.anchor_distance_m))
+    })?;
+    Some(anchor_from_projection(track, projection))
 }
 
 fn ease_out_back(value: f64) -> f32 {
@@ -567,11 +789,20 @@ pub fn build_frame_with_context(
     };
     let route_ndc: Vec<_> = projected.into_iter().map(to_ndc).collect();
     let marker_ndc = to_ndc(mercator(sample.lon, sample.lat));
-    let completed_points = scene
+    let completed_count = scene
         .track
         .points
         .partition_point(|point| point.distance_m <= sample.distance_m)
-        .max(1);
+        .max(1)
+        .min(route_ndc.len());
+    let mut completed_route_ndc = route_ndc[..completed_count].to_vec();
+    let marker_matches_last = completed_route_ndc.last().is_some_and(|point| {
+        (point[0] - marker_ndc[0]).abs() <= f32::EPSILON
+            && (point[1] - marker_ndc[1]).abs() <= f32::EPSILON
+    });
+    if !marker_matches_last {
+        completed_route_ndc.push(marker_ndc);
+    }
     let elevations: Vec<_> = scene
         .track
         .points
@@ -614,7 +845,7 @@ pub fn build_frame_with_context(
         view_span: span,
         view_span_y: span_y,
         route_ndc,
-        completed_points,
+        completed_route_ndc,
         marker_ndc,
         elevation_line,
         progress: progress as f32,
@@ -648,7 +879,11 @@ pub fn blend_frames(from: &FramePlan, to: &FramePlan, amount: f64) -> FramePlan 
         view_span: span,
         view_span_y: span_y,
         route_ndc: from.route_ndc.iter().map(|&p| convert(p, from)).collect(),
-        completed_points: to.completed_points,
+        completed_route_ndc: from
+            .completed_route_ndc
+            .iter()
+            .map(|&p| convert(p, from))
+            .collect(),
         marker_ndc: convert(from.marker_ndc, from),
         elevation_line: to.elevation_line.clone(),
         progress: to.progress,
@@ -864,7 +1099,24 @@ mod tests {
         let scene = scene();
         let frame = build_frame(&scene, 0.5);
         assert!((frame.distance_m - scene.track.distance_m * 0.5).abs() < 0.01);
-        assert!(frame.completed_points >= 1);
+        assert!(!frame.completed_route_ndc.is_empty());
+    }
+    #[test]
+    fn completed_route_ends_at_interpolated_marker_without_duplicate_at_vertex() {
+        let scene = scene();
+        let mid_frame = build_frame(&scene, 0.35);
+        assert_eq!(mid_frame.completed_route_ndc.len(), 2);
+        assert_eq!(
+            mid_frame.completed_route_ndc.last(),
+            Some(&mid_frame.marker_ndc)
+        );
+
+        let start_frame = build_frame(&scene, 0.0);
+        assert_eq!(start_frame.completed_route_ndc.len(), 1);
+        assert_eq!(
+            start_frame.completed_route_ndc.last(),
+            Some(&start_frame.marker_ndc)
+        );
     }
     #[test]
     fn follow_camera_centers_marker() {
@@ -911,6 +1163,7 @@ mod tests {
             anchor_distance_m: anchor.anchor_distance_m,
             anchor_progress: anchor.anchor_progress,
             distance_from_route_m: anchor.distance_from_route_m,
+            anchor_mode: LandmarkAnchorMode::SelectedPass,
             enabled: true,
             style: LandmarkStyle::default(),
         });
@@ -976,6 +1229,43 @@ mod tests {
     }
 
     #[test]
+    fn landmark_passes_keep_outbound_and_return_on_same_road() {
+        let track = parse_gpx(
+            r#"<gpx><trk><trkseg>
+                <trkpt lat="25.0" lon="121.0"/>
+                <trkpt lat="25.0" lon="121.01"/>
+                <trkpt lat="25.0" lon="121.0"/>
+            </trkseg></trk></gpx>"#,
+            ParseOptions::default(),
+        )
+        .unwrap();
+        let passes = find_landmark_passes(&track, 25.0, 121.005);
+        assert_eq!(passes.len(), 2);
+        assert!(passes[0].anchor_progress < passes[1].anchor_progress);
+        assert!(passes[0].heading_deg.is_some() && passes[1].heading_deg.is_some());
+        assert!(bearing_delta_deg(passes[0].heading_deg, passes[1].heading_deg).unwrap() > 120.0);
+        assert!((passes[0].distance_from_route_m - passes[1].distance_from_route_m).abs() < 0.01);
+    }
+
+    #[test]
+    fn landmark_passes_merge_adjacent_segments_of_one_visit() {
+        let track = parse_gpx(
+            r#"<gpx><trk><trkseg>
+                <trkpt lat="25.0" lon="121.0"/>
+                <trkpt lat="25.0" lon="121.004"/>
+                <trkpt lat="25.0" lon="121.005"/>
+                <trkpt lat="25.0" lon="121.006"/>
+                <trkpt lat="25.0" lon="121.01"/>
+            </trkseg></trk></gpx>"#,
+            ParseOptions::default(),
+        )
+        .unwrap();
+        let passes = find_landmark_passes(&track, 25.0, 121.005);
+        assert_eq!(passes.len(), 1);
+        assert!(passes[0].distance_from_route_m < 0.01);
+    }
+
+    #[test]
     fn landmark_reveal_is_hidden_then_persistent() {
         let mut value = scene();
         let anchor = anchor_landmark_to_route(&value.track, 25.01, 121.01).unwrap();
@@ -990,6 +1280,7 @@ mod tests {
             anchor_distance_m: anchor.anchor_distance_m,
             anchor_progress: anchor.anchor_progress,
             distance_from_route_m: anchor.distance_from_route_m,
+            anchor_mode: LandmarkAnchorMode::SelectedPass,
             enabled: true,
             style: LandmarkStyle::default(),
         });
@@ -1020,6 +1311,7 @@ mod tests {
             anchor_distance_m: anchor.anchor_distance_m,
             anchor_progress: anchor.anchor_progress,
             distance_from_route_m: anchor.distance_from_route_m,
+            anchor_mode: LandmarkAnchorMode::SelectedPass,
             enabled: true,
             style: LandmarkStyle::default(),
         });
