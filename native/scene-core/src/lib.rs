@@ -9,8 +9,9 @@ pub enum Aspect {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MapStyle {
+    /// Legacy project files may use `Dark`; load those files as Light.
+    #[serde(alias = "Dark")]
     Light,
-    Dark,
     Satellite,
     Transparent,
 }
