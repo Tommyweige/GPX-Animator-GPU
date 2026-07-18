@@ -2,6 +2,7 @@ package com.gpxanimator.mobile.ui
 
 import com.gpxanimator.mobile.data.SyncState
 import com.gpxanimator.mobile.data.TripState
+import com.gpxanimator.mobile.locale.AppLanguage
 
 data class RidePermissionState(
     val hasFineLocation: Boolean = false,
@@ -85,6 +86,7 @@ data class RideAppCallbacks(
     val onOpenLocationSettings: () -> Unit = {},
     val onConnectDrive: () -> Unit = {},
     val onDisconnectDrive: () -> Unit = {},
+    val onLanguageChange: (AppLanguage) -> Unit = {},
     val onShareRide: (String) -> Unit = {},
     val onRetryDriveSync: (String) -> Unit = {},
     val onFinalizeInterruptedRide: (String) -> Unit = {},

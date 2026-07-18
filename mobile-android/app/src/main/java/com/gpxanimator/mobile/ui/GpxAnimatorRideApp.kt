@@ -21,6 +21,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.gpxanimator.mobile.locale.AppLanguage
 import com.gpxanimator.mobile.ui.components.RideBottomBar
 import com.gpxanimator.mobile.ui.components.TopLevelDestination
 import com.gpxanimator.mobile.ui.screens.HistoryScreen
@@ -38,6 +39,7 @@ fun GpxAnimatorRideApp(
     viewModel: RideViewModel,
     permissions: RidePermissionState,
     backgroundProtection: BackgroundProtectionState,
+    language: AppLanguage,
     driveState: DriveUiState = DriveUiState(),
     callbacks: RideAppCallbacks,
 ) {
@@ -138,6 +140,8 @@ fun GpxAnimatorRideApp(
                             onOpenLocationSettings = callbacks.onOpenLocationSettings,
                             onConnectDrive = callbacks.onConnectDrive,
                             onDisconnectDrive = callbacks.onDisconnectDrive,
+                            language = language,
+                            onLanguageChange = callbacks.onLanguageChange,
                         )
                     }
                     composable(RECORDING_ROUTE) {

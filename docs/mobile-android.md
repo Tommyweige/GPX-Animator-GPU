@@ -41,6 +41,14 @@ Release signing is intentionally not stored in this repository. Configure a
 local keystore and Gradle signing properties before distributing a release
 APK. Never commit a keystore, private key, access token or account credential.
 
+## In-app language setting
+
+Open **Settings → App language** to choose **System default**, **English** or
+**Traditional Chinese**. The choice applies to GPX Animator Ride only, is
+persisted across launches and does not change the phone's global language.
+Android 13 and newer use the platform per-app locale API; Android 10–12 keep
+the selection in the app's private preferences.
+
 ## Google Drive setup
 
 1. Create a Google Cloud project and enable Google Drive API v3.

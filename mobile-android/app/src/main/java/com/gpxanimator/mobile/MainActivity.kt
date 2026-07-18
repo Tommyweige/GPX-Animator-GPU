@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
@@ -28,6 +29,8 @@ import androidx.work.await
 import com.gpxanimator.mobile.data.SyncState
 import com.gpxanimator.mobile.gpx.RideFileActions
 import com.gpxanimator.mobile.gpx.RideFinalizer
+import com.gpxanimator.mobile.locale.AppLanguage
+import com.gpxanimator.mobile.locale.AppLanguagePreferences
 import com.gpxanimator.mobile.recording.RecordingController
 import com.gpxanimator.mobile.sync.DriveAuthorizationManager
 import com.gpxanimator.mobile.sync.DriveAuthorizationOutcome
@@ -52,8 +55,9 @@ class MainActivity : ComponentActivity() {
     }
     private var permissionState by mutableStateOf(RidePermissionState())
     private var backgroundProtection by mutableStateOf(BackgroundProtectionState())
+    private var appLanguage by mutableStateOf(AppLanguage.SystemDefault)
     private var driveState by
-    mutableStateOf(DriveUiState(canStartAuthorization = true))
+        mutableStateOf(DriveUiState(canStartAuthorization = true))
     private var pendingDriveAuthorization: PendingIntent? = null
     private var startAfterPermissionGrant = false
 
@@ -78,15 +82,21 @@ class MainActivity : ComponentActivity() {
             applyAuthorizationOutcome(outcome, launchResolution = false)
         }
 
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLanguagePreferences.localizedContext(newBase))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        appLanguage = AppLanguagePreferences.current(this)
         refreshDeviceState()
         setContent {
             GpxAnimatorRideApp(
                 viewModel = rideViewModel,
                 permissions = permissionState,
                 backgroundProtection = backgroundProtection,
+                language = appLanguage,
                 driveState = driveState,
                 callbacks =
                     RideAppCallbacks(
@@ -98,6 +108,7 @@ class MainActivity : ComponentActivity() {
                         onOpenLocationSettings = ::openLocationSettings,
                         onConnectDrive = ::connectDrive,
                         onDisconnectDrive = ::disconnectDrive,
+                        onLanguageChange = ::changeLanguage,
                         onShareRide = ::shareRide,
                         onRetryDriveSync = ::retryDriveSync,
                         onFinalizeInterruptedRide = ::finalizeInterruptedRide,
@@ -110,6 +121,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        appLanguage = AppLanguagePreferences.current(this)
         refreshDeviceState()
         if (driveState.connection == DriveConnectionUiState.Connected) {
             refreshDriveAuthorization()
@@ -127,6 +139,15 @@ class MainActivity : ComponentActivity() {
 
     private fun requestRecordingPermissions() {
         launchRecordingPermissionRequest(startWhenGranted = false)
+    }
+
+    private fun changeLanguage(language: AppLanguage) {
+        if (language == appLanguage) return
+        AppLanguagePreferences.set(this, language)
+        appLanguage = language
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            recreate()
+        }
     }
 
     private fun launchRecordingPermissionRequest(startWhenGranted: Boolean) {

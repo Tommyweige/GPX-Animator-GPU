@@ -105,6 +105,15 @@
 
     <string name="settings_title">設定一次，放心出發。</string>
     <string name="settings_subtitle">權限、背景保護與雲端交接狀態都能快速確認。</string>
+    <string name="language_title">App 語言</string>
+    <string name="language_body">只調整 GPX Animator Ride 的顯示語言，不會改變手機的其他設定。</string>
+    <string name="language_current">目前語言</string>
+    <string name="language_change">變更語言</string>
+    <string name="language_dialog_title">選擇 App 語言</string>
+    <string name="language_done">完成</string>
+    <string name="language_system">跟隨系統</string>
+    <string name="language_english">English</string>
+    <string name="language_traditional_chinese">繁體中文</string>
     <string name="permissions_title">記錄權限</string>
     <string name="permissions_settings_body">精確位置用來記錄路線；通知讓前景記錄服務保持可見。</string>
     <string name="background_protection_title">背景保護</string>
